@@ -243,13 +243,53 @@ app.put("/api/salary-bands/by-employee", wrap(async (req, res) => {
   return res.status(201).json(created);
 }));
 
+// GET /api/admin/users — lista de empleados con permisos formateada
+app.get("/api/admin/users", wrap(async (_req, res) => {
+  const employees = await readCol("employees");
+  const departments = await readCol("departments");
+  const parseArr = (v) => {
+    if (Array.isArray(v)) return v;
+    if (typeof v === "string") {
+      try { const p = JSON.parse(v); return Array.isArray(p) ? p : []; } catch { return []; }
+    }
+    return [];
+  };
+  const out = employees.map((emp) => {
+    const dept = departments.find((d) => Number(d.id) === Number(emp.departmentId));
+    return {
+      id: emp.id,
+      firstName: emp.firstName,
+      lastName: emp.lastName,
+      position: emp.position,
+      department: dept?.shortName ?? dept?.name ?? "—",
+      departmentId: emp.departmentId,
+      cedula: emp.cedula,
+      email: emp.email,
+      phone: emp.phone,
+      level: emp.level,
+      username: emp.username || "",
+      hasPassword: !!emp.password,
+      mustChangePassword: !!emp.mustChangePassword,
+      canAccessGeneralMenu: !!emp.canAccessGeneralMenu,
+      moduleAccess: parseArr(emp.moduleAccess),
+      menuAccess: parseArr(emp.menuAccess),
+      status: emp.status,
+    };
+  });
+  res.json(out);
+}));
+
 // PATCH /api/admin/users/:id — credenciales/permisos
 app.patch("/api/admin/users/:id", wrap(async (req, res) => {
   const id = Number(req.params.id);
   const items = await readCol("employees");
   const idx = items.findIndex((e) => Number(e.id) === id);
   if (idx < 0) return res.status(404).json({ message: "not found" });
-  items[idx] = { ...items[idx], ...(req.body || {}) };
+  const body = { ...(req.body || {}) };
+  // Normalizar: el frontend manda arrays pero algunas filas viejas usan JSON-string
+  if (Array.isArray(body.moduleAccess)) body.moduleAccess = body.moduleAccess;
+  if (Array.isArray(body.menuAccess)) body.menuAccess = body.menuAccess;
+  items[idx] = { ...items[idx], ...body };
   await writeCol("employees", items);
   res.json(items[idx]);
 }));
