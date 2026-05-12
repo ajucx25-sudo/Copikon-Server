@@ -322,6 +322,82 @@ app.delete("/api/erp/product-serials/:id", wrap(async (req, res) => {
   res.json(removed);
 }));
 
+// ───── Adjuntos de tareas de proyectos ──────────────────────
+// Los attachments viven inline en cada projectTask bajo la propiedad
+// `attachments` (array). dataUrl base64 embebido (max 25MB por request).
+
+function parseAttachments(v) {
+  if (Array.isArray(v)) return v;
+  if (typeof v === "string" && v) {
+    try { const p = JSON.parse(v); return Array.isArray(p) ? p : []; } catch { return []; }
+  }
+  return [];
+}
+
+// POST /api/project-tasks/:id/attachments — agregar adjunto
+app.post("/api/project-tasks/:id/attachments", wrap(async (req, res) => {
+  const taskId = Number(req.params.id);
+  const items = await readCol("projectTasks");
+  const idx = items.findIndex((t) => Number(t.id) === taskId);
+  if (idx < 0) return res.status(404).json({ message: "task not found" });
+  const body = req.body || {};
+  const mime = body.mimeType || "application/octet-stream";
+  const dataUrl = body.dataBase64 ? `data:${mime};base64,${body.dataBase64}` : (body.dataUrl || "");
+  const size = body.size ?? (body.dataBase64 ? Math.floor((body.dataBase64.length * 3) / 4) : 0);
+  const newAttachment = {
+    id: `att_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+    filename: body.filename || "archivo",
+    mimeType: mime,
+    size,
+    dataUrl,
+    uploadedAt: new Date().toISOString(),
+    uploadedBy: body.uploadedBy ?? null,
+    uploadedByName: body.uploadedByName ?? null,
+  };
+  const current = parseAttachments(items[idx].attachments);
+  items[idx] = { ...items[idx], attachments: [...current, newAttachment] };
+  await writeCol("projectTasks", items);
+  res.status(201).json(newAttachment);
+}));
+
+// GET /api/project-tasks/:id/attachments/:attId — descargar (devuelve dataUrl)
+app.get("/api/project-tasks/:id/attachments/:attId", wrap(async (req, res) => {
+  const taskId = Number(req.params.id);
+  const attId = req.params.attId;
+  const items = await readCol("projectTasks");
+  const task = items.find((t) => Number(t.id) === taskId);
+  if (!task) return res.status(404).json({ message: "task not found" });
+  const atts = parseAttachments(task.attachments);
+  const att = atts.find((a) => a.id === attId);
+  if (!att) return res.status(404).json({ message: "attachment not found" });
+  // Si tiene dataUrl, devolver el binario directamente
+  if (att.dataUrl && typeof att.dataUrl === "string") {
+    const m = att.dataUrl.match(/^data:([^;]+);base64,(.+)$/);
+    if (m) {
+      const buf = Buffer.from(m[2], "base64");
+      const download = req.query.download === "1";
+      res.setHeader("Content-Type", m[1]);
+      if (download) res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(att.filename || "archivo")}"`);
+      return res.end(buf);
+    }
+  }
+  res.json(att);
+}));
+
+// DELETE /api/project-tasks/:id/attachments/:attId — eliminar adjunto
+app.delete("/api/project-tasks/:id/attachments/:attId", wrap(async (req, res) => {
+  const taskId = Number(req.params.id);
+  const attId = req.params.attId;
+  const items = await readCol("projectTasks");
+  const idx = items.findIndex((t) => Number(t.id) === taskId);
+  if (idx < 0) return res.status(404).json({ message: "task not found" });
+  const current = parseAttachments(items[idx].attachments);
+  const next = current.filter((a) => a.id !== attId);
+  items[idx] = { ...items[idx], attachments: next };
+  await writeCol("projectTasks", items);
+  res.json({ ok: true });
+}));
+
 // PATCH /api/admin/users/:id — credenciales/permisos
 app.patch("/api/admin/users/:id", wrap(async (req, res) => {
   const id = Number(req.params.id);
