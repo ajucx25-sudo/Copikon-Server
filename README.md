@@ -1,14 +1,13 @@
 # Copikon — Servidor compartido
 
-Backend ligero (Express + SQLite) que reemplaza el mock que la intranet usaba
+Backend ligero (Express + Postgres) que reemplaza el mock que la intranet usaba
 en el navegador. Todos los usuarios escriben/leen contra la misma base de datos.
 
 ## Estructura
 
-- `server.js` — servidor Express. Una sola tabla `kv` en SQLite con JSON por
+- `server.js` — servidor Express. Una sola tabla `kv` en Postgres con JSONB por
   colección (employees, projects, projectTasks, erpProducts, etc.).
-- `render.yaml` — config para desplegar en Render.com con disco persistente.
-- `data/copikon.sqlite` — base de datos (en producción se monta en `/var/data`).
+- `render.yaml` — config para desplegar en Render.com con Postgres free.
 
 ## Cómo desplegar en Render.com (5 minutos)
 
