@@ -279,6 +279,49 @@ app.get("/api/admin/users", wrap(async (_req, res) => {
   res.json(out);
 }));
 
+// GET /api/erp/products/:id/serials — stub: devuelve arreglo (vacío por ahora)
+app.get("/api/erp/products/:id/serials", wrap(async (req, res) => {
+  const all = await readCol("productSerials").catch(() => []);
+  const list = Array.isArray(all) ? all.filter(s => Number(s.productId) === Number(req.params.id)) : [];
+  res.json(list);
+}));
+
+// POST /api/erp/products/:id/serials — agregar serial
+app.post("/api/erp/products/:id/serials", wrap(async (req, res) => {
+  const productId = Number(req.params.id);
+  const items = await readCol("productSerials").catch(() => []);
+  const arr = Array.isArray(items) ? items : [];
+  const nextId = arr.reduce((m, it) => Math.max(m, Number(it?.id) || 0), 0) + 1;
+  const created = { ...(req.body || {}), id: nextId, productId, createdAt: new Date().toISOString() };
+  arr.push(created);
+  await writeCol("productSerials", arr);
+  res.status(201).json(created);
+}));
+
+// PATCH /api/erp/product-serials/:id
+app.patch("/api/erp/product-serials/:id", wrap(async (req, res) => {
+  const id = Number(req.params.id);
+  const arr = (await readCol("productSerials").catch(() => [])) || [];
+  if (!Array.isArray(arr)) return res.status(404).json({ message: "not found" });
+  const idx = arr.findIndex(s => Number(s.id) === id);
+  if (idx < 0) return res.status(404).json({ message: "not found" });
+  arr[idx] = { ...arr[idx], ...(req.body || {}) };
+  await writeCol("productSerials", arr);
+  res.json(arr[idx]);
+}));
+
+// DELETE /api/erp/product-serials/:id
+app.delete("/api/erp/product-serials/:id", wrap(async (req, res) => {
+  const id = Number(req.params.id);
+  const arr = (await readCol("productSerials").catch(() => [])) || [];
+  if (!Array.isArray(arr)) return res.status(404).json({ message: "not found" });
+  const idx = arr.findIndex(s => Number(s.id) === id);
+  if (idx < 0) return res.status(404).json({ message: "not found" });
+  const [removed] = arr.splice(idx, 1);
+  await writeCol("productSerials", arr);
+  res.json(removed);
+}));
+
 // PATCH /api/admin/users/:id — credenciales/permisos
 app.patch("/api/admin/users/:id", wrap(async (req, res) => {
   const id = Number(req.params.id);
