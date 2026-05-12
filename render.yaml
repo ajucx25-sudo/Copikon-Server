@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: copikon-server
+    env: node
+    plan: free
+    region: oregon
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_VERSION
+        value: 20.11.1
+      - key: PORT
+        value: 10000
+      - key: DATA_DIR
+        value: /var/data
+    disk:
+      name: copikon-data
+      mountPath: /var/data
+      sizeGB: 1
