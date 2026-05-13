@@ -73,6 +73,7 @@ const ROUTES = {
   "/api/erp/rental-contracts": "erpRentalContracts",
   "/api/erp/rental-payments": "erpRentalPayments",
   "/api/maintenance-packages": "maintenancePackages",
+  "/api/extra-services": "extraServices",
 };
 
 const STATIC_KEYS = ["departments", "announcements", "jobDescriptions", "processMaps", "courses"];
