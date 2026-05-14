@@ -171,6 +171,32 @@ app.post("/api/sync/seed", wrap(async (req, res) => {
   return res.json({ ok: true, written });
 }));
 
+// ───── Rutas ESPECIALES (deben ir ANTES del CRUD genérico) ─
+// Si se registran después del loop, /api/salary-bands/by-employee
+// es atrapado por el handler PUT /api/salary-bands/:id genérico
+// (Express casa la primera ruta registrada) → :id = "by-employee"
+// → Number(NaN) → 404. Por eso este bloque va aquí.
+
+// PUT /api/salary-bands/by-employee — upsert por employeeId
+app.put("/api/salary-bands/by-employee", wrap(async (req, res) => {
+  const body = req.body || {};
+  const empId = Number(body.employeeId);
+  if (!empId) return res.status(400).json({ message: "employeeId requerido" });
+  const items = await readCol("salaryBands");
+  const idx = items.findIndex((b) => Number(b.employeeId) === empId);
+  const stamped = { ...body, updatedAt: new Date().toISOString() };
+  if (idx >= 0) {
+    items[idx] = { ...items[idx], ...stamped };
+    await writeCol("salaryBands", items);
+    return res.json(items[idx]);
+  }
+  const nextId = items.reduce((m, it) => Math.max(m, Number(it?.id) || 0), 0) + 1;
+  const created = { ...stamped, id: nextId };
+  items.push(created);
+  await writeCol("salaryBands", items);
+  return res.status(201).json(created);
+}));
+
 // ───── CRUD genérico por colección ──────────────────────────
 for (const [route, key] of Object.entries(ROUTES)) {
   app.get(route, wrap(async (_req, res) => res.json(await readCol(key))));
@@ -224,27 +250,7 @@ for (const [route, key] of Object.entries(ROUTES)) {
   }));
 }
 
-// ───── Rutas especiales ─────────────────────────────────────
-
-// PUT /api/salary-bands/by-employee — upsert por employeeId
-app.put("/api/salary-bands/by-employee", wrap(async (req, res) => {
-  const body = req.body || {};
-  const empId = Number(body.employeeId);
-  if (!empId) return res.status(400).json({ message: "employeeId requerido" });
-  const items = await readCol("salaryBands");
-  const idx = items.findIndex((b) => Number(b.employeeId) === empId);
-  const stamped = { ...body, updatedAt: new Date().toISOString() };
-  if (idx >= 0) {
-    items[idx] = { ...items[idx], ...stamped };
-    await writeCol("salaryBands", items);
-    return res.json(items[idx]);
-  }
-  const nextId = items.reduce((m, it) => Math.max(m, Number(it?.id) || 0), 0) + 1;
-  const created = { ...stamped, id: nextId };
-  items.push(created);
-  await writeCol("salaryBands", items);
-  return res.status(201).json(created);
-}));
+// ───── Otras rutas especiales ───────────────────────────────
 
 // GET /api/admin/users — lista de empleados con permisos formateada
 app.get("/api/admin/users", wrap(async (_req, res) => {
