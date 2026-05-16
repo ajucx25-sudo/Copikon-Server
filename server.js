@@ -118,6 +118,32 @@ app.get("/api/auth/me", wrap(async (req, res) => {
   return res.json(emp);
 }));
 
+// ───── Cambio de contraseña (usuario autenticado) ───────────
+app.post("/api/auth/change-password", wrap(async (req, res) => {
+  const auth = req.headers.authorization || "";
+  const token = auth.replace(/^Bearer\s+/, "");
+  const m = token.match(/^srv-(\d+)-/);
+  if (!m) return res.status(401).json({ message: "Unauthorized" });
+  const id = Number(m[1]);
+  const { currentPassword, newPassword } = req.body || {};
+  if (!newPassword || String(newPassword).length < 6) {
+    return res.status(400).json({ error: "La nueva contraseña debe tener al menos 6 caracteres" });
+  }
+  const employees = await readCol("employees");
+  const idx = employees.findIndex((e) => Number(e.id) === id);
+  if (idx < 0) return res.status(401).json({ error: "Usuario no encontrado" });
+  const emp = employees[idx];
+  if (String(emp.password ?? "") !== String(currentPassword ?? "")) {
+    return res.status(400).json({ error: "La contraseña actual es incorrecta" });
+  }
+  if (String(newPassword) === String(currentPassword)) {
+    return res.status(400).json({ error: "La nueva contraseña debe ser distinta a la actual" });
+  }
+  employees[idx] = { ...emp, password: String(newPassword), mustChangePassword: 0 };
+  await writeCol("employees", employees);
+  return res.json({ ok: true, user: employees[idx] });
+}));
+
 // ───── Statics (read-only) ──────────────────────────────────
 for (const key of STATIC_KEYS) {
   const route = `/api/${key.replace(/([A-Z])/g, "-$1").toLowerCase()}`;
