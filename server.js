@@ -461,6 +461,171 @@ app.post("/api/admin/users/:id/reset-password", wrap(async (req, res) => {
   res.json({ ok: true, newPassword: newPass });
 }));
 
+// ───── Acceso a técnicos externos (proveedores) ────────────
+// Cada proveedor externo puede tener un "employee sintético" asociado vía
+// providerId. Este empleado existe solo para autenticar y aparecer como
+// usuario del PWA en modo campo. NO se debe mostrar en organigrama ni
+// listados de personal interno.
+
+function normalizeUsernameFromEmail(emailOrName) {
+  const s = String(emailOrName || "").trim();
+  if (!s) return "";
+  // Si parece email, usar parte local o el email completo
+  if (s.includes("@")) return s.toLowerCase().replace(/\s+/g, "");
+  return s.toLowerCase().replace(/[^a-z0-9.]/g, ".").replace(/\.+/g, ".");
+}
+
+function splitName(fullName) {
+  const parts = String(fullName || "").trim().split(/\s+/);
+  if (parts.length <= 1) return { firstName: parts[0] || "Técnico", lastName: "Externo" };
+  const firstName = parts.slice(0, Math.ceil(parts.length / 2)).join(" ");
+  const lastName = parts.slice(Math.ceil(parts.length / 2)).join(" ");
+  return { firstName, lastName };
+}
+
+// GET /api/admin/technical-providers — lista con campo derivado hasLogin
+app.get("/api/admin/technical-providers", wrap(async (_req, res) => {
+  const providers = await readCol("technicalProviders");
+  const employees = await readCol("employees");
+  const out = (providers || []).map((p) => {
+    const emp = employees.find((e) => Number(e.providerId) === Number(p.id));
+    return {
+      ...p,
+      hasLogin: !!emp,
+      loginUsername: emp ? emp.username : null,
+      loginUserId: emp ? emp.id : null,
+      mustChangePassword: emp ? !!emp.mustChangePassword : false,
+    };
+  });
+  res.json(out);
+}));
+
+// POST /api/admin/technical-providers/:id/grant-access
+// Crea o actualiza el empleado sintético para el proveedor. Devuelve
+// credenciales (sólo en la respuesta, no se vuelven a exponer).
+// Body opcional: { username?, password? } — si vacío, se generan.
+app.post("/api/admin/technical-providers/:id/grant-access", wrap(async (req, res) => {
+  const providerId = Number(req.params.id);
+  const providers = await readCol("technicalProviders");
+  const provider = providers.find((p) => Number(p.id) === providerId);
+  if (!provider) return res.status(404).json({ message: "proveedor no encontrado" });
+
+  const employees = await readCol("employees");
+  const existingIdx = employees.findIndex((e) => Number(e.providerId) === providerId);
+
+  const body = req.body || {};
+  const desiredUsername = String(body.username || "").trim() ||
+    normalizeUsernameFromEmail(provider.email || provider.name) ||
+    `tecnico${providerId}`;
+
+  // Generar contraseña si no se provee (cedula del proveedor o aleatoria)
+  const cedula = String(provider.taxId || "").replace(/[^a-zA-Z0-9-]/g, "");
+  const defaultPassword = cedula || `tec${providerId}${Math.random().toString(36).slice(2, 6)}`;
+  const desiredPassword = String(body.password || "").trim() || defaultPassword;
+
+  // Validar que el username no esté tomado por OTRO empleado
+  const clash = employees.find((e) =>
+    String(e.username || "").toLowerCase() === desiredUsername.toLowerCase() &&
+    Number(e.providerId || 0) !== providerId
+  );
+  if (clash) {
+    return res.status(409).json({ message: "username ya está en uso por otro usuario" });
+  }
+
+  const { firstName, lastName } = splitName(provider.contactName || provider.name);
+
+  if (existingIdx >= 0) {
+    // Actualizar credenciales
+    employees[existingIdx] = {
+      ...employees[existingIdx],
+      username: desiredUsername,
+      password: desiredPassword,
+      mustChangePassword: 1,
+      providerId,
+      role: "tecnico_externo",
+      level: "tecnico_externo",
+      firstName,
+      lastName,
+      email: provider.email || employees[existingIdx].email || "",
+      phone: provider.phone || employees[existingIdx].phone || "",
+      status: "active",
+      isExternalProvider: true,
+      position: "Técnico Externo",
+    };
+    await writeCol("employees", employees);
+    return res.json({
+      ok: true,
+      action: "updated",
+      userId: employees[existingIdx].id,
+      username: desiredUsername,
+      password: desiredPassword,
+      providerId,
+    });
+  }
+
+  // Crear nuevo empleado sintético
+  const nextId = employees.reduce((m, e) => Math.max(m, Number(e.id) || 0), 0) + 1;
+  const synthetic = {
+    id: nextId,
+    firstName,
+    lastName,
+    position: "Técnico Externo",
+    email: provider.email || "",
+    phone: provider.phone || "",
+    cedula: provider.taxId || "",
+    username: desiredUsername,
+    password: desiredPassword,
+    mustChangePassword: 1,
+    status: "active",
+    level: "tecnico_externo",
+    role: "tecnico_externo",
+    providerId,
+    isExternalProvider: true,
+    canAccessGeneralMenu: false,
+    moduleAccess: [],
+    menuAccess: ["modo-campo"],
+    departmentId: null,
+    createdAt: new Date().toISOString(),
+  };
+  employees.push(synthetic);
+  await writeCol("employees", employees);
+  res.status(201).json({
+    ok: true,
+    action: "created",
+    userId: nextId,
+    username: desiredUsername,
+    password: desiredPassword,
+    providerId,
+  });
+}));
+
+// POST /api/admin/technical-providers/:id/reset-access — resetea password
+app.post("/api/admin/technical-providers/:id/reset-access", wrap(async (req, res) => {
+  const providerId = Number(req.params.id);
+  const providers = await readCol("technicalProviders");
+  const provider = providers.find((p) => Number(p.id) === providerId);
+  if (!provider) return res.status(404).json({ message: "proveedor no encontrado" });
+  const employees = await readCol("employees");
+  const idx = employees.findIndex((e) => Number(e.providerId) === providerId);
+  if (idx < 0) return res.status(404).json({ message: "no hay acceso creado para este proveedor" });
+  const cedula = String(provider.taxId || "").replace(/[^a-zA-Z0-9-]/g, "");
+  const newPass = String(req.body?.password || "").trim() || cedula || `tec${providerId}${Math.random().toString(36).slice(2, 6)}`;
+  employees[idx] = { ...employees[idx], password: newPass, mustChangePassword: 1 };
+  await writeCol("employees", employees);
+  res.json({ ok: true, newPassword: newPass, username: employees[idx].username });
+}));
+
+// DELETE /api/admin/technical-providers/:id/revoke-access — revoca acceso
+app.delete("/api/admin/technical-providers/:id/revoke-access", wrap(async (req, res) => {
+  const providerId = Number(req.params.id);
+  const employees = await readCol("employees");
+  const idx = employees.findIndex((e) => Number(e.providerId) === providerId);
+  if (idx < 0) return res.status(404).json({ message: "no hay acceso" });
+  const [removed] = employees.splice(idx, 1);
+  await writeCol("employees", employees);
+  res.json({ ok: true, removedUserId: removed.id });
+}));
+
 // ───── Arranque ─────────────────────────────────────────────
 const PORT = process.env.PORT || 5050;
 (async () => {
