@@ -651,10 +651,15 @@ async function readMaterialRaw(key) {
 }
 
 // Normaliza al esquema nuevo {files: [...], url, updatedAt}
+// IMPORTANTE: si detectamos formato viejo (dataBase64 en la raíz), persistimos
+// la migración a `files[]` para que el id sea estable. Antes generábamos un id
+// mig-${Date.now()} en cada lectura, lo que rompía DELETE porque el id que vio
+// el cliente ya no coincidía con el siguiente render del servidor.
 async function readMaterial(key) {
   const raw = await readMaterialRaw(key);
   if (!raw) return { files: [], url: "", updatedAt: null };
-  const files = Array.isArray(raw.files) ? raw.files : [];
+  const files = Array.isArray(raw.files) ? [...raw.files] : [];
+  let needsPersist = false;
   // Migración: si existía un archivo único en la raíz, lo movemos al array
   if (raw.dataBase64 && files.length === 0) {
     files.push({
@@ -665,8 +670,24 @@ async function readMaterial(key) {
       size: raw.size || 0,
       uploadedAt: raw.updatedAt || new Date().toISOString(),
     });
+    needsPersist = true;
   }
-  return { files, url: raw.url || "", updatedAt: raw.updatedAt || null };
+  // Asegurar id estable: si algún archivo no tiene id, asignar uno y persistir
+  for (const f of files) {
+    if (!f.id) {
+      f.id = `mig-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      needsPersist = true;
+    }
+  }
+  const updatedAt = raw.updatedAt || new Date().toISOString();
+  if (needsPersist) {
+    try {
+      await writeMaterial(key, { files, url: raw.url || "", updatedAt });
+    } catch (e) {
+      console.warn(`[materials] no se pudo persistir migración de ${key}:`, e?.message || e);
+    }
+  }
+  return { files, url: raw.url || "", updatedAt };
 }
 
 async function writeMaterial(key, data) {
