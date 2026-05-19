@@ -73,6 +73,7 @@ const ROUTES = {
   "/api/erp/rental-contracts": "erpRentalContracts",
   "/api/erp/rental-payments": "erpRentalPayments",
   "/api/erp/rental-maintenance": "erpRentalMaintenance",
+  "/api/erp/rental-invoices": "erpRentalInvoices",
   "/api/maintenance-packages": "maintenancePackages",
   "/api/extra-services": "extraServices",
   "/api/technical-providers": "technicalProviders",
