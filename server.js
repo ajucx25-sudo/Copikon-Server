@@ -628,9 +628,11 @@ app.delete("/api/admin/technical-providers/:id/revoke-access", wrap(async (req, 
 
 // ───── Marketing · Materiales Corporativos ─────────────────
 // Almacena PDFs/videos por material en la tabla `kv` bajo clave
-// `material:<key>`. Cada material tiene: filename, mimeType,
-// dataBase64 (opcional, archivo subido), size, url (enlace ext.),
-// updatedAt. Si no hay archivo ni URL, el frontend genera PDF auto.
+// `material:<key>`. Cada material es:
+//   { files: [{id, filename, mimeType, dataBase64, size, uploadedAt}],
+//     url: string, updatedAt: string }
+// Soporta múltiples archivos por material. Retrocompat con formato
+// antiguo (un solo archivo en la raíz) vía normalización al leer.
 
 const MATERIAL_DEFS = [
   { key: "presentacion_corporativa", title: "Presentación Corporativa", kind: "pdf" },
@@ -641,11 +643,30 @@ const MATERIAL_DEFS = [
   { key: "video_corporativo",        title: "Video Corporativo",        kind: "video" },
 ];
 
-async function readMaterial(key) {
+async function readMaterialRaw(key) {
   const r = await pool.query("SELECT value FROM kv WHERE key = $1", [`material:${key}`]);
   if (!r.rows[0]) return null;
   const v = r.rows[0].value;
   return v && typeof v === "object" ? v : null;
+}
+
+// Normaliza al esquema nuevo {files: [...], url, updatedAt}
+async function readMaterial(key) {
+  const raw = await readMaterialRaw(key);
+  if (!raw) return { files: [], url: "", updatedAt: null };
+  const files = Array.isArray(raw.files) ? raw.files : [];
+  // Migración: si existía un archivo único en la raíz, lo movemos al array
+  if (raw.dataBase64 && files.length === 0) {
+    files.push({
+      id: `mig-${Date.now()}`,
+      filename: raw.filename || "documento.pdf",
+      mimeType: raw.mimeType || "application/pdf",
+      dataBase64: raw.dataBase64,
+      size: raw.size || 0,
+      uploadedAt: raw.updatedAt || new Date().toISOString(),
+    });
+  }
+  return { files, url: raw.url || "", updatedAt: raw.updatedAt || null };
 }
 
 async function writeMaterial(key, data) {
@@ -660,27 +681,58 @@ async function deleteMaterial(key) {
   await pool.query("DELETE FROM kv WHERE key = $1", [`material:${key}`]);
 }
 
-// GET /api/materials — lista los 6 materiales con su estado (sin el blob)
+function fileMeta(f) {
+  return {
+    id: f.id,
+    filename: f.filename,
+    mimeType: f.mimeType,
+    size: f.size || 0,
+    uploadedAt: f.uploadedAt || null,
+  };
+}
+
+// GET /api/materials — lista los 6 materiales con su estado (sin blobs)
 app.get("/api/materials", wrap(async (_req, res) => {
   const out = [];
   for (const def of MATERIAL_DEFS) {
     const data = await readMaterial(def.key);
+    const first = data.files[0] || null;
     out.push({
       key: def.key,
       title: def.title,
       kind: def.kind,
-      hasFile: !!(data && data.dataBase64),
-      filename: data?.filename || null,
-      mimeType: data?.mimeType || null,
-      size: data?.size || null,
-      url: data?.url || "",
-      updatedAt: data?.updatedAt || null,
+      // Compat: campos del primer archivo en la raíz
+      hasFile: data.files.length > 0,
+      filename: first?.filename || null,
+      mimeType: first?.mimeType || null,
+      size: first?.size || null,
+      url: data.url || "",
+      updatedAt: data.updatedAt || null,
+      // Nuevo: lista completa
+      files: data.files.map(fileMeta),
+      filesCount: data.files.length,
     });
   }
   res.json(out);
 }));
 
-// POST /api/materials/:key/upload — sube archivo (base64)
+// GET /api/materials/:key — detalle de un material con sus archivos (sin blobs)
+app.get("/api/materials/:key", wrap(async (req, res) => {
+  const key = String(req.params.key || "");
+  const def = MATERIAL_DEFS.find((d) => d.key === key);
+  if (!def) return res.status(404).json({ message: "material no existe" });
+  const data = await readMaterial(key);
+  res.json({
+    key: def.key,
+    title: def.title,
+    kind: def.kind,
+    url: data.url || "",
+    updatedAt: data.updatedAt || null,
+    files: data.files.map(fileMeta),
+  });
+}));
+
+// POST /api/materials/:key/upload — agrega un archivo (múltiples permitidos)
 app.post("/api/materials/:key/upload", wrap(async (req, res) => {
   const key = String(req.params.key || "");
   const def = MATERIAL_DEFS.find((d) => d.key === key);
@@ -689,24 +741,27 @@ app.post("/api/materials/:key/upload", wrap(async (req, res) => {
   if (!dataBase64 || typeof dataBase64 !== "string") {
     return res.status(400).json({ message: "dataBase64 requerido" });
   }
-  // Calcular tamaño aproximado del binario
   const cleaned = dataBase64.replace(/\s/g, "");
   const size = Math.floor((cleaned.length * 3) / 4) - (cleaned.endsWith("==") ? 2 : cleaned.endsWith("=") ? 1 : 0);
-  // Límite 50MB
   if (size > 50 * 1024 * 1024) {
     return res.status(413).json({ message: "archivo excede 50 MB" });
   }
-  const existing = (await readMaterial(key)) || {};
-  const updated = {
-    ...existing,
+  const existing = await readMaterial(key);
+  const newFile = {
+    id: `f-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     filename: String(filename || (def.kind === "video" ? "video.mp4" : "documento.pdf")),
     mimeType: String(mimeType || (def.kind === "video" ? "video/mp4" : "application/pdf")),
     dataBase64: cleaned,
     size,
+    uploadedAt: new Date().toISOString(),
+  };
+  const updated = {
+    files: [...existing.files, newFile],
+    url: existing.url || "",
     updatedAt: new Date().toISOString(),
   };
   await writeMaterial(key, updated);
-  res.json({ ok: true, key, filename: updated.filename, size, mimeType: updated.mimeType });
+  res.json({ ok: true, key, file: fileMeta(newFile), filesCount: updated.files.length });
 }));
 
 // PATCH /api/materials/:key/url — guarda enlace externo
@@ -715,41 +770,83 @@ app.patch("/api/materials/:key/url", wrap(async (req, res) => {
   const def = MATERIAL_DEFS.find((d) => d.key === key);
   if (!def) return res.status(404).json({ message: "material no existe" });
   const url = String(req.body?.url || "").trim();
-  const existing = (await readMaterial(key)) || {};
-  const updated = { ...existing, url, updatedAt: new Date().toISOString() };
+  const existing = await readMaterial(key);
+  const updated = { files: existing.files, url, updatedAt: new Date().toISOString() };
   await writeMaterial(key, updated);
   res.json({ ok: true, key, url });
 }));
 
-// DELETE /api/materials/:key/file — borra el archivo subido (mantiene URL)
+// DELETE /api/materials/:key/files/:fileId — borra un archivo específico
+app.delete("/api/materials/:key/files/:fileId", wrap(async (req, res) => {
+  const key = String(req.params.key || "");
+  const fileId = String(req.params.fileId || "");
+  const def = MATERIAL_DEFS.find((d) => d.key === key);
+  if (!def) return res.status(404).json({ message: "material no existe" });
+  const existing = await readMaterial(key);
+  const next = existing.files.filter((f) => f.id !== fileId);
+  if (next.length === existing.files.length) {
+    return res.status(404).json({ message: "archivo no encontrado" });
+  }
+  const url = existing.url || "";
+  if (next.length === 0 && !url) {
+    await deleteMaterial(key);
+  } else {
+    await writeMaterial(key, { files: next, url, updatedAt: new Date().toISOString() });
+  }
+  res.json({ ok: true, key, fileId, filesCount: next.length });
+}));
+
+// DELETE /api/materials/:key/file — compat: borra TODOS los archivos
 app.delete("/api/materials/:key/file", wrap(async (req, res) => {
   const key = String(req.params.key || "");
   const def = MATERIAL_DEFS.find((d) => d.key === key);
   if (!def) return res.status(404).json({ message: "material no existe" });
-  const existing = (await readMaterial(key)) || {};
+  const existing = await readMaterial(key);
   const url = existing.url || "";
   if (url) {
-    // Conserva solo la URL externa
-    await writeMaterial(key, { url, updatedAt: new Date().toISOString() });
+    await writeMaterial(key, { files: [], url, updatedAt: new Date().toISOString() });
   } else {
     await deleteMaterial(key);
   }
   res.json({ ok: true, key });
 }));
 
-// GET /api/materials/:key/download — sirve el binario con su mimeType
+// GET /api/materials/:key/files/:fileId/download — sirve un archivo específico
+app.get("/api/materials/:key/files/:fileId/download", wrap(async (req, res) => {
+  const key = String(req.params.key || "");
+  const fileId = String(req.params.fileId || "");
+  const def = MATERIAL_DEFS.find((d) => d.key === key);
+  if (!def) return res.status(404).json({ message: "material no existe" });
+  const data = await readMaterial(key);
+  const file = data.files.find((f) => f.id === fileId);
+  if (!file || !file.dataBase64) {
+    return res.status(404).json({ message: "archivo no encontrado" });
+  }
+  try {
+    const buf = Buffer.from(file.dataBase64, "base64");
+    res.setHeader("Content-Type", file.mimeType || "application/octet-stream");
+    res.setHeader("Content-Disposition", `inline; filename=\"${(file.filename || key).replace(/"/g, "")}\"`);
+    res.setHeader("Cache-Control", "private, max-age=300");
+    res.send(buf);
+  } catch (e) {
+    res.status(500).json({ message: "error decodificando archivo", error: e?.message });
+  }
+}));
+
+// GET /api/materials/:key/download — compat: sirve el PRIMER archivo
 app.get("/api/materials/:key/download", wrap(async (req, res) => {
   const key = String(req.params.key || "");
   const def = MATERIAL_DEFS.find((d) => d.key === key);
   if (!def) return res.status(404).json({ message: "material no existe" });
   const data = await readMaterial(key);
-  if (!data || !data.dataBase64) {
+  const file = data.files[0];
+  if (!file || !file.dataBase64) {
     return res.status(404).json({ message: "sin archivo subido" });
   }
   try {
-    const buf = Buffer.from(data.dataBase64, "base64");
-    res.setHeader("Content-Type", data.mimeType || "application/octet-stream");
-    res.setHeader("Content-Disposition", `inline; filename=\"${(data.filename || key).replace(/"/g, "")}\"`);
+    const buf = Buffer.from(file.dataBase64, "base64");
+    res.setHeader("Content-Type", file.mimeType || "application/octet-stream");
+    res.setHeader("Content-Disposition", `inline; filename=\"${(file.filename || key).replace(/"/g, "")}\"`);
     res.setHeader("Cache-Control", "private, max-age=300");
     res.send(buf);
   } catch (e) {
