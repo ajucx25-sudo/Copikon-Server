@@ -81,7 +81,7 @@ const STATIC_KEYS = ["departments", "announcements", "jobDescriptions", "process
 
 const app = express();
 app.use(cors({ origin: true, credentials: true }));
-app.use(express.json({ limit: "25mb" }));
+app.use(express.json({ limit: "60mb" }));
 
 const wrap = (fn) => (req, res) =>
   Promise.resolve(fn(req, res)).catch((err) => {
@@ -624,6 +624,137 @@ app.delete("/api/admin/technical-providers/:id/revoke-access", wrap(async (req, 
   const [removed] = employees.splice(idx, 1);
   await writeCol("employees", employees);
   res.json({ ok: true, removedUserId: removed.id });
+}));
+
+// ───── Marketing · Materiales Corporativos ─────────────────
+// Almacena PDFs/videos por material en la tabla `kv` bajo clave
+// `material:<key>`. Cada material tiene: filename, mimeType,
+// dataBase64 (opcional, archivo subido), size, url (enlace ext.),
+// updatedAt. Si no hay archivo ni URL, el frontend genera PDF auto.
+
+const MATERIAL_DEFS = [
+  { key: "presentacion_corporativa", title: "Presentación Corporativa", kind: "pdf" },
+  { key: "catalogo_productos",       title: "Catálogo de Productos",   kind: "pdf" },
+  { key: "brochure",                 title: "Brochure Institucional",   kind: "pdf" },
+  { key: "casos_exito",              title: "Casos de Éxito / Referencias", kind: "pdf" },
+  { key: "certificaciones",          title: "Certificaciones y Garantías",  kind: "pdf" },
+  { key: "video_corporativo",        title: "Video Corporativo",        kind: "video" },
+];
+
+async function readMaterial(key) {
+  const r = await pool.query("SELECT value FROM kv WHERE key = $1", [`material:${key}`]);
+  if (!r.rows[0]) return null;
+  const v = r.rows[0].value;
+  return v && typeof v === "object" ? v : null;
+}
+
+async function writeMaterial(key, data) {
+  await pool.query(
+    `INSERT INTO kv (key, value, updated_at) VALUES ($1, $2::jsonb, $3)
+     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at`,
+    [`material:${key}`, JSON.stringify(data ?? {}), Date.now()]
+  );
+}
+
+async function deleteMaterial(key) {
+  await pool.query("DELETE FROM kv WHERE key = $1", [`material:${key}`]);
+}
+
+// GET /api/materials — lista los 6 materiales con su estado (sin el blob)
+app.get("/api/materials", wrap(async (_req, res) => {
+  const out = [];
+  for (const def of MATERIAL_DEFS) {
+    const data = await readMaterial(def.key);
+    out.push({
+      key: def.key,
+      title: def.title,
+      kind: def.kind,
+      hasFile: !!(data && data.dataBase64),
+      filename: data?.filename || null,
+      mimeType: data?.mimeType || null,
+      size: data?.size || null,
+      url: data?.url || "",
+      updatedAt: data?.updatedAt || null,
+    });
+  }
+  res.json(out);
+}));
+
+// POST /api/materials/:key/upload — sube archivo (base64)
+app.post("/api/materials/:key/upload", wrap(async (req, res) => {
+  const key = String(req.params.key || "");
+  const def = MATERIAL_DEFS.find((d) => d.key === key);
+  if (!def) return res.status(404).json({ message: "material no existe" });
+  const { filename, mimeType, dataBase64 } = req.body || {};
+  if (!dataBase64 || typeof dataBase64 !== "string") {
+    return res.status(400).json({ message: "dataBase64 requerido" });
+  }
+  // Calcular tamaño aproximado del binario
+  const cleaned = dataBase64.replace(/\s/g, "");
+  const size = Math.floor((cleaned.length * 3) / 4) - (cleaned.endsWith("==") ? 2 : cleaned.endsWith("=") ? 1 : 0);
+  // Límite 50MB
+  if (size > 50 * 1024 * 1024) {
+    return res.status(413).json({ message: "archivo excede 50 MB" });
+  }
+  const existing = (await readMaterial(key)) || {};
+  const updated = {
+    ...existing,
+    filename: String(filename || (def.kind === "video" ? "video.mp4" : "documento.pdf")),
+    mimeType: String(mimeType || (def.kind === "video" ? "video/mp4" : "application/pdf")),
+    dataBase64: cleaned,
+    size,
+    updatedAt: new Date().toISOString(),
+  };
+  await writeMaterial(key, updated);
+  res.json({ ok: true, key, filename: updated.filename, size, mimeType: updated.mimeType });
+}));
+
+// PATCH /api/materials/:key/url — guarda enlace externo
+app.patch("/api/materials/:key/url", wrap(async (req, res) => {
+  const key = String(req.params.key || "");
+  const def = MATERIAL_DEFS.find((d) => d.key === key);
+  if (!def) return res.status(404).json({ message: "material no existe" });
+  const url = String(req.body?.url || "").trim();
+  const existing = (await readMaterial(key)) || {};
+  const updated = { ...existing, url, updatedAt: new Date().toISOString() };
+  await writeMaterial(key, updated);
+  res.json({ ok: true, key, url });
+}));
+
+// DELETE /api/materials/:key/file — borra el archivo subido (mantiene URL)
+app.delete("/api/materials/:key/file", wrap(async (req, res) => {
+  const key = String(req.params.key || "");
+  const def = MATERIAL_DEFS.find((d) => d.key === key);
+  if (!def) return res.status(404).json({ message: "material no existe" });
+  const existing = (await readMaterial(key)) || {};
+  const url = existing.url || "";
+  if (url) {
+    // Conserva solo la URL externa
+    await writeMaterial(key, { url, updatedAt: new Date().toISOString() });
+  } else {
+    await deleteMaterial(key);
+  }
+  res.json({ ok: true, key });
+}));
+
+// GET /api/materials/:key/download — sirve el binario con su mimeType
+app.get("/api/materials/:key/download", wrap(async (req, res) => {
+  const key = String(req.params.key || "");
+  const def = MATERIAL_DEFS.find((d) => d.key === key);
+  if (!def) return res.status(404).json({ message: "material no existe" });
+  const data = await readMaterial(key);
+  if (!data || !data.dataBase64) {
+    return res.status(404).json({ message: "sin archivo subido" });
+  }
+  try {
+    const buf = Buffer.from(data.dataBase64, "base64");
+    res.setHeader("Content-Type", data.mimeType || "application/octet-stream");
+    res.setHeader("Content-Disposition", `inline; filename=\"${(data.filename || key).replace(/"/g, "")}\"`);
+    res.setHeader("Cache-Control", "private, max-age=300");
+    res.send(buf);
+  } catch (e) {
+    res.status(500).json({ message: "error decodificando archivo", error: e?.message });
+  }
 }));
 
 // ───── Arranque ─────────────────────────────────────────────
