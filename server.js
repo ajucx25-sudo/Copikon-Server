@@ -95,6 +95,7 @@ const ROUTES = {
   "/api/2bc/files": "twoBCFiles",
   "/api/2bc/clients": "twoBCClients",
   "/api/2bc/quotes": "twoBCQuotes",
+  "/api/erp/sales-invoices": "erpSalesInvoices",
 };
 
 const STATIC_KEYS = ["departments", "announcements", "jobDescriptions", "processMaps", "courses"];
