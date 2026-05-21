@@ -647,13 +647,13 @@ app.delete("/api/admin/technical-providers/:id/revoke-access", wrap(async (req, 
   res.json({ ok: true, removedUserId: removed.id });
 }));
 
-// ───── Marketing · Materiales Corporativos ─────────────────
-// Almacena PDFs/videos por material en la tabla `kv` bajo clave
-// `material:<key>`. Cada material es:
-//   { files: [{id, filename, mimeType, dataBase64, size, uploadedAt}],
-//     url: string, updatedAt: string }
-// Soporta múltiples archivos por material. Retrocompat con formato
-// antiguo (un solo archivo en la raíz) vía normalización al leer.
+// ───── Marketing · Materiales Corporativos (v2 — storage por archivo) ─────
+// Esquema:
+//   `material:<key>:meta`         → { url, fileIds: [...], updatedAt }
+//   `material:<key>:file:<id>`    → { filename, mimeType, dataBase64, size, uploadedAt }
+//
+// Migración automática desde el esquema viejo `material:<key>` (un solo blob con
+// todos los archivos) la primera vez que se accede a cada key.
 
 const MATERIAL_DEFS = [
   { key: "presentacion_corporativa", title: "Presentación Corporativa", kind: "pdf" },
@@ -664,63 +664,162 @@ const MATERIAL_DEFS = [
   { key: "video_corporativo",        title: "Video Corporativo",        kind: "video" },
 ];
 
-async function readMaterialRaw(key) {
-  const r = await pool.query("SELECT value FROM kv WHERE key = $1", [`material:${key}`]);
+function newFileId() {
+  return `f-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+async function readMaterialMeta(key) {
+  const r = await pool.query("SELECT value FROM kv WHERE key = $1", [`material:${key}:meta`]);
   if (!r.rows[0]) return null;
   const v = r.rows[0].value;
-  return v && typeof v === "object" ? v : null;
+  if (!v || typeof v !== "object") return null;
+  return {
+    url: typeof v.url === "string" ? v.url : "",
+    fileIds: Array.isArray(v.fileIds) ? v.fileIds.map(String) : [],
+    updatedAt: v.updatedAt || null,
+  };
 }
 
-// Normaliza al esquema nuevo {files: [...], url, updatedAt}
-// IMPORTANTE: si detectamos formato viejo (dataBase64 en la raíz), persistimos
-// la migración a `files[]` para que el id sea estable. Antes generábamos un id
-// mig-${Date.now()} en cada lectura, lo que rompía DELETE porque el id que vio
-// el cliente ya no coincidía con el siguiente render del servidor.
-async function readMaterial(key) {
-  const raw = await readMaterialRaw(key);
-  if (!raw) return { files: [], url: "", updatedAt: null };
-  const files = Array.isArray(raw.files) ? [...raw.files] : [];
-  let needsPersist = false;
-  // Migración: si existía un archivo único en la raíz, lo movemos al array
-  if (raw.dataBase64 && files.length === 0) {
-    files.push({
-      id: `mig-${Date.now()}`,
-      filename: raw.filename || "documento.pdf",
-      mimeType: raw.mimeType || "application/pdf",
-      dataBase64: raw.dataBase64,
-      size: raw.size || 0,
-      uploadedAt: raw.updatedAt || new Date().toISOString(),
-    });
-    needsPersist = true;
-  }
-  // Asegurar id estable: si algún archivo no tiene id, asignar uno y persistir
-  for (const f of files) {
-    if (!f.id) {
-      f.id = `mig-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      needsPersist = true;
-    }
-  }
-  const updatedAt = raw.updatedAt || new Date().toISOString();
-  if (needsPersist) {
-    try {
-      await writeMaterial(key, { files, url: raw.url || "", updatedAt });
-    } catch (e) {
-      console.warn(`[materials] no se pudo persistir migración de ${key}:`, e?.message || e);
-    }
-  }
-  return { files, url: raw.url || "", updatedAt };
-}
-
-async function writeMaterial(key, data) {
+async function writeMaterialMeta(key, meta) {
+  const payload = {
+    url: meta.url || "",
+    fileIds: Array.isArray(meta.fileIds) ? meta.fileIds : [],
+    updatedAt: meta.updatedAt || new Date().toISOString(),
+  };
   await pool.query(
     `INSERT INTO kv (key, value, updated_at) VALUES ($1, $2::jsonb, $3)
      ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at`,
-    [`material:${key}`, JSON.stringify(data ?? {}), Date.now()]
+    [`material:${key}:meta`, JSON.stringify(payload), Date.now()]
   );
 }
 
-async function deleteMaterial(key) {
-  await pool.query("DELETE FROM kv WHERE key = $1", [`material:${key}`]);
+async function deleteMaterialMeta(key) {
+  await pool.query("DELETE FROM kv WHERE key = $1", [`material:${key}:meta`]);
+}
+
+async function readMaterialFile(key, fileId) {
+  const r = await pool.query("SELECT value FROM kv WHERE key = $1", [`material:${key}:file:${fileId}`]);
+  if (!r.rows[0]) return null;
+  const v = r.rows[0].value;
+  if (!v || typeof v !== "object") return null;
+  return {
+    id: fileId,
+    filename: v.filename || "documento",
+    mimeType: v.mimeType || "application/octet-stream",
+    dataBase64: typeof v.dataBase64 === "string" ? v.dataBase64 : "",
+    size: Number(v.size) || 0,
+    uploadedAt: v.uploadedAt || null,
+  };
+}
+
+async function readMaterialFileMeta(key, fileId) {
+  // Sólo metadata, sin el blob (para no cargar MBs por nada)
+  const r = await pool.query(
+    "SELECT value - 'dataBase64' AS m FROM kv WHERE key = $1",
+    [`material:${key}:file:${fileId}`]
+  );
+  if (!r.rows[0]) return null;
+  const m = r.rows[0].m;
+  if (!m || typeof m !== "object") return null;
+  return {
+    id: fileId,
+    filename: m.filename || "documento",
+    mimeType: m.mimeType || "application/octet-stream",
+    size: Number(m.size) || 0,
+    uploadedAt: m.uploadedAt || null,
+  };
+}
+
+async function writeMaterialFile(key, fileId, fileData) {
+  const payload = {
+    filename: String(fileData.filename || "documento"),
+    mimeType: String(fileData.mimeType || "application/octet-stream"),
+    dataBase64: String(fileData.dataBase64 || ""),
+    size: Number(fileData.size) || 0,
+    uploadedAt: fileData.uploadedAt || new Date().toISOString(),
+  };
+  await pool.query(
+    `INSERT INTO kv (key, value, updated_at) VALUES ($1, $2::jsonb, $3)
+     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at`,
+    [`material:${key}:file:${fileId}`, JSON.stringify(payload), Date.now()]
+  );
+}
+
+async function deleteMaterialFile(key, fileId) {
+  await pool.query("DELETE FROM kv WHERE key = $1", [`material:${key}:file:${fileId}`]);
+}
+
+async function deleteAllMaterialFiles(key) {
+  await pool.query("DELETE FROM kv WHERE key LIKE $1", [`material:${key}:file:%`]);
+}
+
+// Migración automática desde esquema viejo `material:<key>` (un solo blob).
+async function migrateIfNeeded(key) {
+  const meta = await readMaterialMeta(key);
+  if (meta) return; // ya migrado
+  const r = await pool.query("SELECT value FROM kv WHERE key = $1", [`material:${key}`]);
+  if (!r.rows[0]) return;
+  const old = r.rows[0].value;
+  if (!old || typeof old !== "object") return;
+
+  const filesOld = [];
+  if (Array.isArray(old.files) && old.files.length > 0) {
+    for (const f of old.files) {
+      if (!f) continue;
+      filesOld.push({
+        id: f.id || newFileId(),
+        filename: f.filename || "documento",
+        mimeType: f.mimeType || "application/octet-stream",
+        dataBase64: f.dataBase64 || "",
+        size: Number(f.size) || 0,
+        uploadedAt: f.uploadedAt || old.updatedAt || new Date().toISOString(),
+      });
+    }
+  } else if (old.dataBase64) {
+    filesOld.push({
+      id: newFileId(),
+      filename: old.filename || "documento.pdf",
+      mimeType: old.mimeType || "application/pdf",
+      dataBase64: old.dataBase64,
+      size: Number(old.size) || 0,
+      uploadedAt: old.updatedAt || new Date().toISOString(),
+    });
+  }
+
+  const fileIds = [];
+  for (const f of filesOld) {
+    try {
+      await writeMaterialFile(key, f.id, f);
+      fileIds.push(f.id);
+    } catch (e) {
+      console.warn(`[materials] migracion: error con archivo de ${key}:`, e?.message || e);
+    }
+  }
+  await writeMaterialMeta(key, {
+    url: typeof old.url === "string" ? old.url : "",
+    fileIds,
+    updatedAt: old.updatedAt || new Date().toISOString(),
+  });
+  if (fileIds.length === filesOld.length) {
+    try {
+      await pool.query("DELETE FROM kv WHERE key = $1", [`material:${key}`]);
+      console.log(`[materials] migrado ${key}: ${fileIds.length} archivos a esquema v2`);
+    } catch (e) {
+      console.warn(`[materials] no se pudo borrar blob viejo de ${key}:`, e?.message || e);
+    }
+  }
+}
+
+async function readMaterial(key) {
+  await migrateIfNeeded(key);
+  const meta = await readMaterialMeta(key);
+  if (!meta) return { files: [], url: "", updatedAt: null };
+  const files = [];
+  for (const id of meta.fileIds) {
+    const fm = await readMaterialFileMeta(key, id);
+    if (fm) files.push(fm);
+  }
+  return { files, url: meta.url || "", updatedAt: meta.updatedAt || null };
 }
 
 function fileMeta(f) {
@@ -733,7 +832,7 @@ function fileMeta(f) {
   };
 }
 
-// GET /api/materials — lista los 6 materiales con su estado (sin blobs)
+// GET /api/materials — lista los 6 materiales (sin blobs)
 app.get("/api/materials", wrap(async (_req, res) => {
   const out = [];
   for (const def of MATERIAL_DEFS) {
@@ -743,14 +842,12 @@ app.get("/api/materials", wrap(async (_req, res) => {
       key: def.key,
       title: def.title,
       kind: def.kind,
-      // Compat: campos del primer archivo en la raíz
       hasFile: data.files.length > 0,
       filename: first?.filename || null,
       mimeType: first?.mimeType || null,
       size: first?.size || null,
       url: data.url || "",
       updatedAt: data.updatedAt || null,
-      // Nuevo: lista completa
       files: data.files.map(fileMeta),
       filesCount: data.files.length,
     });
@@ -758,7 +855,7 @@ app.get("/api/materials", wrap(async (_req, res) => {
   res.json(out);
 }));
 
-// GET /api/materials/:key — detalle de un material con sus archivos (sin blobs)
+// GET /api/materials/:key
 app.get("/api/materials/:key", wrap(async (req, res) => {
   const key = String(req.params.key || "");
   const def = MATERIAL_DEFS.find((d) => d.key === key);
@@ -774,7 +871,7 @@ app.get("/api/materials/:key", wrap(async (req, res) => {
   });
 }));
 
-// POST /api/materials/:key/upload — agrega un archivo (múltiples permitidos)
+// POST /api/materials/:key/upload — agrega un archivo (storage individual)
 app.post("/api/materials/:key/upload", wrap(async (req, res) => {
   const key = String(req.params.key || "");
   const def = MATERIAL_DEFS.find((d) => d.key === key);
@@ -788,54 +885,59 @@ app.post("/api/materials/:key/upload", wrap(async (req, res) => {
   if (size > 50 * 1024 * 1024) {
     return res.status(413).json({ message: "archivo excede 50 MB" });
   }
-  const existing = await readMaterial(key);
+  await migrateIfNeeded(key);
+  const fileId = newFileId();
   const newFile = {
-    id: `f-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     filename: String(filename || (def.kind === "video" ? "video.mp4" : "documento.pdf")),
     mimeType: String(mimeType || (def.kind === "video" ? "video/mp4" : "application/pdf")),
     dataBase64: cleaned,
     size,
     uploadedAt: new Date().toISOString(),
   };
-  const updated = {
-    files: [...existing.files, newFile],
-    url: existing.url || "",
-    updatedAt: new Date().toISOString(),
-  };
-  await writeMaterial(key, updated);
-  res.json({ ok: true, key, file: fileMeta(newFile), filesCount: updated.files.length });
+  // Escribir el archivo nuevo (1 fila independiente — no toca a los anteriores)
+  await writeMaterialFile(key, fileId, newFile);
+  // Actualizar meta agregando el fileId a la lista
+  const meta = (await readMaterialMeta(key)) || { url: "", fileIds: [], updatedAt: null };
+  meta.fileIds = [...meta.fileIds, fileId];
+  meta.updatedAt = new Date().toISOString();
+  await writeMaterialMeta(key, meta);
+  res.json({ ok: true, key, file: fileMeta({ id: fileId, ...newFile }), filesCount: meta.fileIds.length });
 }));
 
-// PATCH /api/materials/:key/url — guarda enlace externo
+// PATCH /api/materials/:key/url
 app.patch("/api/materials/:key/url", wrap(async (req, res) => {
   const key = String(req.params.key || "");
   const def = MATERIAL_DEFS.find((d) => d.key === key);
   if (!def) return res.status(404).json({ message: "material no existe" });
+  await migrateIfNeeded(key);
   const url = String(req.body?.url || "").trim();
-  const existing = await readMaterial(key);
-  const updated = { files: existing.files, url, updatedAt: new Date().toISOString() };
-  await writeMaterial(key, updated);
+  const meta = (await readMaterialMeta(key)) || { url: "", fileIds: [], updatedAt: null };
+  meta.url = url;
+  meta.updatedAt = new Date().toISOString();
+  await writeMaterialMeta(key, meta);
   res.json({ ok: true, key, url });
 }));
 
-// DELETE /api/materials/:key/files/:fileId — borra un archivo específico
+// DELETE /api/materials/:key/files/:fileId — borra un archivo individual
 app.delete("/api/materials/:key/files/:fileId", wrap(async (req, res) => {
   const key = String(req.params.key || "");
   const fileId = String(req.params.fileId || "");
   const def = MATERIAL_DEFS.find((d) => d.key === key);
   if (!def) return res.status(404).json({ message: "material no existe" });
-  const existing = await readMaterial(key);
-  const next = existing.files.filter((f) => f.id !== fileId);
-  if (next.length === existing.files.length) {
+  await migrateIfNeeded(key);
+  const meta = await readMaterialMeta(key);
+  if (!meta || !meta.fileIds.includes(fileId)) {
     return res.status(404).json({ message: "archivo no encontrado" });
   }
-  const url = existing.url || "";
-  if (next.length === 0 && !url) {
-    await deleteMaterial(key);
+  await deleteMaterialFile(key, fileId);
+  meta.fileIds = meta.fileIds.filter((id) => id !== fileId);
+  meta.updatedAt = new Date().toISOString();
+  if (meta.fileIds.length === 0 && !meta.url) {
+    await deleteMaterialMeta(key);
   } else {
-    await writeMaterial(key, { files: next, url, updatedAt: new Date().toISOString() });
+    await writeMaterialMeta(key, meta);
   }
-  res.json({ ok: true, key, fileId, filesCount: next.length });
+  res.json({ ok: true, key, fileId, filesCount: meta.fileIds.length });
 }));
 
 // DELETE /api/materials/:key/file — compat: borra TODOS los archivos
@@ -843,31 +945,33 @@ app.delete("/api/materials/:key/file", wrap(async (req, res) => {
   const key = String(req.params.key || "");
   const def = MATERIAL_DEFS.find((d) => d.key === key);
   if (!def) return res.status(404).json({ message: "material no existe" });
-  const existing = await readMaterial(key);
-  const url = existing.url || "";
+  await migrateIfNeeded(key);
+  const meta = await readMaterialMeta(key);
+  const url = meta?.url || "";
+  await deleteAllMaterialFiles(key);
   if (url) {
-    await writeMaterial(key, { files: [], url, updatedAt: new Date().toISOString() });
+    await writeMaterialMeta(key, { url, fileIds: [], updatedAt: new Date().toISOString() });
   } else {
-    await deleteMaterial(key);
+    await deleteMaterialMeta(key);
   }
   res.json({ ok: true, key });
 }));
 
-// GET /api/materials/:key/files/:fileId/download — sirve un archivo específico
+// GET /api/materials/:key/files/:fileId/download
 app.get("/api/materials/:key/files/:fileId/download", wrap(async (req, res) => {
   const key = String(req.params.key || "");
   const fileId = String(req.params.fileId || "");
   const def = MATERIAL_DEFS.find((d) => d.key === key);
   if (!def) return res.status(404).json({ message: "material no existe" });
-  const data = await readMaterial(key);
-  const file = data.files.find((f) => f.id === fileId);
+  await migrateIfNeeded(key);
+  const file = await readMaterialFile(key, fileId);
   if (!file || !file.dataBase64) {
     return res.status(404).json({ message: "archivo no encontrado" });
   }
   try {
     const buf = Buffer.from(file.dataBase64, "base64");
     res.setHeader("Content-Type", file.mimeType || "application/octet-stream");
-    res.setHeader("Content-Disposition", `inline; filename=\"${(file.filename || key).replace(/"/g, "")}\"`);
+    res.setHeader("Content-Disposition", `inline; filename="${(file.filename || key).replace(/"/g, "")}"`);
     res.setHeader("Cache-Control", "private, max-age=300");
     res.send(buf);
   } catch (e) {
@@ -880,15 +984,18 @@ app.get("/api/materials/:key/download", wrap(async (req, res) => {
   const key = String(req.params.key || "");
   const def = MATERIAL_DEFS.find((d) => d.key === key);
   if (!def) return res.status(404).json({ message: "material no existe" });
-  const data = await readMaterial(key);
-  const file = data.files[0];
+  await migrateIfNeeded(key);
+  const meta = await readMaterialMeta(key);
+  const firstId = meta?.fileIds?.[0];
+  if (!firstId) return res.status(404).json({ message: "sin archivo subido" });
+  const file = await readMaterialFile(key, firstId);
   if (!file || !file.dataBase64) {
     return res.status(404).json({ message: "sin archivo subido" });
   }
   try {
     const buf = Buffer.from(file.dataBase64, "base64");
     res.setHeader("Content-Type", file.mimeType || "application/octet-stream");
-    res.setHeader("Content-Disposition", `inline; filename=\"${(file.filename || key).replace(/"/g, "")}\"`);
+    res.setHeader("Content-Disposition", `inline; filename="${(file.filename || key).replace(/"/g, "")}"`);
     res.setHeader("Cache-Control", "private, max-age=300");
     res.send(buf);
   } catch (e) {
