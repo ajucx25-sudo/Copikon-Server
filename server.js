@@ -96,6 +96,7 @@ const ROUTES = {
   "/api/2bc/clients": "twoBCClients",
   "/api/2bc/quotes": "twoBCQuotes",
   "/api/erp/sales-invoices": "erpSalesInvoices",
+  "/api/sales-partners": "salesPartners",
 };
 
 const STATIC_KEYS = ["departments", "announcements", "jobDescriptions", "processMaps", "courses"];
@@ -1001,6 +1002,106 @@ app.get("/api/materials/:key/download", wrap(async (req, res) => {
   } catch (e) {
     res.status(500).json({ message: "error decodificando archivo", error: e?.message });
   }
+}));
+
+// ───── Dashboard de Ventas (resumen agregado) ──────────────
+app.get("/api/sales/dashboard-summary", wrap(async (_req, res) => {
+  const [leads, employees, partners, visits, maintOrders] = await Promise.all([
+    readCol("erpLeads"),
+    readCol("employees"),
+    readCol("salesPartners"),
+    readCol("erpVisits"),
+    readCol("erpMaintenanceOrders"),
+  ]);
+  const now = new Date();
+  const startMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+  const startYear = new Date(now.getFullYear(), 0, 1);
+  const toNum = (v) => Number(v) || 0;
+  const stageOf = (l) => String(l?.stage || l?.stageId || "").toLowerCase();
+  const won = (l) => ["aprobada", "cerrada_ganada", "instalacion"].includes(stageOf(l));
+  const lost = (l) => ["perdida", "cerrada_perdida"].includes(stageOf(l));
+  const active = (l) => !won(l) && !lost(l);
+  const amount = (l) => toNum(l?.amount || l?.totalAmount || l?.value || 0);
+  const inDate = (d, start) => d && new Date(d) >= start;
+
+  // KPIs hero
+  const pipelineUsd = leads.filter(active).reduce((s, l) => s + amount(l), 0);
+  const closedMonthUsd = leads.filter((l) => won(l) && inDate(l.closedAt || l.updatedAt, startMonth)).reduce((s, l) => s + amount(l), 0);
+  const closedYearUsd = leads.filter((l) => won(l) && inDate(l.closedAt || l.updatedAt, startYear)).reduce((s, l) => s + amount(l), 0);
+  const allClosed = leads.filter((l) => won(l) || lost(l)).length;
+  const conversionRate = allClosed > 0 ? (leads.filter(won).length / allClosed) * 100 : 0;
+  const activeLeadsCount = leads.filter(active).length;
+  const todayStr = now.toISOString().slice(0, 10);
+  const visitsToday = visits.filter((v) => String(v.scheduledDate || v.date || "").slice(0, 10) === todayStr).length;
+  const pendingInspections = leads.filter((l) => stageOf(l) === "inspeccion_tecnica").length;
+
+  // Embudo por etapa
+  const stages = ["nuevo", "presentacion_corporativa", "inspeccion_tecnica", "cotizacion", "negociacion", "aprobada", "instalacion"];
+  const funnel = stages.map((s) => ({
+    stage: s,
+    count: leads.filter((l) => stageOf(l) === s).length,
+    amount: leads.filter((l) => stageOf(l) === s).reduce((sum, l) => sum + amount(l), 0),
+  }));
+
+  // Ranking vendedores (internos + partners) por USD cerrado este mes
+  const sellerMap = new Map();
+  for (const l of leads) {
+    if (!won(l) || !inDate(l.closedAt || l.updatedAt, startMonth)) continue;
+    const partnerId = l.salesPartnerId ? `p-${l.salesPartnerId}` : null;
+    const empId = l.assigneeId ? `e-${l.assigneeId}` : null;
+    const k = partnerId || empId;
+    if (!k) continue;
+    const prev = sellerMap.get(k) || { id: k, type: partnerId ? "partner" : "internal", closedUsd: 0, deals: 0 };
+    prev.closedUsd += amount(l);
+    prev.deals += 1;
+    sellerMap.set(k, prev);
+  }
+  const ranking = Array.from(sellerMap.values())
+    .map((r) => {
+      let name = "", goal = 0;
+      if (r.type === "partner") {
+        const p = partners.find((x) => `p-${x.id}` === r.id);
+        name = p ? `${p.firstName || ""} ${p.lastName || ""}`.trim() : "Partner";
+        goal = toNum(p?.monthlyGoalUsd);
+      } else {
+        const e = employees.find((x) => `e-${x.id}` === r.id);
+        name = e ? `${e.firstName || ""} ${e.lastName || ""}`.trim() : "Vendedor";
+        goal = toNum(e?.monthlySalesGoalUsd);
+      }
+      return { ...r, name, monthlyGoalUsd: goal, progressPct: goal > 0 ? Math.round((r.closedUsd / goal) * 100) : null };
+    })
+    .sort((a, b) => b.closedUsd - a.closedUsd)
+    .slice(0, 5);
+
+  // Rutas: contadores simples
+  const routesVentas = new Set(leads.filter((l) => l.routeId && stageOf(l) !== "inspeccion_tecnica").map((l) => l.routeId)).size;
+  const routesTecnicas = new Set(leads.filter((l) => l.routeId && stageOf(l) === "inspeccion_tecnica").map((l) => l.routeId)).size;
+
+  // Actividad reciente: últimos 10 leads modificados
+  const recent = [...leads]
+    .sort((a, b) => new Date(b.updatedAt || b.createdAt || 0).getTime() - new Date(a.updatedAt || a.createdAt || 0).getTime())
+    .slice(0, 10)
+    .map((l) => ({ id: l.id, name: l.name || l.clientName, stage: stageOf(l), amount: amount(l), updatedAt: l.updatedAt || l.createdAt, assigneeId: l.assigneeId, salesPartnerId: l.salesPartnerId }));
+
+  res.json({
+    pipelineUsd,
+    closedMonthUsd,
+    closedYearUsd,
+    conversionRate,
+    activeLeadsCount,
+    visitsToday,
+    pendingInspections,
+    funnel,
+    ranking,
+    routesVentas,
+    routesTecnicas,
+    recent,
+    totalsByType: {
+      internal: ranking.filter((r) => r.type === "internal").length,
+      partner: ranking.filter((r) => r.type === "partner").length,
+    },
+    generatedAt: now.toISOString(),
+  });
 }));
 
 // ───── Arranque ─────────────────────────────────────────────
