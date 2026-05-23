@@ -118,19 +118,75 @@ app.get("/api/health", wrap(async (_req, res) => {
 }));
 
 // ───── Login simple (sin hash) ──────────────────────────────
+// Construye user shape para partner externo
+function buildPartnerUser(p) {
+  return {
+    id: `p-${p.id}`,
+    salesPartnerId: p.id,
+    username: p.username || "",
+    firstName: p.firstName || "",
+    lastName: p.lastName || "",
+    email: p.email || "",
+    phone: p.phone || "",
+    cedula: p.cedula || "",
+    position: "Partner Externo",
+    company: p.company || "",
+    region: p.region || "",
+    level: "partner_externo",
+    role: "partner_externo",
+    isPartner: true,
+    tier: p.tier || "bronze",
+    commissionPct: Number(p.commissionPct) || 0,
+    monthlyGoalUsd: Number(p.monthlyGoalUsd) || 0,
+    annualGoalUsd: Number(p.annualGoalUsd) || 0,
+    canAccessGeneralMenu: false,
+    moduleAccess: ["ventas", "modo_campo"],
+    menuAccess: ["dashboard", "leads", "rutas", "catalogo", "mi_perfil"],
+    status: p.status || "active",
+  };
+}
+
 app.post("/api/auth/login", wrap(async (req, res) => {
   const { username, password } = req.body || {};
   const employees = await readCol("employees");
   const emp = employees.find(
     (e) => e && e.username === username && e.password === password
   );
-  if (!emp) return res.status(401).json({ message: "Credenciales inválidas" });
-  return res.json({ token: `srv-${emp.id}-${Date.now()}`, user: emp });
+  if (emp) {
+    return res.json({ token: `srv-${emp.id}-${Date.now()}`, user: emp });
+  }
+  // Buscar en partners externos
+  const partners = await readCol("salesPartners").catch(() => []);
+  const p = (Array.isArray(partners) ? partners : []).find(
+    (x) => x && x.username && String(x.username) === String(username) && String(x.password ?? "") === String(password ?? "")
+  );
+  if (p) {
+    if (p.canLogin === false || p.canLogin === 0 || p.canLogin === "false") {
+      return res.status(403).json({ message: "Acceso desactivado. Contacta al administrador." });
+    }
+    if (p.status === "inactive") {
+      return res.status(403).json({ message: "Partner inactivo." });
+    }
+    return res.json({ token: `srv-p${p.id}-${Date.now()}`, user: buildPartnerUser(p) });
+  }
+  return res.status(401).json({ message: "Credenciales inválidas" });
 }));
 
 app.get("/api/auth/me", wrap(async (req, res) => {
   const auth = req.headers.authorization || "";
   const token = auth.replace(/^Bearer\s+/, "");
+  // Token partner: srv-p<id>-<ts>
+  const mp = token.match(/^srv-p(\d+)-/);
+  if (mp) {
+    const pid = Number(mp[1]);
+    const partners = await readCol("salesPartners").catch(() => []);
+    const p = (Array.isArray(partners) ? partners : []).find((x) => Number(x.id) === pid);
+    if (!p) return res.status(401).json({ message: "Unauthorized" });
+    if (p.canLogin === false || p.status === "inactive") {
+      return res.status(401).json({ message: "Acceso revocado" });
+    }
+    return res.json(buildPartnerUser(p));
+  }
   const m = token.match(/^srv-(\d+)-/);
   if (!m) return res.status(401).json({ message: "Unauthorized" });
   const id = Number(m[1]);
@@ -245,17 +301,46 @@ app.put("/api/salary-bands/by-employee", wrap(async (req, res) => {
   return res.status(201).json(created);
 }));
 
+// ───── Sanitizado GET sales-partners (oculta password) ─────────
+function sanitizePartner(p) {
+  if (!p || typeof p !== "object") return p;
+  const out = { ...p };
+  if (out.password != null) {
+    out.hasPassword = true;
+    delete out.password;
+  } else {
+    out.hasPassword = false;
+  }
+  return out;
+}
+app.get("/api/sales-partners", wrap(async (_req, res) => {
+  const arr = await readCol("salesPartners").catch(() => []);
+  res.json((Array.isArray(arr) ? arr : []).map(sanitizePartner));
+}));
+app.get("/api/sales-partners/:id", wrap(async (req, res) => {
+  const id = Number(req.params.id);
+  const arr = await readCol("salesPartners").catch(() => []);
+  const it = (Array.isArray(arr) ? arr : []).find((x) => Number(x.id) === id);
+  if (!it) return res.status(404).json({ message: "not found" });
+  res.json(sanitizePartner(it));
+}));
+
 // ───── CRUD genérico por colección ──────────────────────────
 for (const [route, key] of Object.entries(ROUTES)) {
-  app.get(route, wrap(async (_req, res) => res.json(await readCol(key))));
+  // Skip GET para sales-partners (ya manejado arriba con sanitización)
+  if (route !== "/api/sales-partners") {
+    app.get(route, wrap(async (_req, res) => res.json(await readCol(key))));
+  }
 
-  app.get(`${route}/:id`, wrap(async (req, res) => {
-    const id = Number(req.params.id);
-    const items = await readCol(key);
-    const item = items.find((x) => Number(x.id) === id);
-    if (!item) return res.status(404).json({ message: "not found" });
-    res.json(item);
-  }));
+  if (route !== "/api/sales-partners") {
+    app.get(`${route}/:id`, wrap(async (req, res) => {
+      const id = Number(req.params.id);
+      const items = await readCol(key);
+      const item = items.find((x) => Number(x.id) === id);
+      if (!item) return res.status(404).json({ message: "not found" });
+      res.json(item);
+    }));
+  }
 
   app.post(route, wrap(async (req, res) => {
     const items = await readCol(key);
@@ -481,6 +566,48 @@ app.post("/api/admin/users/:id/reset-password", wrap(async (req, res) => {
   items[idx] = { ...items[idx], password: newPass, mustChangePassword: 1 };
   await writeCol("employees", items);
   res.json({ ok: true, newPassword: newPass });
+}));
+
+// ───── Credenciales de partners externos ───────────────────
+// POST /api/sales-partners/:id/set-credentials — { username, password, canLogin }
+app.post("/api/sales-partners/:id/set-credentials", wrap(async (req, res) => {
+  const id = Number(req.params.id);
+  const arr = await readCol("salesPartners").catch(() => []);
+  if (!Array.isArray(arr)) return res.status(404).json({ message: "not found" });
+  const idx = arr.findIndex((p) => Number(p.id) === id);
+  if (idx < 0) return res.status(404).json({ message: "partner not found" });
+  const body = req.body || {};
+  const updates = {};
+  if (typeof body.username === "string") {
+    const u = body.username.trim().toLowerCase();
+    if (u) {
+      // Validar unicidad contra employees y otros partners
+      const employees = await readCol("employees").catch(() => []);
+      const empClash = (employees || []).some((e) => e && String(e.username || "").toLowerCase() === u);
+      const partnerClash = arr.some((p, i) => i !== idx && String(p.username || "").toLowerCase() === u);
+      if (empClash || partnerClash) {
+        return res.status(409).json({ message: "El nombre de usuario ya está en uso" });
+      }
+      updates.username = u;
+    } else {
+      updates.username = "";
+    }
+  }
+  if (typeof body.password === "string" && body.password.length > 0) {
+    if (body.password.length < 6) {
+      return res.status(400).json({ message: "La contraseña debe tener al menos 6 caracteres" });
+    }
+    updates.password = body.password;
+    updates.mustChangePassword = body.mustChangePassword ? 1 : 0;
+  }
+  if (typeof body.canLogin === "boolean") {
+    updates.canLogin = body.canLogin;
+  }
+  arr[idx] = { ...arr[idx], ...updates };
+  await writeCol("salesPartners", arr);
+  const safe = { ...arr[idx] };
+  delete safe.password;
+  res.json({ ok: true, partner: safe });
 }));
 
 // ───── Acceso a técnicos externos (proveedores) ────────────
