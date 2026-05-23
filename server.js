@@ -140,7 +140,7 @@ function buildPartnerUser(p) {
     monthlyGoalUsd: Number(p.monthlyGoalUsd) || 0,
     annualGoalUsd: Number(p.annualGoalUsd) || 0,
     canAccessGeneralMenu: false,
-    moduleAccess: ["ventas", "modo_campo"],
+    moduleAccess: ["generators-ventas", "modo-campo", "mi-portal"],
     menuAccess: ["dashboard", "leads", "rutas", "catalogo", "mi_perfil"],
     status: p.status || "active",
   };
