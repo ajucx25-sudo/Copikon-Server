@@ -610,6 +610,118 @@ app.post("/api/sales-partners/:id/set-credentials", wrap(async (req, res) => {
   res.json({ ok: true, partner: safe });
 }));
 
+// ───── Acceso a Partners Externos (panel Usuarios y Permisos) ─────
+// Endpoints "one-click" para gestionar credenciales desde el panel admin,
+// análogos a los de technical-providers. Genera username/password si no
+// se proveen y devuelve las credenciales en la respuesta.
+
+function generatePartnerUsername(p) {
+  const email = String(p.email || "").trim().toLowerCase();
+  if (email.includes("@")) {
+    const local = email.split("@")[0];
+    const clean = local.replace(/[^a-z0-9.]/g, "").slice(0, 24);
+    if (clean) return clean;
+  }
+  const first = String(p.firstName || "").trim().toLowerCase().replace(/[^a-z0-9]/g, "");
+  const last = String(p.lastName || "").trim().toLowerCase().replace(/[^a-z0-9]/g, "");
+  if (first && last) return `${first}.${last}`.slice(0, 30);
+  if (first) return first;
+  return `partner${p.id}`;
+}
+
+function generatePartnerPassword() {
+  const chars = "abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  let out = "";
+  for (let i = 0; i < 10; i++) out += chars[Math.floor(Math.random() * chars.length)];
+  return out;
+}
+
+// GET /api/admin/sales-partners — lista para panel Usuarios y Permisos
+app.get("/api/admin/sales-partners", wrap(async (_req, res) => {
+  const arr = await readCol("salesPartners").catch(() => []);
+  const out = (arr || []).map((p) => {
+    const safe = { ...p };
+    delete safe.password;
+    safe.hasLogin = !!(p.username && p.password && p.canLogin !== false);
+    safe.hasPassword = !!p.password;
+    return safe;
+  });
+  res.json(out);
+}));
+
+// POST /api/admin/sales-partners/:id/grant-access — crea o reactiva acceso
+app.post("/api/admin/sales-partners/:id/grant-access", wrap(async (req, res) => {
+  const id = Number(req.params.id);
+  const arr = await readCol("salesPartners").catch(() => []);
+  const idx = (arr || []).findIndex((p) => Number(p.id) === id);
+  if (idx < 0) return res.status(404).json({ message: "partner not found" });
+  const p = arr[idx];
+  const body = req.body || {};
+
+  let username = String(body.username || p.username || "").trim().toLowerCase();
+  if (!username) username = generatePartnerUsername(p);
+  // Validar unicidad
+  const employees = await readCol("employees").catch(() => []);
+  const empClash = (employees || []).some((e) => e && String(e.username || "").toLowerCase() === username);
+  const partnerClash = arr.some((other, i) => i !== idx && String(other.username || "").toLowerCase() === username);
+  if (empClash || partnerClash) {
+    // probar variantes con sufijo numérico
+    let resolved = false;
+    for (let i = 2; i <= 99; i++) {
+      const candidate = `${username}${i}`;
+      const c1 = (employees || []).some((e) => e && String(e.username || "").toLowerCase() === candidate);
+      const c2 = arr.some((other, j) => j !== idx && String(other.username || "").toLowerCase() === candidate);
+      if (!c1 && !c2) { username = candidate; resolved = true; break; }
+    }
+    if (!resolved) return res.status(409).json({ message: "No se pudo generar un username único" });
+  }
+
+  const password = String(body.password || "").trim() || generatePartnerPassword();
+  if (password.length < 6) return res.status(400).json({ message: "La contraseña debe tener al menos 6 caracteres" });
+
+  arr[idx] = {
+    ...p,
+    username,
+    password,
+    canLogin: true,
+    mustChangePassword: 1,
+  };
+  await writeCol("salesPartners", arr);
+  res.json({
+    ok: true,
+    action: p.username && p.password ? "updated" : "created",
+    partnerId: id,
+    username,
+    password,
+  });
+}));
+
+// POST /api/admin/sales-partners/:id/reset-access — resetea contraseña
+app.post("/api/admin/sales-partners/:id/reset-access", wrap(async (req, res) => {
+  const id = Number(req.params.id);
+  const arr = await readCol("salesPartners").catch(() => []);
+  const idx = (arr || []).findIndex((p) => Number(p.id) === id);
+  if (idx < 0) return res.status(404).json({ message: "partner not found" });
+  const p = arr[idx];
+  if (!p.username) return res.status(400).json({ message: "El partner no tiene acceso aún. Usá grant-access primero." });
+  const newPassword = String(req.body?.password || "").trim() || generatePartnerPassword();
+  if (newPassword.length < 6) return res.status(400).json({ message: "La contraseña debe tener al menos 6 caracteres" });
+  arr[idx] = { ...p, password: newPassword, canLogin: true, mustChangePassword: 1 };
+  await writeCol("salesPartners", arr);
+  res.json({ ok: true, partnerId: id, username: p.username, newPassword });
+}));
+
+// DELETE /api/admin/sales-partners/:id/revoke-access — revoca acceso (mantiene partner)
+app.delete("/api/admin/sales-partners/:id/revoke-access", wrap(async (req, res) => {
+  const id = Number(req.params.id);
+  const arr = await readCol("salesPartners").catch(() => []);
+  const idx = (arr || []).findIndex((p) => Number(p.id) === id);
+  if (idx < 0) return res.status(404).json({ message: "partner not found" });
+  arr[idx] = { ...arr[idx], canLogin: false };
+  await writeCol("salesPartners", arr);
+  res.json({ ok: true, partnerId: id });
+}));
+
 // ───── Acceso a técnicos externos (proveedores) ────────────
 // Cada proveedor externo puede tener un "employee sintético" asociado vía
 // providerId. Este empleado existe solo para autenticar y aparecer como
