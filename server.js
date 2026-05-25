@@ -345,6 +345,22 @@ for (const [route, key] of Object.entries(ROUTES)) {
   app.post(route, wrap(async (req, res) => {
     const items = await readCol(key);
     const body = req.body || {};
+    // Anti-duplicado: si el body trae un id que ya existe, devolver el existente
+    // (idempotencia para retries/clicks múltiples). Aplica a TODAS las rutas /api/...
+    if (body.id != null) {
+      const existing = items.find((it) => Number(it?.id) === Number(body.id));
+      if (existing) {
+        return res.status(200).json(existing);
+      }
+    }
+    // Anti-duplicado específico para clientes ERP: si viene convertedFromLeadId,
+    // y ya existe un cliente con ese leadId, devolver el existente (no crear copia).
+    if (key === "erpClients" && body.convertedFromLeadId != null) {
+      const existing = items.find((it) => Number(it?.convertedFromLeadId) === Number(body.convertedFromLeadId));
+      if (existing) {
+        return res.status(200).json(existing);
+      }
+    }
     const nextId = items.reduce((m, it) => Math.max(m, Number(it?.id) || 0), 0) + 1;
     const created = { ...body, id: body.id ?? nextId };
     items.push(created);
