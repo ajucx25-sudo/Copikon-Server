@@ -84,19 +84,12 @@ const ROUTES = {
   "/api/maintenance-packages": "maintenancePackages",
   "/api/extra-services": "extraServices",
   "/api/technical-providers": "technicalProviders",
-  "/api/logistica/shipments-intl": "logShipmentsIntl",
-  "/api/logistica/dispatches-nat": "logDispatchesNat",
-  "/api/logistica/clients": "logClients",
-  "/api/logistica/quotes": "logQuotes",
-  "/api/logistica/rates": "logRates",
-  "/api/logistica/carriers": "logCarriers",
-  "/api/logistica/invoices": "logInvoices",
-  "/api/logistica/payables": "logPayables",
-  "/api/2bc/files": "twoBCFiles",
-  "/api/2bc/clients": "twoBCClients",
-  "/api/2bc/quotes": "twoBCQuotes",
   "/api/erp/sales-invoices": "erpSalesInvoices",
   "/api/sales-partners": "salesPartners",
+  // CPK Logística v37 (nuevo módulo)
+  "/api/logistica/shipments": "logisticaShipments",
+  "/api/logistica/imports": "logisticaImports",
+  "/api/logistica/carriers": "logisticaCarriers",
 };
 
 const STATIC_KEYS = ["departments", "announcements", "jobDescriptions", "processMaps", "courses"];
