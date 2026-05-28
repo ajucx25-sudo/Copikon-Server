@@ -95,6 +95,8 @@ const ROUTES = {
   "/api/wms/receipts": "wmsReceipts",
   "/api/wms/picks": "wmsPicks",
   "/api/wms/cycle-counts": "wmsCycleCounts",
+  "/api/wms/packings": "wmsPackings",
+  "/api/wms/dispatches": "wmsDispatches",
 };
 
 const STATIC_KEYS = ["departments", "announcements", "jobDescriptions", "processMaps", "courses"];
