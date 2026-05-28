@@ -90,6 +90,11 @@ const ROUTES = {
   "/api/logistica/shipments": "logisticaShipments",
   "/api/logistica/imports": "logisticaImports",
   "/api/logistica/carriers": "logisticaCarriers",
+  // WMS v53 (módulo principal transversal)
+  "/api/wms/locations": "wmsLocations",
+  "/api/wms/receipts": "wmsReceipts",
+  "/api/wms/picks": "wmsPicks",
+  "/api/wms/cycle-counts": "wmsCycleCounts",
 };
 
 const STATIC_KEYS = ["departments", "announcements", "jobDescriptions", "processMaps", "courses"];
