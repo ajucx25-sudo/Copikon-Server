@@ -914,7 +914,7 @@ app.delete("/api/admin/technical-providers/:id/revoke-access", wrap(async (req, 
 const MATERIAL_DEFS = [
   { key: "presentacion_corporativa", title: "Presentación Corporativa", kind: "pdf" },
   { key: "catalogo_productos",       title: "Catálogo de Productos",   kind: "pdf" },
-  { key: "brochure",                 title: "Brochure Institucional",   kind: "pdf" },
+  { key: "brochure",                 title: "Brochure de Generadores",   kind: "pdf" },
   { key: "casos_exito",              title: "Casos de Éxito / Referencias", kind: "pdf" },
   { key: "certificaciones",          title: "Certificaciones y Garantías",  kind: "pdf" },
   { key: "video_corporativo",        title: "Video Corporativo",        kind: "video" },
