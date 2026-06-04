@@ -8,6 +8,7 @@
 // ============================================================
 
 import express from "express";
+import compression from "compression";
 import cors from "cors";
 import pkg from "pg";
 
@@ -102,6 +103,7 @@ const ROUTES = {
 const STATIC_KEYS = ["departments", "announcements", "jobDescriptions", "processMaps", "courses"];
 
 const app = express();
+app.use(compression({ level: 6, threshold: 1024 })); // gzip — reduce respuestas JSON ~70%
 app.use(cors({ origin: true, credentials: true }));
 app.use(express.json({ limit: "60mb" }));
 
