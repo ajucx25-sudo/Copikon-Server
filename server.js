@@ -303,6 +303,48 @@ app.put("/api/salary-bands/by-employee", wrap(async (req, res) => {
   return res.status(201).json(created);
 }));
 
+// ───── Tarifario de Alquiler (singleton key-value) ─────────
+// Guarda un objeto (no array) en kv bajo la clave 'rentalTariff'
+async function readSingleton(key) {
+  const r = await pool.query("SELECT value FROM kv WHERE key = $1", [key]);
+  if (!r.rows[0]) return null;
+  return r.rows[0].value;
+}
+async function writeSingleton(key, obj) {
+  await pool.query(
+    `INSERT INTO kv (key, value, updated_at) VALUES ($1, $2::jsonb, $3)
+     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at`,
+    [key, JSON.stringify(obj ?? {}), Date.now()]
+  );
+}
+
+const DEFAULT_RENTAL_TARIFF = {
+  pricePerKvaPerDay: 1.5,
+  weeklyDiscountPct: 10,
+  monthlyDiscountPct: 25,
+  lightTowerPricePerDay: 45,
+  transportFlatFee: 50,
+  transportPerKm: 0.8,
+  fuelPricePerLiter: 1.2,
+  fuelDefaultMode: "dry",
+  operatorPerDay: 60,
+  depositPctOfMonthly: 50,
+  currency: "USD",
+  notes: "",
+};
+
+app.get("/api/erp/rental-tariff", wrap(async (_req, res) => {
+  const t = await readSingleton("rentalTariff");
+  res.json(t && typeof t === "object" && !Array.isArray(t) ? t : DEFAULT_RENTAL_TARIFF);
+}));
+
+app.put("/api/erp/rental-tariff", wrap(async (req, res) => {
+  const body = req.body || {};
+  const merged = { ...DEFAULT_RENTAL_TARIFF, ...body, updatedAt: new Date().toISOString() };
+  await writeSingleton("rentalTariff", merged);
+  res.json(merged);
+}));
+
 // ───── Sanitizado GET sales-partners (oculta password) ─────────
 function sanitizePartner(p) {
   if (!p || typeof p !== "object") return p;
