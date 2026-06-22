@@ -98,6 +98,12 @@ const ROUTES = {
   "/api/wms/cycle-counts": "wmsCycleCounts",
   "/api/wms/packings": "wmsPackings",
   "/api/wms/dispatches": "wmsDispatches",
+  // Infraestructura y Mantenimiento Corporativo v1
+  "/api/erp/infra-assets": "infraAssets",
+  "/api/erp/infra-maintenance-plans": "infraMaintenancePlans",
+  "/api/erp/infra-maintenance-orders": "infraMaintenanceOrders",
+  "/api/erp/infra-incidents": "infraIncidents",
+  "/api/erp/infra-transfers": "infraTransfers",
 };
 
 const STATIC_KEYS = ["departments", "announcements", "jobDescriptions", "processMaps", "courses"];
