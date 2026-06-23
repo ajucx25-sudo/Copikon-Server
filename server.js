@@ -104,6 +104,8 @@ const ROUTES = {
   "/api/erp/infra-maintenance-orders": "infraMaintenanceOrders",
   "/api/erp/infra-incidents": "infraIncidents",
   "/api/erp/infra-transfers": "infraTransfers",
+  // Pre-Leads (carga masiva antes de convertir a lead)
+  "/api/erp/pre-leads": "preLeads",
 };
 
 const STATIC_KEYS = ["departments", "announcements", "jobDescriptions", "processMaps", "courses"];
