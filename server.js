@@ -1411,6 +1411,213 @@ app.get("/api/sales/dashboard-summary", wrap(async (_req, res) => {
   });
 }));
 
+// ─────────────────────────────────────────────────────────────
+// RSI Global (Wialon) — proxy seguro para dashboard de flota GPS
+// Mantiene un sid de sesión en cache; re-autentica si caduca.
+// Credenciales en env vars RSI_USER / RSI_PASS — nunca en frontend.
+// ─────────────────────────────────────────────────────────────
+const RSI_USER = process.env.RSI_USER;
+const RSI_PASS = process.env.RSI_PASS;
+const WIALON_HOST = "https://hst-api.wialon.com";
+
+let wialonSid = null;
+let wialonSidExpiresAt = 0; // ms
+
+async function wialonLogin() {
+  if (!RSI_USER || !RSI_PASS) {
+    throw new Error("RSI_USER / RSI_PASS env vars no configuradas");
+  }
+  // Wialon usa /wialon/ajax.html?svc=token/login con user+password
+  const params = { user: RSI_USER, password: RSI_PASS };
+  const url = `${WIALON_HOST}/wialon/ajax.html?svc=token/login&params=${encodeURIComponent(JSON.stringify(params))}`;
+  const res = await fetch(url);
+  const data = await res.json();
+  if (data.error || !data.eid) {
+    throw new Error(`Wialon login falló: ${JSON.stringify(data)}`);
+  }
+  wialonSid = data.eid;
+  // Wialon mantiene la sesión activa por ~5 min de inactividad; refrescamos cada 4 min
+  wialonSidExpiresAt = Date.now() + 4 * 60 * 1000;
+  return wialonSid;
+}
+
+async function wialonCall(svc, params) {
+  if (!wialonSid || Date.now() > wialonSidExpiresAt) {
+    await wialonLogin();
+  }
+  const url = `${WIALON_HOST}/wialon/ajax.html?svc=${svc}&params=${encodeURIComponent(JSON.stringify(params))}&sid=${wialonSid}`;
+  const res = await fetch(url);
+  const data = await res.json();
+  // Si el sid expiró, re-loguear y reintentar una vez
+  if (data.error === 1 || data.error === 5) {
+    await wialonLogin();
+    const url2 = `${WIALON_HOST}/wialon/ajax.html?svc=${svc}&params=${encodeURIComponent(JSON.stringify(params))}&sid=${wialonSid}`;
+    const res2 = await fetch(url2);
+    return res2.json();
+  }
+  // Cada llamada exitosa extiende la vida del sid
+  wialonSidExpiresAt = Date.now() + 4 * 60 * 1000;
+  return data;
+}
+
+function haversineKm(lat1, lon1, lat2, lon2) {
+  const R = 6371;
+  const toRad = (x) => (x * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(a));
+}
+
+// Cache de unidades — 30 s para no martillar la API
+let unitsCache = null;
+let unitsCacheAt = 0;
+
+async function getUnits() {
+  if (unitsCache && Date.now() - unitsCacheAt < 30 * 1000) return unitsCache;
+  const data = await wialonCall("core/search_items", {
+    spec: { itemsType: "avl_unit", propName: "sys_name", propValueMask: "*", sortType: "sys_name" },
+    force: 1,
+    flags: 1 + 8 + 256 + 1024, // base + lastMessage + position + sensors
+    from: 0,
+    to: 0,
+  });
+  const items = (data.items || []).map((u) => {
+    const lastReportSec = u.lmsg?.t || 0;
+    const minsSinceReport = lastReportSec ? Math.floor((Date.now() / 1000 - lastReportSec) / 60) : null;
+    return {
+      id: u.id,
+      name: u.nm,
+      iconUrl: u.uri ? `${WIALON_HOST}${u.uri}?b=${u.bact || 0}` : null,
+      position: u.pos
+        ? { lat: u.pos.y, lng: u.pos.x, speed: u.pos.s, course: u.pos.c, altitude: u.pos.z, satellites: u.pos.sc }
+        : null,
+      lastReportAt: lastReportSec ? new Date(lastReportSec * 1000).toISOString() : null,
+      minutesSinceReport: minsSinceReport,
+      status: !lastReportSec
+        ? "sin_reporte"
+        : minsSinceReport > 60
+        ? "sin_reporte"
+        : (u.pos?.s || 0) > 5
+        ? "en_movimiento"
+        : "detenido",
+    };
+  });
+  unitsCache = { count: items.length, items, fetchedAt: new Date().toISOString() };
+  unitsCacheAt = Date.now();
+  return unitsCache;
+}
+
+// Cache por unidad para los datos del día — 60 s
+const todayCache = new Map();
+
+async function getUnitToday(unitId) {
+  const cached = todayCache.get(unitId);
+  if (cached && Date.now() - cached.at < 60 * 1000) return cached.data;
+
+  const now = Math.floor(Date.now() / 1000);
+  const startOfDay = Math.floor(new Date(new Date().toDateString()).getTime() / 1000);
+
+  const data = await wialonCall("messages/load_interval", {
+    itemId: unitId,
+    timeFrom: startOfDay,
+    timeTo: now,
+    flags: 0,
+    flagsMask: 0,
+    loadCount: 10000,
+  });
+
+  let totalKm = 0;
+  let maxSpeed = 0;
+  let movingSec = 0;
+  let stoppedSec = 0;
+  let lastPos = null;
+  let lastTime = null;
+  const track = [];
+  const positions = (data.messages || []).filter((m) => m.pos);
+  positions.forEach((m) => {
+    if (lastPos) {
+      const km = haversineKm(lastPos.y, lastPos.x, m.pos.y, m.pos.x);
+      totalKm += km;
+      const dt = m.t - lastTime;
+      if (m.pos.s > 0) movingSec += dt;
+      else stoppedSec += dt;
+    }
+    if (m.pos.s > maxSpeed) maxSpeed = m.pos.s;
+    lastPos = m.pos;
+    lastTime = m.t;
+    // Track: muestreamos cada N para no devolver 1000 puntos
+  });
+
+  // Track reducido: máximo 200 puntos para el mapa
+  const step = Math.max(1, Math.floor(positions.length / 200));
+  for (let i = 0; i < positions.length; i += step) {
+    const m = positions[i];
+    track.push({ t: m.t, lat: m.pos.y, lng: m.pos.x, speed: m.pos.s });
+  }
+
+  const result = {
+    unitId,
+    date: new Date(startOfDay * 1000).toISOString().slice(0, 10),
+    totalKm: Number(totalKm.toFixed(2)),
+    maxSpeed,
+    movingMinutes: Math.round(movingSec / 60),
+    stoppedMinutes: Math.round(stoppedSec / 60),
+    messageCount: positions.length,
+    track,
+  };
+  todayCache.set(unitId, { data: result, at: Date.now() });
+  return result;
+}
+
+app.get("/api/rsi/units", wrap(async (_req, res) => {
+  try {
+    const data = await getUnits();
+    res.json(data);
+  } catch (e) {
+    res.status(503).json({ error: e.message });
+  }
+}));
+
+app.get("/api/rsi/unit/:id/today", wrap(async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    const data = await getUnitToday(id);
+    res.json(data);
+  } catch (e) {
+    res.status(503).json({ error: e.message });
+  }
+}));
+
+app.get("/api/rsi/fleet/summary", wrap(async (_req, res) => {
+  try {
+    const units = await getUnits();
+    const enMovimiento = units.items.filter((u) => u.status === "en_movimiento").length;
+    const detenido = units.items.filter((u) => u.status === "detenido").length;
+    const sinReporte = units.items.filter((u) => u.status === "sin_reporte").length;
+
+    // Sumar km del día de todas las unidades activas
+    const activeUnits = units.items.filter((u) => u.status !== "sin_reporte");
+    const todayData = await Promise.all(
+      activeUnits.map((u) => getUnitToday(u.id).catch(() => null))
+    );
+    const totalKmToday = todayData.filter(Boolean).reduce((sum, d) => sum + (d.totalKm || 0), 0);
+    const totalMovingMin = todayData.filter(Boolean).reduce((sum, d) => sum + (d.movingMinutes || 0), 0);
+
+    res.json({
+      totalUnits: units.count,
+      enMovimiento,
+      detenido,
+      sinReporte,
+      totalKmToday: Number(totalKmToday.toFixed(2)),
+      totalMovingMinutes: totalMovingMin,
+      generatedAt: new Date().toISOString(),
+    });
+  } catch (e) {
+    res.status(503).json({ error: e.message });
+  }
+}));
+
 // ───── Arranque ─────────────────────────────────────────────
 const PORT = process.env.PORT || 5050;
 (async () => {
