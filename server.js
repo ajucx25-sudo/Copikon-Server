@@ -1570,6 +1570,22 @@ async function getUnitToday(unitId) {
   return result;
 }
 
+// Endpoint de diagnóstico — muestra qué env vars relacionadas con RSI ve el server
+app.get("/api/rsi/_debug", wrap(async (_req, res) => {
+  const allEnvKeys = Object.keys(process.env);
+  const rsiKeys = allEnvKeys.filter((k) => k.toUpperCase().includes("RSI") || k.toUpperCase().includes("WIALON"));
+  res.json({
+    rsiUserSet: !!process.env.RSI_USER,
+    rsiUserLength: (process.env.RSI_USER || "").length,
+    rsiPassSet: !!process.env.RSI_PASS,
+    rsiPassLength: (process.env.RSI_PASS || "").length,
+    relatedKeys: rsiKeys,
+    nodeVersion: process.version,
+    totalEnvCount: allEnvKeys.length,
+    sampleNonSecretKeys: allEnvKeys.filter((k) => !k.toLowerCase().match(/pass|secret|token|key|auth/)).slice(0, 30),
+  });
+}));
+
 app.get("/api/rsi/units", wrap(async (_req, res) => {
   try {
     const data = await getUnits();
