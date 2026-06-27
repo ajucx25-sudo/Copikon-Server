@@ -1425,7 +1425,8 @@ let wialonSidExpiresAt = 0; // ms
 
 async function wialonLogin() {
   // Wialon Hosting requiere token de aplicación (no user/password)
-  const token = process.env.RSI_TOKEN;
+  // trim() para tolerar espacios o saltos de línea al pegar en Render
+  const token = (process.env.RSI_TOKEN || "").trim();
   if (!token) {
     throw new Error("RSI_TOKEN env var no configurado");
   }
