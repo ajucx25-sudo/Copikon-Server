@@ -1424,11 +1424,12 @@ let wialonSid = null;
 let wialonSidExpiresAt = 0; // ms
 
 async function wialonLogin() {
-  if (!RSI_USER || !RSI_PASS) {
-    throw new Error("RSI_USER / RSI_PASS env vars no configuradas");
+  // Wialon Hosting requiere token de aplicación (no user/password)
+  const token = process.env.RSI_TOKEN;
+  if (!token) {
+    throw new Error("RSI_TOKEN env var no configurado");
   }
-  // Wialon usa /wialon/ajax.html?svc=token/login con user+password
-  const params = { user: RSI_USER, password: RSI_PASS };
+  const params = { token };
   const url = `${WIALON_HOST}/wialon/ajax.html?svc=token/login&params=${encodeURIComponent(JSON.stringify(params))}`;
   const res = await fetch(url);
   const data = await res.json();
@@ -1575,6 +1576,8 @@ app.get("/api/rsi/_debug", wrap(async (_req, res) => {
   const allEnvKeys = Object.keys(process.env);
   const rsiKeys = allEnvKeys.filter((k) => k.toUpperCase().includes("RSI") || k.toUpperCase().includes("WIALON"));
   res.json({
+    rsiTokenSet: !!process.env.RSI_TOKEN,
+    rsiTokenLength: (process.env.RSI_TOKEN || "").length,
     rsiUserSet: !!process.env.RSI_USER,
     rsiUserLength: (process.env.RSI_USER || "").length,
     rsiPassSet: !!process.env.RSI_PASS,
