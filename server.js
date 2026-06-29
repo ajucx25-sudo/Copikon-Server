@@ -106,6 +106,9 @@ const ROUTES = {
   "/api/erp/infra-transfers": "infraTransfers",
   // Pre-Leads (carga masiva antes de convertir a lead)
   "/api/erp/pre-leads": "preLeads",
+  // Notificaciones in-app y reportes semanales de bitácora
+  "/api/notifications": "notifications",
+  "/api/bitacora-reports": "bitacoraReports",
 };
 
 const STATIC_KEYS = ["departments", "announcements", "jobDescriptions", "processMaps", "courses"];
@@ -1639,6 +1642,241 @@ app.get("/api/rsi/fleet/summary", wrap(async (_req, res) => {
 }));
 
 // ───── Arranque ─────────────────────────────────────────────
+// Bitacora Generators - Recordatorios y Reportes Semanales
+const BITACORA_MODULE_PREFIX = "gen-";
+
+function caracasNow() {
+  return new Date(Date.now() - 4 * 60 * 60 * 1000);
+}
+
+function isWeekday(date) {
+  const day = date.getUTCDay();
+  return day >= 1 && day <= 5;
+}
+
+async function getBitacoraRecipients() {
+  const employees = await readCol("employees");
+  const ceo = employees.find((e) => e && (e.level === "ceo" || e.username === "admin"));
+  const generatorsManager = employees.find(
+    (e) => e && Number(e.departmentId) === 31 && (e.level === "manager" || e.level === "gerente")
+  );
+  const managers = employees.filter((e) => e && (e.level === "manager" || e.level === "ceo"));
+  return { ceo, generatorsManager, directiva: managers };
+}
+
+async function pushNotification({ userId, title, message, type = "info", link = null }) {
+  if (!userId) return null;
+  const items = await readCol("notifications");
+  const nextId = items.reduce((m, it) => Math.max(m, Number(it?.id) || 0), 0) + 1;
+  const notif = {
+    id: nextId,
+    userId: Number(userId),
+    title,
+    message,
+    type,
+    link,
+    createdAt: new Date().toISOString(),
+    readAt: null,
+  };
+  items.push(notif);
+  const trimmed = items.length > 500 ? items.slice(-500) : items;
+  await writeCol("notifications", trimmed);
+  return notif;
+}
+
+app.post("/api/generators/bitacora/check-daily", wrap(async (_req, res) => {
+  const caracasToday = caracasNow();
+  const yesterday = new Date(caracasToday.getTime() - 24 * 60 * 60 * 1000);
+  const yDateStr = yesterday.toISOString().slice(0, 10);
+
+  if (!isWeekday(yesterday)) {
+    return res.json({ ok: true, skipped: true, reason: "yesterday-was-weekend", date: yDateStr });
+  }
+
+  const activities = await readCol("copikonGenActivities");
+  const yActivities = (activities || []).filter((a) => {
+    if (!a || a.type !== "bitacora") return false;
+    if (typeof a.module !== "string" || !a.module.startsWith(BITACORA_MODULE_PREFIX)) return false;
+    const dates = [a.createdAt, a.startDate, a.completedDate, a.dueDate].filter(Boolean);
+    return dates.some((d) => String(d).slice(0, 10) === yDateStr);
+  });
+
+  if (yActivities.length > 0) {
+    return res.json({
+      ok: true,
+      skipped: true,
+      reason: "activities-found",
+      date: yDateStr,
+      count: yActivities.length,
+    });
+  }
+
+  const { ceo, generatorsManager } = await getBitacoraRecipients();
+  const sent = [];
+  const ddmm = yDateStr.split("-").reverse().slice(0, 2).join("/");
+  const title = `Sin actividades en bitacora (${ddmm})`;
+  const message = `No se registro ninguna actividad en la bitacora de Copikon Generators el dia ${ddmm}. Por favor verificar con los responsables.`;
+  const link = "/copikon-generators?module=bitacora";
+
+  if (ceo) {
+    const n = await pushNotification({ userId: ceo.id, title, message, type: "warning", link });
+    sent.push({ userId: ceo.id, who: "ceo", id: n?.id });
+  }
+  if (generatorsManager && generatorsManager.id !== ceo?.id) {
+    const n = await pushNotification({ userId: generatorsManager.id, title, message, type: "warning", link });
+    sent.push({ userId: generatorsManager.id, who: "gerente-generators", id: n?.id });
+  }
+
+  res.json({ ok: true, date: yDateStr, recipients: sent });
+}));
+
+app.post("/api/generators/bitacora/generate-weekly-report", wrap(async (_req, res) => {
+  const caracas = caracasNow();
+  const dow = caracas.getUTCDay();
+  const monday = new Date(caracas);
+  const diffToMon = (dow === 0 ? 6 : dow - 1);
+  monday.setUTCDate(caracas.getUTCDate() - diffToMon);
+  monday.setUTCHours(0, 0, 0, 0);
+  const friday = new Date(monday);
+  friday.setUTCDate(monday.getUTCDate() + 4);
+  friday.setUTCHours(23, 59, 59, 999);
+
+  const fromStr = monday.toISOString().slice(0, 10);
+  const toStr = friday.toISOString().slice(0, 10);
+
+  const [activities, employees] = await Promise.all([
+    readCol("copikonGenActivities"),
+    readCol("employees"),
+  ]);
+
+  const inWeek = (a) => {
+    const candidates = [a.createdAt, a.startDate, a.completedDate, a.dueDate].filter(Boolean);
+    return candidates.some((d) => {
+      const s = String(d).slice(0, 10);
+      return s >= fromStr && s <= toStr;
+    });
+  };
+
+  const weekActivities = (activities || []).filter(
+    (a) =>
+      a && a.type === "bitacora" &&
+      typeof a.module === "string" &&
+      a.module.startsWith(BITACORA_MODULE_PREFIX) &&
+      inWeek(a)
+  );
+
+  const totalActivities = weekActivities.length;
+  const completadas = weekActivities.filter((a) => a.status === "completada").length;
+  const enProgreso = weekActivities.filter((a) => a.status === "en_progreso").length;
+  const pendientes = weekActivities.filter((a) => a.status === "pendiente").length;
+  const altaPrioridad = weekActivities.filter((a) => a.priority === "alta").length;
+
+  const byModule = {};
+  for (const a of weekActivities) {
+    const m = a.module;
+    if (!byModule[m]) byModule[m] = { total: 0, completadas: 0, en_progreso: 0, pendiente: 0, items: [] };
+    byModule[m].total++;
+    const st = a.status === "en_progreso" ? "en_progreso" : a.status;
+    if (byModule[m][st] != null) byModule[m][st]++;
+    const emp = employees.find((e) => Number(e.id) === Number(a.assigneeId));
+    byModule[m].items.push({
+      id: a.id,
+      title: a.title,
+      description: a.description,
+      status: a.status,
+      priority: a.priority,
+      assignee: emp ? `${emp.firstName} ${emp.lastName}`.trim() : null,
+      createdAt: a.createdAt,
+      completedDate: a.completedDate,
+      dueDate: a.dueDate,
+    });
+  }
+
+  const byAssignee = {};
+  for (const a of weekActivities) {
+    if (!a.assigneeId) continue;
+    const emp = employees.find((e) => Number(e.id) === Number(a.assigneeId));
+    if (!emp) continue;
+    const name = `${emp.firstName} ${emp.lastName}`.trim();
+    if (!byAssignee[name]) byAssignee[name] = { total: 0, completadas: 0, employeeId: emp.id };
+    byAssignee[name].total++;
+    if (a.status === "completada") byAssignee[name].completadas++;
+  }
+
+  const report = {
+    id: Date.now(),
+    weekStart: fromStr,
+    weekEnd: toStr,
+    generatedAt: new Date().toISOString(),
+    stats: {
+      totalActivities,
+      completadas,
+      enProgreso,
+      pendientes,
+      altaPrioridad,
+      completionRate: totalActivities > 0 ? Math.round((completadas / totalActivities) * 100) : 0,
+    },
+    byModule,
+    byAssignee,
+    activities: weekActivities,
+  };
+
+  const reports = await readCol("bitacoraReports");
+  const existingIdx = reports.findIndex((r) => r.weekStart === fromStr);
+  if (existingIdx >= 0) {
+    reports[existingIdx] = report;
+  } else {
+    reports.push(report);
+  }
+  const trimmed = reports.length > 52 ? reports.slice(-52) : reports;
+  await writeCol("bitacoraReports", trimmed);
+
+  const { ceo, generatorsManager, directiva } = await getBitacoraRecipients();
+  const recipients = new Map();
+  if (ceo) recipients.set(ceo.id, { who: "ceo", emp: ceo });
+  if (generatorsManager) recipients.set(generatorsManager.id, { who: "gerente-generators", emp: generatorsManager });
+  for (const m of directiva) recipients.set(m.id, { who: "directiva", emp: m });
+
+  const fmtDdMm = (s) => s.split("-").reverse().slice(0, 2).join("/");
+  const title = `Reporte semanal bitacora (${fmtDdMm(fromStr)} - ${fmtDdMm(toStr)})`;
+  const message = `Disponible el reporte de bitacora de Copikon Generators de la semana. Total: ${totalActivities} actividades, ${completadas} completadas (${report.stats.completionRate}%), ${enProgreso} en progreso, ${pendientes} pendientes.`;
+  const link = `/copikon-generators?module=bitacora&report=${report.id}`;
+
+  const sent = [];
+  for (const [userId, info] of recipients.entries()) {
+    const n = await pushNotification({ userId, title, message, type: "info", link });
+    sent.push({ userId, who: info.who, id: n?.id });
+  }
+
+  res.json({ ok: true, report, recipients: sent });
+}));
+
+app.post("/api/notifications/:id/read", wrap(async (req, res) => {
+  const id = Number(req.params.id);
+  const items = await readCol("notifications");
+  const idx = items.findIndex((x) => Number(x.id) === id);
+  if (idx < 0) return res.status(404).json({ message: "not found" });
+  items[idx] = { ...items[idx], readAt: new Date().toISOString() };
+  await writeCol("notifications", items);
+  res.json(items[idx]);
+}));
+
+app.post("/api/notifications/read-all", wrap(async (req, res) => {
+  const userId = Number(req.body?.userId);
+  if (!userId) return res.status(400).json({ message: "userId requerido" });
+  const items = await readCol("notifications");
+  const now = new Date().toISOString();
+  let updated = 0;
+  for (let i = 0; i < items.length; i++) {
+    if (Number(items[i].userId) === userId && !items[i].readAt) {
+      items[i] = { ...items[i], readAt: now };
+      updated++;
+    }
+  }
+  await writeCol("notifications", items);
+  res.json({ ok: true, updated });
+}));
+
 const PORT = process.env.PORT || 5050;
 (async () => {
   try {
