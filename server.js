@@ -2029,9 +2029,7 @@ app.post("/api/abastecimiento/odoo-test", wrap(async (_req, res) => {
   }
 }));
 
-// ───── Odoo XML-RPC helpers ─────
-const xmlrpc = require("xmlrpc");
-
+// ───── Odoo XML-RPC helpers (sin dependencias — fetch nativo + XML manual) ─────
 async function readOdooConfig() {
   const cfgArr = await readCol("abastecimientoOdooConfig").catch(() => []);
   const cfg = (Array.isArray(cfgArr) && cfgArr[0]) || {};
@@ -2039,31 +2037,157 @@ async function readOdooConfig() {
   return cfg;
 }
 
-function odooCall(client, method, params) {
-  return new Promise((resolve, reject) => {
-    client.methodCall(method, params, (err, value) => {
-      if (err) return reject(err);
-      resolve(value);
+// Serializa un valor JS a XML-RPC <value>
+function xrpcValue(v) {
+  if (v === null || v === undefined) return "<value><nil/></value>";
+  if (typeof v === "boolean") return `<value><boolean>${v ? 1 : 0}</boolean></value>`;
+  if (typeof v === "number") {
+    if (Number.isInteger(v)) return `<value><int>${v}</int></value>`;
+    return `<value><double>${v}</double></value>`;
+  }
+  if (typeof v === "string") return `<value><string>${escapeXml(v)}</string></value>`;
+  if (Array.isArray(v)) {
+    return `<value><array><data>${v.map(xrpcValue).join("")}</data></array></value>`;
+  }
+  if (typeof v === "object") {
+    const members = Object.entries(v).map(([k, val]) =>
+      `<member><name>${escapeXml(k)}</name>${xrpcValue(val)}</member>`
+    ).join("");
+    return `<value><struct>${members}</struct></value>`;
+  }
+  return `<value><string>${escapeXml(String(v))}</string></value>`;
+}
+
+function escapeXml(s) {
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&apos;");
+}
+
+function buildXrpcRequest(methodName, params) {
+  const paramsXml = params.map(p => `<param>${xrpcValue(p)}</param>`).join("");
+  return `<?xml version="1.0"?><methodCall><methodName>${methodName}</methodName><params>${paramsXml}</params></methodCall>`;
+}
+
+// Parser muy simple de XML-RPC respuesta (suficiente para Odoo)
+function parseXrpcResponse(xml) {
+  // Detectar fault
+  const faultMatch = xml.match(/<fault>([\s\S]*?)<\/fault>/);
+  if (faultMatch) {
+    const stringMatch = faultMatch[1].match(/<string>([\s\S]*?)<\/string>/);
+    const intMatch = faultMatch[1].match(/<int>([\s\S]*?)<\/int>/);
+    const msg = stringMatch ? unescapeXml(stringMatch[1]) : (intMatch ? `Fault ${intMatch[1]}` : "XML-RPC fault");
+    const err = new Error(msg);
+    err.isFault = true;
+    throw err;
+  }
+  const valMatch = xml.match(/<params>\s*<param>([\s\S]*?)<\/param>\s*<\/params>/);
+  if (!valMatch) {
+    throw new Error("Respuesta XML-RPC sin <params>");
+  }
+  return parseValueNode(valMatch[1]);
+}
+
+function unescapeXml(s) {
+  return String(s).replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&apos;/g, "'");
+}
+
+// Parsea un nodo <value>...</value> a JS
+function parseValueNode(chunk) {
+  // chunk puede o no incluir el wrapper <value>...
+  const trimmed = chunk.replace(/^\s*<value>/, "").replace(/<\/value>\s*$/, "").trim();
+  if (trimmed.startsWith("<array>")) {
+    const inner = trimmed.slice("<array>".length, -"</array>".length).replace(/^<data>/, "").replace(/<\/data>$/, "");
+    return splitTopLevelValues(inner).map(parseValueNode);
+  }
+  if (trimmed.startsWith("<struct>")) {
+    const inner = trimmed.slice("<struct>".length, -"</struct>".length);
+    const out = {};
+    const memberRegex = /<member>\s*<name>([\s\S]*?)<\/name>\s*([\s\S]*?)<\/member>/g;
+    let m;
+    while ((m = memberRegex.exec(inner)) !== null) {
+      out[unescapeXml(m[1])] = parseValueNode(m[2]);
+    }
+    return out;
+  }
+  if (trimmed.startsWith("<int>")) return parseInt(trimmed.slice(5, -6), 10);
+  if (trimmed.startsWith("<i4>")) return parseInt(trimmed.slice(4, -5), 10);
+  if (trimmed.startsWith("<boolean>")) return trimmed.slice(9, -10) === "1";
+  if (trimmed.startsWith("<double>")) return parseFloat(trimmed.slice(8, -9));
+  if (trimmed.startsWith("<string>")) return unescapeXml(trimmed.slice(8, -9));
+  if (trimmed.startsWith("<dateTime.iso8601>")) return unescapeXml(trimmed.slice(18, -19));
+  if (trimmed.startsWith("<base64>")) return trimmed.slice(8, -9);
+  if (trimmed.startsWith("<nil/>")) return null;
+  if (trimmed === "" || trimmed.startsWith("<nil")) return null;
+  // String puro (si Odoo no envuelve)
+  return unescapeXml(trimmed);
+}
+
+// Divide un bloque XML en sus <value>...</value> top-level
+function splitTopLevelValues(inner) {
+  const out = [];
+  let depth = 0;
+  let start = -1;
+  let i = 0;
+  const len = inner.length;
+  while (i < len) {
+    if (inner[i] === "<") {
+      const close = inner.indexOf(">", i);
+      if (close < 0) break;
+      const tag = inner.substring(i + 1, close);
+      const isClose = tag.startsWith("/");
+      const isSelfClose = tag.endsWith("/");
+      const tagName = (isClose ? tag.slice(1) : tag).split(/[ \/]/)[0];
+      if (tagName === "value") {
+        if (isClose) {
+          depth--;
+          if (depth === 0 && start >= 0) {
+            out.push(inner.substring(start, close + 1));
+            start = -1;
+          }
+        } else if (!isSelfClose) {
+          if (depth === 0) start = i;
+          depth++;
+        }
+      }
+      i = close + 1;
+    } else {
+      i++;
+    }
+  }
+  return out;
+}
+
+async function odooXrpc(url, methodName, params, timeoutMs = 60000) {
+  const xmlBody = buildXrpcRequest(methodName, params);
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "text/xml; charset=utf-8" },
+      body: xmlBody,
+      signal: controller.signal,
     });
-  });
+    const text = await res.text();
+    if (!res.ok) throw new Error(`HTTP ${res.status}: ${text.slice(0, 200)}`);
+    return parseXrpcResponse(text);
+  } finally {
+    clearTimeout(t);
+  }
 }
 
 async function odooConnect(cfg) {
-  const url = String(cfg.url).replace(/\/$/, "");
-  const isHttps = url.startsWith("https://");
-  const Client = isHttps ? xmlrpc.createSecureClient : xmlrpc.createClient;
-  const common = Client({ url: url + "/xmlrpc/2/common" });
-  const object = Client({ url: url + "/xmlrpc/2/object" });
-  // authenticate(db, login, password, {})
-  const uid = await odooCall(common, "authenticate", [cfg.db, cfg.username, cfg.password, {}]);
+  const baseUrl = String(cfg.url).replace(/\/$/, "");
+  const commonUrl = baseUrl + "/xmlrpc/2/common";
+  const objectUrl = baseUrl + "/xmlrpc/2/object";
+  const uid = await odooXrpc(commonUrl, "authenticate", [cfg.db, cfg.username, cfg.password, {}]);
   if (!uid || uid === false) {
-    throw new Error("Autenticación fallida. Verifica BD, usuario y API Key.");
+    throw new Error("Autenticación fallida. Verifica URL, BD, usuario y API Key en la pestaña Odoo.");
   }
   return {
     uid,
     cfg,
     async execute_kw(model, method, args, kwargs = {}) {
-      return odooCall(object, "execute_kw", [cfg.db, uid, cfg.password, model, method, args, kwargs]);
+      return odooXrpc(objectUrl, "execute_kw", [cfg.db, uid, cfg.password, model, method, args, kwargs]);
     }
   };
 }
