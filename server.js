@@ -109,6 +109,11 @@ const ROUTES = {
   // Notificaciones in-app y reportes semanales de bitácora
   "/api/notifications": "notifications",
   "/api/bitacora-reports": "bitacoraReports",
+  // Operaciones → Abastecimiento (catálogo de sucursales, parámetros min/max y propuestas semanales)
+  "/api/abastecimiento/sucursales": "abastecimientoSucursales",
+  "/api/abastecimiento/sku-params": "abastecimientoSkuParams",
+  "/api/abastecimiento/propuestas": "abastecimientoPropuestas",
+  "/api/abastecimiento/odoo-config": "abastecimientoOdooConfig",
 };
 
 const STATIC_KEYS = ["departments", "announcements", "jobDescriptions", "processMaps", "courses"];
@@ -1878,6 +1883,118 @@ app.post("/api/notifications/read-all", wrap(async (req, res) => {
   }
   await writeCol("notifications", items);
   res.json({ ok: true, updated });
+}));
+
+// ============================================================================
+// OPERACIONES → ABASTECIMIENTO
+// ----------------------------------------------------------------------------
+// Genera la propuesta semanal de reabastecimiento por sucursal a partir de:
+//   - Catálogo de sucursales (kv: abastecimientoSucursales)
+//   - Parámetros min/max/óptimo por SKU×sucursal (kv: abastecimientoSkuParams)
+//   - Inventario actual por sucursal (Odoo si está conectado, fallback a kv local)
+//
+// Fórmula confirmada por el usuario (29-jun-2026):
+//   max_dias = 60
+//   margen_seguridad = 20%
+//   lead_time = 30 días
+//   Min = Venta_diaria * (lead_time) * (1 + margen)
+//   Max = Venta_diaria * max_dias
+//   Optimo = (Min + Max) / 2
+//   Sugerido = max(0, Optimo - Stock_actual)
+// ============================================================================
+
+function calcMinMaxOptimo({ ventaDiaria = 0, leadTime = 30, maxDias = 60, margen = 0.20 }) {
+  const v = Number(ventaDiaria) || 0;
+  const min = Math.round(v * leadTime * (1 + margen));
+  const max = Math.round(v * maxDias);
+  const opt = Math.round((min + max) / 2);
+  return { min, max, optimo: opt };
+}
+
+// POST /api/abastecimiento/generar-propuesta { sucursalId } → crea propuesta automática
+app.post("/api/abastecimiento/generar-propuesta", wrap(async (req, res) => {
+  const { sucursalId } = req.body || {};
+  if (!sucursalId) return res.status(400).json({ error: "sucursalId requerido" });
+
+  const sucursales = await readCol("abastecimientoSucursales").catch(() => []);
+  const sucursal = (sucursales || []).find((s) => String(s.id) === String(sucursalId));
+  if (!sucursal) return res.status(404).json({ error: "Sucursal no encontrada" });
+
+  const skuParams = await readCol("abastecimientoSkuParams").catch(() => []);
+  const productos = await readCol("erpProducts").catch(() => []);
+
+  // Construir líneas: para cada producto con parámetros en esta sucursal, calcular sugerido
+  const lineas = [];
+  for (const param of skuParams) {
+    if (String(param.sucursalId) !== String(sucursalId)) continue;
+    const producto = productos.find((p) => String(p.id) === String(param.productoId) || String(p.sku) === String(param.sku));
+    if (!producto) continue;
+    const { min, max, optimo } = calcMinMaxOptimo({
+      ventaDiaria: param.ventaDiaria || 0,
+      leadTime: param.leadTime || 30,
+      maxDias: param.maxDias || 60,
+      margen: typeof param.margen === "number" ? param.margen : 0.20,
+    });
+    const stockActual = Number(param.stockActual || 0);
+    const sugerido = Math.max(0, optimo - stockActual);
+    if (sugerido <= 0 && stockActual >= min) continue; // no necesita reposición
+    lineas.push({
+      productoId: producto.id,
+      sku: producto.sku || param.sku,
+      nombre: producto.name || producto.nombre || param.nombre,
+      stockActual,
+      min, max, optimo,
+      sugerido,
+      criticidad: stockActual < min ? "critica" : stockActual < optimo ? "baja" : "ok",
+    });
+  }
+
+  // Crear propuesta
+  const propuestas = await readCol("abastecimientoPropuestas").catch(() => []);
+  const newId = Date.now();
+  const nuevaPropuesta = {
+    id: newId,
+    sucursalId,
+    sucursalNombre: sucursal.nombre,
+    fechaGenerada: new Date().toISOString(),
+    fechaDespacho: sucursal.proximoDespacho || null,
+    estado: "pendiente", // pendiente → aprobada → despachada → rechazada
+    lineas,
+    totales: {
+      totalSkus: lineas.length,
+      totalUnidades: lineas.reduce((s, l) => s + l.sugerido, 0),
+      criticas: lineas.filter((l) => l.criticidad === "critica").length,
+    },
+    formula: { maxDias: 60, leadTime: 30, margen: 0.20 },
+  };
+  propuestas.push(nuevaPropuesta);
+  await writeCol("abastecimientoPropuestas", propuestas);
+  res.json({ ok: true, propuesta: nuevaPropuesta });
+}));
+
+// POST /api/abastecimiento/odoo-sync → sincroniza inventario desde Odoo
+// Si la configuración no está lista, devuelve un mensaje claro al frontend.
+app.post("/api/abastecimiento/odoo-sync", wrap(async (_req, res) => {
+  // odooConfig se guarda como array de 1 elemento por compatibilidad con readCol
+  const cfgArr = await readCol("abastecimientoOdooConfig").catch(() => []);
+  const cfg = (Array.isArray(cfgArr) && cfgArr[0]) || {};
+  if (!cfg.url || !cfg.db || !cfg.username || !cfg.password) {
+    return res.json({
+      ok: false,
+      configured: false,
+      message: "Conexión con Odoo no configurada. Ve a Ajustes → Conexión Odoo para configurar URL, BD, usuario y clave.",
+    });
+  }
+  // TODO: implementar XML-RPC contra Odoo:
+  //   - authenticate(db, user, pass) → uid
+  //   - search_read(stock.quant) por almacén filtrado
+  //   - actualizar skuParams.stockActual y ventaDiaria (sale.order de últimos 30 días / 30)
+  // Por ahora devolvemos placeholder con instrucciones.
+  res.json({
+    ok: false,
+    configured: true,
+    message: "Conexión Odoo configurada pero la integración está en preparación. Provee credenciales al equipo técnico para activar la sincronización automática.",
+  });
 }));
 
 const PORT = process.env.PORT || 5050;
