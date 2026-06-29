@@ -1992,25 +1992,218 @@ app.post("/api/abastecimiento/generar-propuesta", wrap(async (req, res) => {
 // Si la configuración no está lista, devuelve un mensaje claro al frontend.
 app.post("/api/abastecimiento/odoo-sync", wrap(async (_req, res) => {
   // odooConfig se guarda como array de 1 elemento por compatibilidad con readCol
+  try {
+    const result = await runOdooSync();
+    res.json(result);
+  } catch (e) {
+    console.error("[odoo-sync] error:", e?.message || e);
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+}));
+
+// POST /api/abastecimiento/odoo-test — prueba credenciales y devuelve info del servidor
+app.post("/api/abastecimiento/odoo-test", wrap(async (_req, res) => {
+  try {
+    const cfg = await readOdooConfig();
+    if (!cfg) {
+      return res.json({ ok: false, message: "Conexión Odoo no configurada. Completa los campos antes de probar." });
+    }
+    const odoo = await odooConnect(cfg);
+    // Contar warehouses, products almacenables, y user info
+    const userInfo = await odoo.execute_kw("res.users", "read", [[odoo.uid], ["name", "login"]]);
+    const warehouses = await odoo.execute_kw("stock.warehouse", "search_read", [[], ["id", "name", "code"]]);
+    const productsCount = await odoo.execute_kw("product.product", "search_count", [[["type", "=", "product"]]]);
+    res.json({
+      ok: true,
+      message: "Conexión exitosa",
+      info: {
+        user: userInfo[0]?.name || cfg.username,
+        login: userInfo[0]?.login || cfg.username,
+        warehouses: warehouses.map(w => ({ id: w.id, name: w.name, code: w.code })),
+        productosAlmacenables: productsCount,
+      }
+    });
+  } catch (e) {
+    console.error("[odoo-test] error:", e?.message || e);
+    res.json({ ok: false, message: String(e?.message || e) });
+  }
+}));
+
+// ───── Odoo XML-RPC helpers ─────
+const xmlrpc = require("xmlrpc");
+
+async function readOdooConfig() {
   const cfgArr = await readCol("abastecimientoOdooConfig").catch(() => []);
   const cfg = (Array.isArray(cfgArr) && cfgArr[0]) || {};
-  if (!cfg.url || !cfg.db || !cfg.username || !cfg.password) {
-    return res.json({
-      ok: false,
-      configured: false,
-      message: "Conexión con Odoo no configurada. Ve a Ajustes → Conexión Odoo para configurar URL, BD, usuario y clave.",
+  if (!cfg.url || !cfg.db || !cfg.username || !cfg.password) return null;
+  return cfg;
+}
+
+function odooCall(client, method, params) {
+  return new Promise((resolve, reject) => {
+    client.methodCall(method, params, (err, value) => {
+      if (err) return reject(err);
+      resolve(value);
     });
-  }
-  // TODO: implementar XML-RPC contra Odoo:
-  //   - authenticate(db, user, pass) → uid
-  //   - search_read(stock.quant) por almacén filtrado
-  //   - actualizar skuParams.stockActual y ventaDiaria (sale.order de últimos 30 días / 30)
-  // Por ahora devolvemos placeholder con instrucciones.
-  res.json({
-    ok: false,
-    configured: true,
-    message: "Conexión Odoo configurada pero la integración está en preparación. Provee credenciales al equipo técnico para activar la sincronización automática.",
   });
+}
+
+async function odooConnect(cfg) {
+  const url = String(cfg.url).replace(/\/$/, "");
+  const isHttps = url.startsWith("https://");
+  const Client = isHttps ? xmlrpc.createSecureClient : xmlrpc.createClient;
+  const common = Client({ url: url + "/xmlrpc/2/common" });
+  const object = Client({ url: url + "/xmlrpc/2/object" });
+  // authenticate(db, login, password, {})
+  const uid = await odooCall(common, "authenticate", [cfg.db, cfg.username, cfg.password, {}]);
+  if (!uid || uid === false) {
+    throw new Error("Autenticación fallida. Verifica BD, usuario y API Key.");
+  }
+  return {
+    uid,
+    cfg,
+    async execute_kw(model, method, args, kwargs = {}) {
+      return odooCall(object, "execute_kw", [cfg.db, uid, cfg.password, model, method, args, kwargs]);
+    }
+  };
+}
+
+// Sincroniza warehouses + productos + stock por sucursal
+// Guarda en kv: abastecimientoOdooStock = [{sucursalId, warehouseId, sku, productId, qty, lastUpdate}]
+async function runOdooSync() {
+  const cfg = await readOdooConfig();
+  if (!cfg) {
+    return { ok: false, configured: false, message: "Conexión Odoo no configurada. Configura URL, BD, usuario y API Key en la pestaña Odoo." };
+  }
+  const sucursales = await readCol("abastecimientoSucursales").catch(() => []);
+  if (!sucursales.length) {
+    return { ok: false, message: "No hay sucursales configuradas. Crea sucursales primero en la pestaña Sucursales." };
+  }
+  const skuParams = await readCol("abastecimientoSkuParams").catch(() => []);
+
+  const odoo = await odooConnect(cfg);
+
+  // 1) Cargar warehouses (id, name, code, lot_stock_id)
+  const warehouses = await odoo.execute_kw("stock.warehouse", "search_read",
+    [[], ["id", "name", "code", "lot_stock_id"]]);
+
+  // Map sucursal -> warehouse (por nombre del almacén, case-insensitive)
+  const sucursalWh = [];
+  for (const s of sucursales) {
+    if (!s.almacenOdoo) continue;
+    const target = String(s.almacenOdoo).trim().toLowerCase();
+    const wh = warehouses.find(w =>
+      String(w.name || "").trim().toLowerCase() === target ||
+      String(w.code || "").trim().toLowerCase() === target
+    );
+    if (wh) sucursalWh.push({ sucursal: s, warehouse: wh });
+  }
+
+  if (!sucursalWh.length) {
+    return {
+      ok: false,
+      message: `No se encontró ningún almacén de Odoo que coincida con las sucursales configuradas. Almacenes disponibles: ${warehouses.map(w => w.name).join(", ") || "(ninguno)"}`,
+      warehousesEnOdoo: warehouses.map(w => ({ id: w.id, name: w.name, code: w.code })),
+    };
+  }
+
+  // 2) Cargar productos almacenables (id, default_code/sku, name)
+  // Limitar a 5000 productos por seguridad
+  const productosOdoo = await odoo.execute_kw("product.product", "search_read",
+    [[["type", "=", "product"]], ["id", "default_code", "name", "barcode", "uom_id"]],
+    { limit: 5000 });
+
+  // Guardar productos en abastecimientoOdooProducts para que el usuario los vea en catálogo
+  const productosNormalizados = productosOdoo.map(p => ({
+    id: p.id,
+    sku: p.default_code || "",
+    nombre: p.name || "",
+    barcode: p.barcode || "",
+    uom: Array.isArray(p.uom_id) ? p.uom_id[1] : "",
+  }));
+  await writeCol("abastecimientoOdooProducts", productosNormalizados);
+
+  // 3) Por cada sucursal+warehouse, leer stock.quant agrupado por producto
+  const stockRows = [];
+  for (const { sucursal, warehouse } of sucursalWh) {
+    // search_read en stock.quant: domain location_id child_of warehouse.lot_stock_id
+    const quants = await odoo.execute_kw("stock.quant", "search_read",
+      [[["location_id", "child_of", warehouse.lot_stock_id[0]], ["product_id.type", "=", "product"]],
+       ["product_id", "quantity", "reserved_quantity"]],
+      { limit: 10000 });
+
+    // Agregar quants por producto (puede haber varios por ubicación)
+    const byProduct = {};
+    for (const q of quants) {
+      const pid = Array.isArray(q.product_id) ? q.product_id[0] : q.product_id;
+      if (!byProduct[pid]) byProduct[pid] = { qty: 0, reservada: 0 };
+      byProduct[pid].qty += Number(q.quantity || 0);
+      byProduct[pid].reservada += Number(q.reserved_quantity || 0);
+    }
+
+    for (const pid of Object.keys(byProduct)) {
+      const prod = productosOdoo.find(p => p.id === Number(pid));
+      stockRows.push({
+        sucursalId: sucursal.id,
+        sucursalNombre: sucursal.nombre,
+        warehouseId: warehouse.id,
+        warehouseName: warehouse.name,
+        productId: Number(pid),
+        sku: prod?.default_code || "",
+        nombre: prod?.name || "",
+        qty: byProduct[pid].qty,
+        reservada: byProduct[pid].reservada,
+        disponible: byProduct[pid].qty - byProduct[pid].reservada,
+      });
+    }
+  }
+
+  await writeCol("abastecimientoOdooStock", stockRows);
+
+  // 4) Actualizar skuParams.stockActual con el stock real (matching por sku o productId)
+  let actualizados = 0;
+  const newParams = skuParams.map(p => {
+    const row = stockRows.find(r =>
+      String(r.sucursalId) === String(p.sucursalId) &&
+      (
+        (p.productoId && Number(p.productoId) === r.productId) ||
+        (p.sku && r.sku && String(p.sku).trim().toLowerCase() === String(r.sku).trim().toLowerCase())
+      )
+    );
+    if (row) {
+      actualizados++;
+      return { ...p, stockActual: row.disponible, stockOdooSync: new Date().toISOString() };
+    }
+    return p;
+  });
+  if (actualizados > 0) await writeCol("abastecimientoSkuParams", newParams);
+
+  // Guardar timestamp de última sync en config
+  const cfgArrNow = await readCol("abastecimientoOdooConfig").catch(() => []);
+  const cfgUpd = (cfgArrNow && cfgArrNow[0]) ? { ...cfgArrNow[0], lastSync: new Date().toISOString() } : cfgArrNow[0];
+  if (cfgUpd) await writeCol("abastecimientoOdooConfig", [cfgUpd]);
+
+  return {
+    ok: true,
+    configured: true,
+    message: `Sincronización exitosa. ${sucursalWh.length} sucursales mapeadas, ${productosOdoo.length} productos, ${stockRows.length} filas de stock, ${actualizados} SKU params actualizados con stock real.`,
+    stats: {
+      sucursalesMapeadas: sucursalWh.length,
+      productosCatalogo: productosOdoo.length,
+      filasStock: stockRows.length,
+      skuParamsActualizados: actualizados,
+    }
+  };
+}
+
+// Endpoint cron-trigger usado por el job diario
+app.post("/api/abastecimiento/odoo-sync-cron", wrap(async (_req, res) => {
+  try {
+    const result = await runOdooSync();
+    res.json(result);
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
 }));
 
 const PORT = process.env.PORT || 5050;
