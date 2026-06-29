@@ -385,6 +385,22 @@ app.get("/api/sales-partners/:id", wrap(async (req, res) => {
   res.json(sanitizePartner(it));
 }));
 
+// ───── Abastecimiento bulk-replace (DEBE ir antes del CRUD genérico para no chocar con :id) ─────
+const ABASTECIMIENTO_BULK_MAP = {
+  "sucursales": "abastecimientoSucursales",
+  "sku-params": "abastecimientoSkuParams",
+  "propuestas": "abastecimientoPropuestas",
+  "odoo-config": "abastecimientoOdooConfig",
+};
+app.put("/api/abastecimiento/:segment/bulk-replace", wrap(async (req, res) => {
+  const key = ABASTECIMIENTO_BULK_MAP[req.params.segment];
+  if (!key) return res.status(404).json({ error: "key inválida" });
+  const body = req.body;
+  if (!Array.isArray(body)) return res.status(400).json({ error: "se requiere array" });
+  await writeCol(key, body);
+  res.json({ ok: true, count: body.length });
+}));
+
 // ───── CRUD genérico por colección ──────────────────────────
 for (const [route, key] of Object.entries(ROUTES)) {
   // Skip GET para sales-partners (ya manejado arriba con sanitización)
@@ -1910,32 +1926,6 @@ function calcMinMaxOptimo({ ventaDiaria = 0, leadTime = 30, maxDias = 60, margen
   const opt = Math.round((min + max) / 2);
   return { min, max, optimo: opt };
 }
-
-// PUT /api/abastecimiento/:key/bulk-replace — reemplaza el array completo de una key
-// Usado por el módulo Abastecimiento que mantiene catálogos pequeños (sucursales, params, propuestas, odoo-config)
-const ABASTECIMIENTO_KEYS = new Set([
-  "abastecimientoSucursales",
-  "abastecimientoSkuParams",
-  "abastecimientoPropuestas",
-  "abastecimientoOdooConfig",
-]);
-function abastecimientoRouteToKey(routeSegment) {
-  const map = {
-    "sucursales": "abastecimientoSucursales",
-    "sku-params": "abastecimientoSkuParams",
-    "propuestas": "abastecimientoPropuestas",
-    "odoo-config": "abastecimientoOdooConfig",
-  };
-  return map[routeSegment];
-}
-app.put("/api/abastecimiento/:segment/bulk-replace", wrap(async (req, res) => {
-  const key = abastecimientoRouteToKey(req.params.segment);
-  if (!key) return res.status(404).json({ error: "key inválida" });
-  const body = req.body;
-  if (!Array.isArray(body)) return res.status(400).json({ error: "se requiere array" });
-  await writeCol(key, body);
-  res.json({ ok: true, count: body.length });
-}));
 
 // POST /api/abastecimiento/generar-propuesta { sucursalId } → crea propuesta automática
 app.post("/api/abastecimiento/generar-propuesta", wrap(async (req, res) => {
