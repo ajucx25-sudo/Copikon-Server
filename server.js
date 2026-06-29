@@ -1774,10 +1774,11 @@ app.post("/api/generators/bitacora/generate-weekly-report", wrap(async (_req, re
   const byModule = {};
   for (const a of weekActivities) {
     const m = a.module;
-    if (!byModule[m]) byModule[m] = { total: 0, completadas: 0, en_progreso: 0, pendiente: 0, items: [] };
+    if (!byModule[m]) byModule[m] = { total: 0, completadas: 0, enProgreso: 0, pendientes: 0, items: [] };
     byModule[m].total++;
-    const st = a.status === "en_progreso" ? "en_progreso" : a.status;
-    if (byModule[m][st] != null) byModule[m][st]++;
+    if (a.status === "completada") byModule[m].completadas++;
+    else if (a.status === "en_progreso") byModule[m].enProgreso++;
+    else if (a.status === "pendiente") byModule[m].pendientes++;
     const emp = employees.find((e) => Number(e.id) === Number(a.assigneeId));
     byModule[m].items.push({
       id: a.id,
@@ -1792,15 +1793,17 @@ app.post("/api/generators/bitacora/generate-weekly-report", wrap(async (_req, re
     });
   }
 
+  // byAssignee indexado por employeeId (clave numérica) para que el frontend pueda hacer lookup
   const byAssignee = {};
   for (const a of weekActivities) {
     if (!a.assigneeId) continue;
     const emp = employees.find((e) => Number(e.id) === Number(a.assigneeId));
     if (!emp) continue;
+    const key = String(emp.id);
     const name = `${emp.firstName} ${emp.lastName}`.trim();
-    if (!byAssignee[name]) byAssignee[name] = { total: 0, completadas: 0, employeeId: emp.id };
-    byAssignee[name].total++;
-    if (a.status === "completada") byAssignee[name].completadas++;
+    if (!byAssignee[key]) byAssignee[key] = { total: 0, completadas: 0, nombre: name };
+    byAssignee[key].total++;
+    if (a.status === "completada") byAssignee[key].completadas++;
   }
 
   const report = {
