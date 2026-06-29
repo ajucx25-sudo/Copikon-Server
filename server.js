@@ -1939,12 +1939,12 @@ app.post("/api/abastecimiento/generar-propuesta", wrap(async (req, res) => {
   const skuParams = await readCol("abastecimientoSkuParams").catch(() => []);
   const productos = await readCol("erpProducts").catch(() => []);
 
-  // Construir líneas: para cada producto con parámetros en esta sucursal, calcular sugerido
+  // Construir líneas: para cada parámetro de esta sucursal, calcular sugerido.
+  // Si existe el producto en erpProducts lo usamos para metadata; si no, usamos los datos del param.
   const lineas = [];
   for (const param of skuParams) {
     if (String(param.sucursalId) !== String(sucursalId)) continue;
     const producto = productos.find((p) => String(p.id) === String(param.productoId) || String(p.sku) === String(param.sku));
-    if (!producto) continue;
     const { min, max, optimo } = calcMinMaxOptimo({
       ventaDiaria: param.ventaDiaria || 0,
       leadTime: param.leadTime || 30,
@@ -1955,9 +1955,9 @@ app.post("/api/abastecimiento/generar-propuesta", wrap(async (req, res) => {
     const sugerido = Math.max(0, optimo - stockActual);
     if (sugerido <= 0 && stockActual >= min) continue; // no necesita reposición
     lineas.push({
-      productoId: producto.id,
-      sku: producto.sku || param.sku,
-      nombre: producto.name || producto.nombre || param.nombre,
+      productoId: producto ? producto.id : (param.productoId || null),
+      sku: (producto && producto.sku) || param.sku || "",
+      nombre: (producto && (producto.name || producto.nombre)) || param.nombre || "",
       stockActual,
       min, max, optimo,
       sugerido,
