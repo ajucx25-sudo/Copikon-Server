@@ -2649,6 +2649,76 @@ async function calculateMinMaxFromOdoo({ leadTime = 30, margen = 0.20, maxDias =
   };
 }
 
+// Endpoint debug: ver movimientos de una sucursal específica en Odoo
+app.get("/api/abastecimiento/odoo-debug-sucursal/:codigo", wrap(async (req, res) => {
+  try {
+    const codigo = String(req.params.codigo).toUpperCase();
+    const cfg = await readOdooConfig();
+    if (!cfg) return res.json({ ok: false, message: "Odoo no configurado" });
+    const sucursales = await readCol("abastecimientoSucursales").catch(() => []);
+    const suc = sucursales.find(s => String(s.codigo).toUpperCase() === codigo);
+    if (!suc) return res.json({ ok: false, message: `Sucursal ${codigo} no encontrada` });
+
+    const odoo = await odooConnect(cfg);
+    const warehouses = await odoo.execute_kw("stock.warehouse", "search_read",
+      [[], ["id", "name", "code", "lot_stock_id"]]);
+    const target = String(suc.almacenOdoo).trim().toLowerCase();
+    const wh = warehouses.find(w =>
+      String(w.name || "").trim().toLowerCase() === target ||
+      String(w.code || "").trim().toLowerCase() === target
+    );
+    if (!wh) {
+      return res.json({
+        ok: false,
+        sucursal: suc,
+        warehouses: warehouses.map(w => ({ id: w.id, name: w.name, code: w.code })),
+        message: `No se encontró warehouse para '${suc.almacenOdoo}'`
+      });
+    }
+
+    const fechaCorte = new Date(Date.now() - 365 * 24 * 60 * 60 * 1000)
+      .toISOString().slice(0, 10) + " 00:00:00";
+
+    // Contar movimientos por tipo de destino
+    const allMoves = await odoo.execute_kw("stock.move", "search_read",
+      [[
+        ["state", "=", "done"],
+        ["date", ">=", fechaCorte],
+        ["location_id", "child_of", wh.lot_stock_id[0]],
+      ], ["location_dest_id", "product_uom_qty", "quantity_done", "date"]],
+      { limit: 5000 });
+
+    // Agrupar por location_dest_id
+    const byDest = {};
+    for (const m of allMoves) {
+      const dest = Array.isArray(m.location_dest_id) ? m.location_dest_id[1] : String(m.location_dest_id);
+      byDest[dest] = (byDest[dest] || 0) + 1;
+    }
+
+    // Verificar locations
+    const destIds = [...new Set(allMoves.map(m => Array.isArray(m.location_dest_id) ? m.location_dest_id[0] : m.location_dest_id))];
+    const locations = destIds.length ? await odoo.execute_kw("stock.location", "read",
+      [destIds, ["id", "name", "usage", "complete_name"]]) : [];
+
+    // Inventario actual (stock.quant)
+    const quantsCount = await odoo.execute_kw("stock.quant", "search_count",
+      [[["location_id", "child_of", wh.lot_stock_id[0]], ["quantity", ">", 0]]]);
+
+    res.json({
+      ok: true,
+      sucursal: { codigo: suc.codigo, almacenOdoo: suc.almacenOdoo },
+      warehouse: { id: wh.id, name: wh.name, code: wh.code, lot_stock_id: wh.lot_stock_id },
+      movimientos_salida_total: allMoves.length,
+      movimientos_por_destino: byDest,
+      locations_destino: locations,
+      stock_quants_activos: quantsCount,
+      fechaCorte
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+}));
+
 // Endpoint manual: recalcular Min/Max desde Odoo (acepta parámetros opcionales)
 app.post("/api/abastecimiento/recalcular-minmax", wrap(async (req, res) => {
   try {
