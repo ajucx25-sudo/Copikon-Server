@@ -2224,10 +2224,14 @@ async function runOdooSync() {
   }
 
   if (!sucursalWh.length) {
+    const cfgNames = sucursales.map(s => s.almacenOdoo || s.nombre).filter(Boolean);
     return {
       ok: false,
-      message: `No se encontró ningún almacén de Odoo que coincida con las sucursales configuradas. Almacenes disponibles: ${warehouses.map(w => w.name).join(", ") || "(ninguno)"}`,
+      reason: "no_match",
+      message: `Ninguna sucursal coincide con un almacén de Odoo. Revisa el campo "Almacén Odoo" en cada sucursal (debe coincidir exactamente con el nombre o código de un almacén en Odoo).`,
+      sucursalesConfiguradas: cfgNames,
       warehousesEnOdoo: warehouses.map(w => ({ id: w.id, name: w.name, code: w.code })),
+      warehousesCount: warehouses.length,
     };
   }
 
