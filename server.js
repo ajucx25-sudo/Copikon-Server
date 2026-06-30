@@ -114,6 +114,8 @@ const ROUTES = {
   "/api/abastecimiento/sku-params": "abastecimientoSkuParams",
   "/api/abastecimiento/propuestas": "abastecimientoPropuestas",
   "/api/abastecimiento/odoo-config": "abastecimientoOdooConfig",
+  "/api/abastecimiento/odoo-stock": "abastecimientoOdooStock",
+  "/api/abastecimiento/odoo-products": "abastecimientoOdooProducts",
 };
 
 const STATIC_KEYS = ["departments", "announcements", "jobDescriptions", "processMaps", "courses"];
