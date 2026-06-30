@@ -2608,16 +2608,41 @@ async function calculateMinMaxFromOdoo({ leadTime = 30, margen = 0.20, maxDias =
     }
   }
 
-  // 5) Guardar — el modo replace garantiza que filas obsoletas (productos descontinuados) desaparezcan
-  await writeCol("abastecimientoMinMax", minmaxRows);
+  // 5) UPSERT: preservar base Excel para SKUs sin movimiento en Odoo
+  //    Estrategia: leer dataset existente, sobrescribir solo SKUs que Odoo recalculó,
+  //    mantener los demás (excel_inicial) intactos para no perder stock/estado base.
+  //    Para filas actualizadas desde Odoo, preservar stockActualExcel/estadoExcel del Excel original.
+  const existing = await readCol("abastecimientoMinMax").catch(() => []);
+  const existingByKey = new Map(existing.map(r => [`${r.sucursalCodigo}__${r.sku}`, r]));
+  const odooKeys = new Set(minmaxRows.map(r => `${r.sucursalCodigo}__${r.sku}`));
+  const preserved = existing.filter(r => !odooKeys.has(`${r.sucursalCodigo}__${r.sku}`));
+
+  // Enriquecer filas Odoo con campos base del Excel (si existían)
+  const enriched = minmaxRows.map(row => {
+    const prev = existingByKey.get(`${row.sucursalCodigo}__${row.sku}`);
+    if (prev) {
+      return {
+        ...row,
+        stockActualExcel: prev.stockActualExcel ?? row.stockActualExcel,
+        estadoExcel: prev.estadoExcel ?? row.estadoExcel,
+      };
+    }
+    return row;
+  });
+
+  const merged = [...preserved, ...enriched];
+
+  await writeCol("abastecimientoMinMax", merged);
 
   return {
     ok: true,
     configured: true,
-    message: `Min/Max recalculados: ${minmaxRows.length} filas desde ${stats.movimientosLeidos} movimientos de ${stats.sucursalesProcessed} sucursales.`,
+    message: `Min/Max recalculados desde Odoo: ${minmaxRows.length} actualizadas + ${preserved.length} preservadas del Excel = ${merged.length} total.`,
     stats: {
       ...stats,
-      filasGeneradas: minmaxRows.length,
+      filasOdooActualizadas: minmaxRows.length,
+      filasExcelPreservadas: preserved.length,
+      filasGeneradas: merged.length,
       parametros: { leadTime, margen, maxDias, ventanaDias },
       fechaCorte: hoyISO,
     }
