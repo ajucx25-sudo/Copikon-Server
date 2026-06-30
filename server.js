@@ -2290,44 +2290,175 @@ async function runOdooSync() {
 
   await writeCol("abastecimientoOdooStock", stockRows);
 
-  // 4) Actualizar skuParams.stockActual con el stock real (matching por sku o productId)
-  let actualizados = 0;
-  const newParams = skuParams.map(p => {
-    const row = stockRows.find(r =>
-      String(r.sucursalId) === String(p.sucursalId) &&
-      (
-        (p.productoId && Number(p.productoId) === r.productId) ||
-        (p.sku && r.sku && String(p.sku).trim().toLowerCase() === String(r.sku).trim().toLowerCase())
-      )
-    );
-    if (row) {
-      actualizados++;
-      return { ...p, stockActual: row.disponible, stockOdooSync: new Date().toISOString() };
+  // 4) Calcular venta diaria histórica desde sale.order.line (últimos 90 días hábiles)
+  //    Estructura: ventaDiariaBySku[sucursalId][sku_lower] = { totalQty, ventaDiaria }
+  const VENTANA_DIAS = 90;
+  const fechaCorte = new Date(Date.now() - VENTANA_DIAS * 24 * 60 * 60 * 1000)
+    .toISOString().slice(0, 10) + " 00:00:00";
+
+  // Contar días hábiles (lun-vie) en la ventana
+  const diasHabiles = (() => {
+    const ahora = new Date();
+    const inicio = new Date(Date.now() - VENTANA_DIAS * 24 * 60 * 60 * 1000);
+    let cnt = 0;
+    for (let d = new Date(inicio); d <= ahora; d.setDate(d.getDate() + 1)) {
+      const dow = d.getDay();
+      if (dow >= 1 && dow <= 5) cnt++;
     }
-    return p;
-  });
-  if (actualizados > 0) await writeCol("abastecimientoSkuParams", newParams);
+    return Math.max(1, cnt);
+  })();
+
+  const ventaDiariaBySku = {}; // { sucursalId: { sku_lower: ventaDiaria } }
+  const ventaStats = { sucursalesProcessed: 0, lineasLeidas: 0, productosConVenta: 0 };
+
+  for (const { sucursal, warehouse } of sucursalWh) {
+    try {
+      // search_read sobre sale.order.line con domain encadenado a order_id
+      // Solo órdenes confirmadas (sale, done) en la ventana de tiempo y en este warehouse
+      const lines = await odoo.execute_kw("sale.order.line", "search_read",
+        [[
+          ["order_id.state", "in", ["sale", "done"]],
+          ["order_id.date_order", ">=", fechaCorte],
+          ["order_id.warehouse_id", "=", warehouse.id],
+          ["product_id.type", "=", "product"],
+          ["qty_delivered", ">", 0],
+        ], ["product_id", "qty_delivered", "product_uom_qty"]],
+        { limit: 50000 });
+
+      ventaStats.lineasLeidas += lines.length;
+      const sumBySku = {}; // sku_lower -> qty acumulada
+
+      for (const ln of lines) {
+        const pid = Array.isArray(ln.product_id) ? ln.product_id[0] : ln.product_id;
+        const prod = productosOdoo.find(p => p.id === pid);
+        if (!prod || !prod.default_code) continue;
+        const sku = String(prod.default_code).trim().toLowerCase();
+        // Preferir qty_delivered (entregado) sobre product_uom_qty (vendido pero no entregado)
+        const qty = Number(ln.qty_delivered || 0);
+        if (qty > 0) {
+          sumBySku[sku] = (sumBySku[sku] || 0) + qty;
+        }
+      }
+
+      const vdMap = {};
+      for (const sku of Object.keys(sumBySku)) {
+        vdMap[sku] = sumBySku[sku] / diasHabiles;
+      }
+      ventaDiariaBySku[sucursal.id] = vdMap;
+      ventaStats.productosConVenta += Object.keys(vdMap).length;
+      ventaStats.sucursalesProcessed++;
+    } catch (e) {
+      console.error(`[odoo-sync] error venta histórica sucursal ${sucursal.nombre}:`, e?.message || e);
+      ventaDiariaBySku[sucursal.id] = {};
+    }
+  }
+
+  // 5) Actualizar skuParams: stockActual + ventaDiaria (sobrescribe el valor manual)
+  //    Además upsert nuevas filas (sucursal×sku) para que el frontend muestre venta histórica
+  //    en SKUs que no tenían override.
+  const ahoraISO = new Date().toISOString();
+  const paramByKey = {}; // sku_lower|sucursalId -> param existente
+  for (const p of skuParams) {
+    const k = `${String(p.sku || "").trim().toLowerCase()}|${p.sucursalId}`;
+    paramByKey[k] = p;
+  }
+
+  let actualizadosStock = 0;
+  let actualizadosVenta = 0;
+  let creadosNuevos = 0;
+
+  // 5a) Recorrer todos los stockRows: garantiza fila por SKU×sucursal y órdenes con venta histórica
+  for (const row of stockRows) {
+    const skuKey = String(row.sku || "").trim().toLowerCase();
+    if (!skuKey) continue;
+    const lookupKey = `${skuKey}|${row.sucursalId}`;
+    const ventaHist = (ventaDiariaBySku[row.sucursalId] || {})[skuKey] ?? 0;
+    const existing = paramByKey[lookupKey];
+
+    if (existing) {
+      const oldStock = existing.stockActual;
+      const oldVenta = existing.ventaDiaria;
+      const newVenta = Number(ventaHist.toFixed(3));
+      const updated = {
+        ...existing,
+        productoId: existing.productoId || row.productId,
+        nombre: existing.nombre || row.nombre,
+        stockActual: row.disponible,
+        ventaDiaria: newVenta,
+        ventaDiariaSource: "odoo_historico",
+        ventaDiariaWindow: VENTANA_DIAS,
+        ventaDiariaUpdatedAt: ahoraISO,
+        stockOdooSync: ahoraISO,
+      };
+      paramByKey[lookupKey] = updated;
+      if (oldStock !== row.disponible) actualizadosStock++;
+      if (Math.abs((oldVenta || 0) - newVenta) > 0.0005) actualizadosVenta++;
+    } else if (ventaHist > 0) {
+      // Solo creamos override automático si hay venta histórica (ahorra basura)
+      const newParam = {
+        id: `odoo-${row.productId}-${row.sucursalId}`,
+        sucursalId: row.sucursalId,
+        productoId: row.productId,
+        sku: row.sku,
+        nombre: row.nombre,
+        stockActual: row.disponible,
+        ventaDiaria: Number(ventaHist.toFixed(3)),
+        ventaDiariaSource: "odoo_historico",
+        ventaDiariaWindow: VENTANA_DIAS,
+        ventaDiariaUpdatedAt: ahoraISO,
+        leadTime: 30,
+        maxDias: 60,
+        margen: 0.20,
+        stockOdooSync: ahoraISO,
+      };
+      paramByKey[lookupKey] = newParam;
+      creadosNuevos++;
+      actualizadosVenta++;
+    }
+  }
+
+  const newParams = Object.values(paramByKey);
+  await writeCol("abastecimientoSkuParams", newParams);
 
   // Guardar timestamp de última sync en config
   const cfgArrNow = await readCol("abastecimientoOdooConfig").catch(() => []);
-  const cfgUpd = (cfgArrNow && cfgArrNow[0]) ? { ...cfgArrNow[0], lastSync: new Date().toISOString() } : cfgArrNow[0];
+  const cfgUpd = (cfgArrNow && cfgArrNow[0]) ? { ...cfgArrNow[0], lastSync: ahoraISO } : cfgArrNow[0];
   if (cfgUpd) await writeCol("abastecimientoOdooConfig", [cfgUpd]);
 
   return {
     ok: true,
     configured: true,
-    message: `Sincronización exitosa. ${sucursalWh.length} sucursales mapeadas, ${productosOdoo.length} productos, ${stockRows.length} filas de stock, ${actualizados} SKU params actualizados con stock real.`,
+    message: `Sincronización exitosa. ${sucursalWh.length} sucursales, ${productosOdoo.length} productos, ${stockRows.length} stock, venta histórica ${VENTANA_DIAS}d (${diasHabiles} días hábiles): ${ventaStats.lineasLeidas} líneas, ${creadosNuevos} SKUs nuevos, ${actualizadosVenta} ventas/día actualizadas.`,
     stats: {
       sucursalesMapeadas: sucursalWh.length,
       productosCatalogo: productosOdoo.length,
       filasStock: stockRows.length,
-      skuParamsActualizados: actualizados,
+      skuParamsActualizados: actualizadosStock,
+      ventaHistorica: {
+        ventanaDias: VENTANA_DIAS,
+        diasHabiles,
+        lineasLeidas: ventaStats.lineasLeidas,
+        productosConVenta: ventaStats.productosConVenta,
+        sucursalesProcessed: ventaStats.sucursalesProcessed,
+        ventasActualizadas: actualizadosVenta,
+        creadosNuevos,
+      }
     }
   };
 }
 
 // Endpoint cron-trigger usado por el job diario
 app.post("/api/abastecimiento/odoo-sync-cron", wrap(async (_req, res) => {
+  try {
+    const result = await runOdooSync();
+    res.json(result);
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+}));
+
+// Endpoint manual: recalcular venta diaria histórica desde Odoo (alias de sync completo)
+app.post("/api/abastecimiento/odoo-recalc-venta-diaria", wrap(async (_req, res) => {
   try {
     const result = await runOdooSync();
     res.json(result);
