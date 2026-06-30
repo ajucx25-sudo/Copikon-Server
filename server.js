@@ -116,6 +116,8 @@ const ROUTES = {
   "/api/abastecimiento/odoo-config": "abastecimientoOdooConfig",
   "/api/abastecimiento/odoo-stock": "abastecimientoOdooStock",
   "/api/abastecimiento/odoo-products": "abastecimientoOdooProducts",
+  // Min/Max oficial (base inicial cargada del Excel 2026-06-23, recálculo automático desde Odoo stock.move 12m)
+  "/api/abastecimiento/minmax": "abastecimientoMinMax",
 };
 
 const STATIC_KEYS = ["departments", "announcements", "jobDescriptions", "processMaps", "courses"];
@@ -2461,6 +2463,177 @@ app.post("/api/abastecimiento/odoo-sync-cron", wrap(async (_req, res) => {
 app.post("/api/abastecimiento/odoo-recalc-venta-diaria", wrap(async (_req, res) => {
   try {
     const result = await runOdooSync();
+    res.json(result);
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+}));
+
+// ───── Min/Max desde Odoo (stock.move últimos 12 meses) ─────
+// Metodología (del Excel Min-Max-Copikon-2026-06-23):
+//   consumoDiario = consumo12m / 365
+//   minimo  = consumoDiario × leadTime × (1 + margen)         (default leadTime=30, margen=0.20)
+//   maximo  = minimo + consumoDiario × maxDias                 (default maxDias=60)
+// Fuente consumo: stock.move con state=done, location_dest_id en location_customer (clientes)
+//   o location_id es ubicación interna del almacén destino (consumo producción).
+// Excluye: devoluciones a proveedor, ajustes de inventario, transferencias internas.
+async function calculateMinMaxFromOdoo({ leadTime = 30, margen = 0.20, maxDias = 60, ventanaDias = 365 } = {}) {
+  const cfg = await readOdooConfig();
+  if (!cfg) {
+    return { ok: false, configured: false, message: "Conexión Odoo no configurada." };
+  }
+  const sucursales = await readCol("abastecimientoSucursales").catch(() => []);
+  if (!sucursales.length) {
+    return { ok: false, message: "No hay sucursales configuradas." };
+  }
+
+  const odoo = await odooConnect(cfg);
+
+  // 1) Cargar warehouses y mapear sucursales
+  const warehouses = await odoo.execute_kw("stock.warehouse", "search_read",
+    [[], ["id", "name", "code", "lot_stock_id"]]);
+  const sucursalWh = [];
+  for (const s of sucursales) {
+    if (!s.almacenOdoo) continue;
+    const target = String(s.almacenOdoo).trim().toLowerCase();
+    const wh = warehouses.find(w =>
+      String(w.name || "").trim().toLowerCase() === target ||
+      String(w.code || "").trim().toLowerCase() === target
+    );
+    if (wh) sucursalWh.push({ sucursal: s, warehouse: wh });
+  }
+  if (!sucursalWh.length) {
+    return { ok: false, reason: "no_match", message: "Ninguna sucursal coincide con un almacén Odoo." };
+  }
+
+  // 2) Cargar productos almacenables
+  const productosOdoo = await odoo.execute_kw("product.product", "search_read",
+    [[["type", "=", "product"]], ["id", "default_code", "name", "uom_id", "product_tmpl_id"]],
+    { limit: 10000 });
+  const productById = new Map(productosOdoo.map(p => [p.id, p]));
+
+  // 2b) Cargar marca por product.template (campo personalizado x_brand o categ_id como fallback)
+  const tmplIds = [...new Set(productosOdoo.map(p => Array.isArray(p.product_tmpl_id) ? p.product_tmpl_id[0] : null).filter(Boolean))];
+  const tmplBrand = new Map();
+  if (tmplIds.length) {
+    try {
+      const tmpls = await odoo.execute_kw("product.template", "read",
+        [tmplIds, ["id", "categ_id"]]);
+      for (const t of tmpls) {
+        tmplBrand.set(t.id, Array.isArray(t.categ_id) ? t.categ_id[1] : "");
+      }
+    } catch (_) { /* opcional */ }
+  }
+
+  // 3) Fecha de corte
+  const fechaCorte = new Date(Date.now() - ventanaDias * 24 * 60 * 60 * 1000)
+    .toISOString().slice(0, 10) + " 00:00:00";
+  const hoyISO = new Date().toISOString().slice(0, 10);
+
+  // 4) Por sucursal, leer stock.move done con destino location_customer
+  //    (Odoo modelo location: usage='customer' = ventas a cliente)
+  const minmaxRows = [];
+  const stats = { sucursalesProcessed: 0, movimientosLeidos: 0, productosConConsumo: 0 };
+
+  for (const { sucursal, warehouse } of sucursalWh) {
+    try {
+      // Filtrar movimientos donde:
+      //  - state = done
+      //  - date >= fechaCorte
+      //  - location_id child_of warehouse.lot_stock_id (sale DEL almacén)
+      //  - location_dest_id.usage = customer (entrega al cliente, no transferencia interna)
+      const moves = await odoo.execute_kw("stock.move", "search_read",
+        [[
+          ["state", "=", "done"],
+          ["date", ">=", fechaCorte],
+          ["location_id", "child_of", warehouse.lot_stock_id[0]],
+          ["location_dest_id.usage", "=", "customer"],
+          ["product_id.type", "=", "product"],
+        ], ["product_id", "product_uom_qty", "quantity_done", "date"]],
+        { limit: 100000 });
+
+      stats.movimientosLeidos += moves.length;
+      const consumoBySku = new Map(); // sku → { qty, productId, nombre, uom, marca }
+
+      for (const m of moves) {
+        const pid = Array.isArray(m.product_id) ? m.product_id[0] : m.product_id;
+        const prod = productById.get(pid);
+        if (!prod || !prod.default_code) continue;
+        const sku = String(prod.default_code).trim();
+        const qty = Number(m.quantity_done || m.product_uom_qty || 0);
+        if (qty <= 0) continue;
+        const cur = consumoBySku.get(sku);
+        if (cur) {
+          cur.qty += qty;
+        } else {
+          const tmplId = Array.isArray(prod.product_tmpl_id) ? prod.product_tmpl_id[0] : null;
+          consumoBySku.set(sku, {
+            qty,
+            productId: pid,
+            nombre: prod.name || "",
+            uom: Array.isArray(prod.uom_id) ? prod.uom_id[1] : "Unidades",
+            marca: tmplBrand.get(tmplId) || "",
+          });
+        }
+      }
+
+      // Generar filas Min/Max para todos los SKUs con consumo > 0
+      for (const [sku, data] of consumoBySku.entries()) {
+        const consumoDiario = data.qty / ventanaDias;
+        const minimo = consumoDiario * leadTime * (1 + margen);
+        const maximo = minimo + consumoDiario * maxDias;
+        const skuClean = sku.replace(/[^A-Za-z0-9\-_.]/g, "_");
+        minmaxRows.push({
+          id: `mm_${sucursal.codigo}_${skuClean}`,
+          sucursalId: sucursal.id,
+          sucursalCodigo: sucursal.codigo,
+          sku,
+          producto: data.nombre,
+          marca: data.marca,
+          udm: data.uom,
+          consumo12m: Number(data.qty.toFixed(2)),
+          consumoDiario: Number(consumoDiario.toFixed(4)),
+          minimo: Number(minimo.toFixed(2)),
+          maximo: Number(maximo.toFixed(2)),
+          fuente: "odoo_calculado",
+          fechaCorte: hoyISO,
+          parametros: { leadTime, margen, maxDias, ventanaDias },
+        });
+      }
+
+      stats.productosConConsumo += consumoBySku.size;
+      stats.sucursalesProcessed++;
+    } catch (e) {
+      console.error(`[minmax] error sucursal ${sucursal.nombre}:`, e?.message || e);
+    }
+  }
+
+  // 5) Guardar — el modo replace garantiza que filas obsoletas (productos descontinuados) desaparezcan
+  await writeCol("abastecimientoMinMax", minmaxRows);
+
+  return {
+    ok: true,
+    configured: true,
+    message: `Min/Max recalculados: ${minmaxRows.length} filas desde ${stats.movimientosLeidos} movimientos de ${stats.sucursalesProcessed} sucursales.`,
+    stats: {
+      ...stats,
+      filasGeneradas: minmaxRows.length,
+      parametros: { leadTime, margen, maxDias, ventanaDias },
+      fechaCorte: hoyISO,
+    }
+  };
+}
+
+// Endpoint manual: recalcular Min/Max desde Odoo (acepta parámetros opcionales)
+app.post("/api/abastecimiento/recalcular-minmax", wrap(async (req, res) => {
+  try {
+    const params = req.body || {};
+    const result = await calculateMinMaxFromOdoo({
+      leadTime: Number(params.leadTime) || 30,
+      margen: Number(params.margen) || 0.20,
+      maxDias: Number(params.maxDias) || 60,
+      ventanaDias: Number(params.ventanaDias) || 365,
+    });
     res.json(result);
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e?.message || e) });
