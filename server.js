@@ -357,6 +357,43 @@ app.put("/api/erp/rental-tariff", wrap(async (req, res) => {
   res.json(merged);
 }));
 
+// ───── Banda "Comisión Generators" (singleton) ──────────────────────
+// Tabla Única de tramos que aplica ADITIVAMENTE a los gerentes de otras
+// unidades (Tiendas, USA, Distribución, etc.) sobre ventas de Copikon Generators.
+// Se guarda como singleton bajo la clave 'salary:generators-band'.
+//
+// Estructura:
+//   { tramos: [{ minVenta, maxVenta, porcentaje }, ...],
+//     notas: string,
+//     updatedAt: ISO }
+const DEFAULT_GENERATORS_BAND = {
+  tramos: [],
+  notas: "",
+};
+
+app.get("/api/salary/generators-band", wrap(async (_req, res) => {
+  const b = await readSingleton("salary:generators-band");
+  res.json(b && typeof b === "object" && !Array.isArray(b) ? b : DEFAULT_GENERATORS_BAND);
+}));
+
+app.put("/api/salary/generators-band", wrap(async (req, res) => {
+  const body = req.body || {};
+  const tramos = Array.isArray(body.tramos) ? body.tramos : [];
+  // Sanitizar tramos
+  const cleanTramos = tramos.map((t) => ({
+    minVenta: Number(t.minVenta) || 0,
+    maxVenta: t.maxVenta === null || t.maxVenta === undefined || t.maxVenta === "" ? null : Number(t.maxVenta),
+    porcentaje: Number(t.porcentaje) || 0,
+  }));
+  const merged = {
+    tramos: cleanTramos,
+    notas: typeof body.notas === "string" ? body.notas : "",
+    updatedAt: new Date().toISOString(),
+  };
+  await writeSingleton("salary:generators-band", merged);
+  res.json(merged);
+}));
+
 // ───── Sanitizado GET sales-partners (oculta password) ─────────
 function sanitizePartner(p) {
   if (!p || typeof p !== "object") return p;
