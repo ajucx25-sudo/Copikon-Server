@@ -2095,6 +2095,26 @@ app.get("/api/admin/finanzas/ar-ap", wrap(async (req, res) => {
   const ctx = ctxCompanies(companyIds);
   const asOfDate = new Date(as_of);
 
+  // ── SALDO CONTABLE (Balance General): sum(balance) de todas las líneas posteadas
+  //     en cuentas receivable/payable hasta as_of. Esto coincide con la línea
+  //     "Cuentas por Cobrar" / "Cuentas por Pagar" del Balance General de Odoo.
+  const glDomainBase = [
+    ["parent_state", "=", "posted"],
+    ["date", "<=", as_of],
+  ];
+  if (companyIds) glDomainBase.push(["company_id", "in", companyIds]);
+
+  const [arGlLines, apGlLines] = await Promise.all([
+    odoo.searchRead("account.move.line",
+      [...glDomainBase, ["account_id.user_type_id.type", "=", "receivable"]],
+      ["balance"], { context: ctx, limit: 50000 }),
+    odoo.searchRead("account.move.line",
+      [...glDomainBase, ["account_id.user_type_id.type", "=", "payable"]],
+      ["balance"], { context: ctx, limit: 50000 }),
+  ]);
+  const ar_gl_balance = arGlLines.reduce((s, l) => s + (l.balance || 0), 0);
+  const ap_gl_balance = Math.abs(apGlLines.reduce((s, l) => s + (l.balance || 0), 0));
+
   const lineDomainBase = [
     ["parent_state", "=", "posted"],
     ["reconciled", "=", false],
@@ -2246,10 +2266,15 @@ app.get("/api/admin/finanzas/ar-ap", wrap(async (req, res) => {
     };
   }
 
+  const arAging = buildAging(arLines, true);
+  const apAging = buildAging(apLines, false);
+  arAging.gl_balance = ar_gl_balance;   // saldo contable según Balance General
+  apAging.gl_balance = ap_gl_balance;
+
   res.json({
     filters: { company_ids: companyIds, as_of },
-    ar: buildAging(arLines, true),
-    ap: buildAging(apLines, false),
+    ar: arAging,
+    ap: apAging,
   });
 }));
 
