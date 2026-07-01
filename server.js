@@ -2079,107 +2079,177 @@ app.get("/api/admin/finanzas/balance", wrap(async (req, res) => {
 
 // GET /api/admin/finanzas/ar-ap — Cuentas x Cobrar y x Pagar con aging
 // Query params: company_id, as_of (default hoy)
+//
+// ENFOQUE: se recorren account.move.line NO reconciliadas en cuentas receivable
+// (AR) y payable (AP). Esto refleja el BALANCE REAL FINAL por partner,
+// considerando facturas abiertas MENOS pagos a cuenta / anticipos ya registrados
+// aunque aún no estén conciliados con una factura específica.
+//
+// - move.line.balance      → débito - crédito en moneda de compañía (USD)
+// - move.line.amount_residual → residual firmado, en moneda de compañía
+//   AR: positivo = cliente nos debe; negativo = anticipo del cliente
+//   AP: negativo = le debemos al proveedor; positivo = anticipo dado
 app.get("/api/admin/finanzas/ar-ap", wrap(async (req, res) => {
   const companyIds = parseCompanyIds(req.query);
   const as_of = String(req.query.as_of || todayIso());
   const ctx = ctxCompanies(companyIds);
   const asOfDate = new Date(as_of);
 
-  // Facturas abiertas: state=posted, payment_state IN ('not_paid','partial','in_payment')
-  // move_type: 'out_invoice','out_refund' → AR ; 'in_invoice','in_refund' → AP
-  // Nota: filtramos por amount_residual (moneda factura) para no perder facturas en Bs,
-  // pero SUMAMOS por amount_residual_signed (siempre en moneda de la compañía = USD)
-  const domainBase = [
-    ["state", "=", "posted"],
-    ["payment_state", "in", ["not_paid", "partial", "in_payment"]],
-    ["amount_residual", ">", 0],
+  const lineDomainBase = [
+    ["parent_state", "=", "posted"],
+    ["reconciled", "=", false],
   ];
-  if (companyIds) domainBase.push(["company_id", "in", companyIds]);
+  if (companyIds) lineDomainBase.push(["company_id", "in", companyIds]);
 
-  const fields = ["id", "name", "partner_id", "invoice_date", "invoice_date_due",
-                  "amount_total", "amount_total_signed", "amount_residual", "amount_residual_signed",
-                  "currency_id", "company_id", "company_currency_id", "move_type", "payment_state"];
+  const lineFields = [
+    "id", "move_id", "move_name", "partner_id", "account_id",
+    "debit", "credit", "balance", "amount_residual", "amount_residual_currency",
+    "currency_id", "company_id", "company_currency_id",
+    "date", "date_maturity", "name", "ref",
+  ];
 
-  const [ar, ap] = await Promise.all([
+  const [arLines, apLines] = await Promise.all([
     odoo.searchRead(
-      "account.move",
-      [...domainBase, ["move_type", "in", ["out_invoice", "out_refund"]]],
-      fields,
-      { context: ctx, limit: 2000, order: "invoice_date_due asc" }
+      "account.move.line",
+      [...lineDomainBase, ["account_id.user_type_id.type", "=", "receivable"]],
+      lineFields,
+      { context: ctx, limit: 20000, order: "date_maturity asc" }
     ),
     odoo.searchRead(
-      "account.move",
-      [...domainBase, ["move_type", "in", ["in_invoice", "in_refund"]]],
-      fields,
-      { context: ctx, limit: 2000, order: "invoice_date_due asc" }
+      "account.move.line",
+      [...lineDomainBase, ["account_id.user_type_id.type", "=", "payable"]],
+      lineFields,
+      { context: ctx, limit: 20000, order: "date_maturity asc" }
     ),
   ]);
 
-  function buildAging(invoices, isAR) {
+  // Enriquecer con move_type y payment_state en un solo call
+  const allMoveIds = Array.from(new Set([...arLines, ...apLines].map(l => l.move_id?.[0]).filter(Boolean)));
+  const moveInfoArr = allMoveIds.length ? await odoo.searchRead(
+    "account.move",
+    [["id", "in", allMoveIds]],
+    ["id", "move_type", "payment_state", "invoice_date", "invoice_date_due", "name", "amount_total_signed", "currency_id"],
+    { context: ctx, limit: allMoveIds.length }
+  ) : [];
+  const moveInfo = new Map(moveInfoArr.map(m => [m.id, m]));
+
+  function buildAging(lines, isAR) {
+    // isAR=true → AR: cliente nos debe si residual > 0 (positivo); anticipo si residual < 0
+    // isAR=false → AP: le debemos si residual < 0 (negativo); anticipo dado si residual > 0
+    const sign = isAR ? 1 : -1; // multiplicar residual por sign → positivo = deuda del partner
+
     const buckets = { current: 0, d1_30: 0, d31_60: 0, d61_90: 0, d90plus: 0 };
+    let advancesTotal = 0; // absoluto: monto de anticipos/pagos-a-cuenta
+    let advancesCount = 0;
     const byPartner = new Map();
-    const rows = invoices.map(inv => {
-      const due = inv.invoice_date_due ? new Date(inv.invoice_date_due) : null;
-      const daysOverdue = due ? Math.floor((asOfDate - due) / (1000 * 60 * 60 * 24)) : 0;
-      let bucket = "current";
-      if (daysOverdue > 90) bucket = "d90plus";
-      else if (daysOverdue > 60) bucket = "d61_90";
-      else if (daysOverdue > 30) bucket = "d31_60";
-      else if (daysOverdue > 0) bucket = "d1_30";
+    const rows = [];
+    const advanceRows = [];
 
-      // amount_residual_signed está en moneda de compañía (USD) y viene con signo:
-      //   AR (out_invoice): positivo   / out_refund: negativo
-      //   AP (in_invoice):  negativo   / in_refund: positivo
-      // Tomamos valor absoluto para presentación consistente.
-      const residualUsd = Math.abs(inv.amount_residual_signed || 0);
-      const totalUsd = Math.abs(inv.amount_total_signed || 0);
+    for (const l of lines) {
+      const partnerId = l.partner_id?.[0] || 0;
+      const partnerName = l.partner_id?.[1] || "(sin partner)";
+      const moveId = l.move_id?.[0];
+      const mi = moveInfo.get(moveId) || {};
+      const moveType = mi.move_type || "entry";
+      const paymentState = mi.payment_state || null;
 
-      buckets[bucket] += residualUsd;
+      // Residual signed en USD (moneda de compañía)
+      const residSigned = l.amount_residual || 0;
+      const debtUsd = residSigned * sign; // positivo = partner debe / negativo = anticipo
 
-      const partnerId = inv.partner_id?.[0] || 0;
-      const partnerName = inv.partner_id?.[1] || "(sin partner)";
+      const isAdvance = debtUsd < 0; // línea contraria al signo esperado → anticipo
+
       if (!byPartner.has(partnerId)) {
         byPartner.set(partnerId, {
           partner_id: partnerId, partner_name: partnerName,
-          total: 0, current: 0, d1_30: 0, d31_60: 0, d61_90: 0, d90plus: 0, count: 0
+          total: 0, current: 0, d1_30: 0, d31_60: 0, d61_90: 0, d90plus: 0,
+          advances: 0, count: 0, advance_count: 0,
         });
       }
       const p = byPartner.get(partnerId);
-      p.total += residualUsd;
-      p[bucket] += residualUsd;
-      p.count += 1;
 
-      return {
-        id: inv.id,
-        name: inv.name,
-        partner_id: partnerId,
-        partner_name: partnerName,
-        company_id: inv.company_id?.[0],
-        company_name: inv.company_id?.[1],
-        invoice_date: inv.invoice_date,
-        due_date: inv.invoice_date_due,
-        days_overdue: daysOverdue,
-        bucket,
-        // Montos en USD (moneda de la compañía) - siempre positivos
-        amount_total: totalUsd,
-        amount_residual: residualUsd,
-        // Montos originales en moneda de la factura (para referencia/debug)
-        amount_total_original: inv.amount_total,
-        amount_residual_original: inv.amount_residual,
-        currency_original: inv.currency_id?.[1] || "USD",
-        currency: inv.company_currency_id?.[1] || "USD",
-        payment_state: inv.payment_state,
-      };
-    });
-    const total = buckets.current + buckets.d1_30 + buckets.d31_60 + buckets.d61_90 + buckets.d90plus;
-    const byPartnerArr = Array.from(byPartner.values()).sort((a, b) => b.total - a.total);
-    return { rows, buckets, total, by_partner: byPartnerArr };
+      if (isAdvance) {
+        // Anticipo o pago a cuenta — reduce el neto del partner pero no va a aging
+        const advAbs = Math.abs(debtUsd);
+        advancesTotal += advAbs;
+        advancesCount += 1;
+        p.advances += advAbs;
+        p.advance_count += 1;
+        p.total += debtUsd; // negativo, reduce total
+
+        advanceRows.push({
+          id: l.id,
+          move_id: moveId,
+          move_name: l.move_name || mi.name || l.name || "(sin nombre)",
+          partner_id: partnerId,
+          partner_name: partnerName,
+          amount: advAbs,
+          date: l.date,
+          move_type: moveType,
+          reference: l.ref || l.name,
+        });
+      } else {
+        // Deuda normal — aging por fecha de vencimiento
+        const due = l.date_maturity ? new Date(l.date_maturity) : (l.date ? new Date(l.date) : null);
+        const daysOverdue = due ? Math.floor((asOfDate - due) / (1000 * 60 * 60 * 24)) : 0;
+        let bucket = "current";
+        if (daysOverdue > 90) bucket = "d90plus";
+        else if (daysOverdue > 60) bucket = "d61_90";
+        else if (daysOverdue > 30) bucket = "d31_60";
+        else if (daysOverdue > 0) bucket = "d1_30";
+
+        buckets[bucket] += debtUsd;
+        p[bucket] += debtUsd;
+        p.total += debtUsd;
+        p.count += 1;
+
+        rows.push({
+          id: l.id,
+          move_id: moveId,
+          name: l.move_name || mi.name || "(sin nombre)",
+          partner_id: partnerId,
+          partner_name: partnerName,
+          company_id: l.company_id?.[0],
+          company_name: l.company_id?.[1],
+          invoice_date: mi.invoice_date || l.date,
+          due_date: l.date_maturity,
+          days_overdue: daysOverdue,
+          bucket,
+          amount_total: Math.abs(mi.amount_total_signed || 0),
+          amount_residual: debtUsd,
+          currency: l.company_currency_id?.[1] || "USD",
+          currency_original: l.currency_id?.[1] || "USD",
+          amount_residual_original: l.amount_residual_currency || null,
+          move_type: moveType,
+          payment_state: paymentState,
+        });
+      }
+    }
+
+    // Ordenar y limpiar partners (algunos pueden tener total=0 si anticipos == deuda)
+    const byPartnerArr = Array.from(byPartner.values())
+      .filter(p => p.total !== 0 || p.advances > 0)
+      .sort((a, b) => b.total - a.total);
+
+    const grossTotal = buckets.current + buckets.d1_30 + buckets.d31_60 + buckets.d61_90 + buckets.d90plus;
+    const netTotal = grossTotal - advancesTotal;
+
+    return {
+      rows,
+      advances: advanceRows,
+      buckets,
+      total: netTotal,          // NETO tras aplicar anticipos (balance final real)
+      gross_total: grossTotal,  // Bruto sin anticipos (facturas abiertas)
+      advances_total: advancesTotal,
+      advances_count: advancesCount,
+      by_partner: byPartnerArr,
+    };
   }
 
   res.json({
     filters: { company_ids: companyIds, as_of },
-    ar: buildAging(ar, true),
-    ap: buildAging(ap, false),
+    ar: buildAging(arLines, true),
+    ap: buildAging(apLines, false),
   });
 }));
 
