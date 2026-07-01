@@ -11,6 +11,7 @@ import express from "express";
 import compression from "compression";
 import cors from "cors";
 import pkg from "pg";
+import * as odoo from "./odoo-client.js";
 
 const { Pool } = pkg;
 
@@ -1878,6 +1879,423 @@ app.post("/api/notifications/read-all", wrap(async (req, res) => {
   }
   await writeCol("notifications", items);
   res.json({ ok: true, updated });
+}));
+
+// ============================================================
+// MÓDULO ADMINISTRACIÓN — Endpoints Odoo (P&L, Balance, AR/AP, Cashflow)
+// ============================================================
+// Multi-company nativo. Todos los endpoints aceptan company_id (int).
+// Si company_id se omite o es 0 → CONSOLIDADO (todas las compañías).
+// Fechas en formato YYYY-MM-DD. Montos en la moneda de la compañía.
+// ============================================================
+
+function parseCompanyIds(q) {
+  const raw = q.company_id;
+  if (!raw || raw === "0" || raw === "all" || raw === "consolidado") return null; // null = todas
+  const id = parseInt(raw, 10);
+  return Number.isFinite(id) && id > 0 ? [id] : null;
+}
+
+function todayIso() { return new Date().toISOString().slice(0, 10); }
+function firstDayOfMonthIso() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-01`;
+}
+
+// Contexto Odoo con allowed_company_ids para forzar multi-company
+function ctxCompanies(companyIds) {
+  if (!companyIds) return {}; // sin restricción = ve todas las permitidas al usuario
+  return { allowed_company_ids: companyIds, force_company: companyIds[0] };
+}
+
+// GET /api/admin/finanzas/ping — test de conexión con Odoo
+app.get("/api/admin/finanzas/ping", wrap(async (_req, res) => {
+  if (!odoo.isConfigured()) {
+    return res.status(503).json({ ok: false, error: "Odoo no configurado (faltan env vars ODOO_URL / ODOO_DB / ODOO_LOGIN / ODOO_API_KEY)" });
+  }
+  const info = await odoo.ping();
+  res.json(info);
+}));
+
+// GET /api/admin/finanzas/companies — lista de compañías
+app.get("/api/admin/finanzas/companies", wrap(async (_req, res) => {
+  const rows = await odoo.searchRead(
+    "res.company",
+    [],
+    ["id", "name", "vat", "currency_id", "country_id"],
+    { order: "name asc" }
+  );
+  res.json({ companies: rows });
+}));
+
+// GET /api/admin/finanzas/pnl — Estado de Resultados
+// Query params: company_id, date_from, date_to
+app.get("/api/admin/finanzas/pnl", wrap(async (req, res) => {
+  const companyIds = parseCompanyIds(req.query);
+  const date_from = String(req.query.date_from || firstDayOfMonthIso());
+  const date_to = String(req.query.date_to || todayIso());
+  const ctx = ctxCompanies(companyIds);
+
+  // Dominio: solo asientos posted + rango de fechas + tipos Income/Expense
+  // account.account.internal_group: 'income' | 'expense' | 'asset' | 'liability' | 'equity' | 'off_balance'
+  const domainBase = [
+    ["parent_state", "=", "posted"],
+    ["date", ">=", date_from],
+    ["date", "<=", date_to],
+  ];
+  if (companyIds) domainBase.push(["company_id", "in", companyIds]);
+
+  // Ingresos (internal_group = 'income') → balance típicamente negativo, se muestra positivo
+  const incomeDomain = [...domainBase, ["account_id.internal_group", "=", "income"]];
+  const expenseDomain = [...domainBase, ["account_id.internal_group", "=", "expense"]];
+
+  const [incomeGroups, expenseGroups] = await Promise.all([
+    odoo.readGroup(
+      "account.move.line",
+      incomeDomain,
+      ["balance:sum", "account_id"],
+      ["account_id"],
+      { context: ctx, lazy: false, limit: 500 }
+    ),
+    odoo.readGroup(
+      "account.move.line",
+      expenseDomain,
+      ["balance:sum", "account_id"],
+      ["account_id"],
+      { context: ctx, lazy: false, limit: 500 }
+    ),
+  ]);
+
+  // En Odoo, ingresos tienen balance negativo (credit > debit).
+  // Invertimos signo para mostrar ingresos como positivos.
+  const income = incomeGroups.map(g => ({
+    account_id: g.account_id?.[0],
+    account_name: g.account_id?.[1],
+    amount: -(g.balance || 0),
+    count: g.__count || 0,
+  })).filter(r => Math.abs(r.amount) > 0.005);
+
+  const expense = expenseGroups.map(g => ({
+    account_id: g.account_id?.[0],
+    account_name: g.account_id?.[1],
+    amount: g.balance || 0,
+    count: g.__count || 0,
+  })).filter(r => Math.abs(r.amount) > 0.005);
+
+  const totalIncome = income.reduce((s, r) => s + r.amount, 0);
+  const totalExpense = expense.reduce((s, r) => s + r.amount, 0);
+  const netIncome = totalIncome - totalExpense;
+
+  res.json({
+    filters: { company_ids: companyIds, date_from, date_to },
+    income,
+    expense,
+    totals: {
+      income: totalIncome,
+      expense: totalExpense,
+      net_income: netIncome,
+      margin_pct: totalIncome !== 0 ? (netIncome / totalIncome) * 100 : 0,
+    },
+  });
+}));
+
+// GET /api/admin/finanzas/balance — Balance General
+// Query params: company_id, as_of (fecha corte, default hoy)
+app.get("/api/admin/finanzas/balance", wrap(async (req, res) => {
+  const companyIds = parseCompanyIds(req.query);
+  const as_of = String(req.query.as_of || todayIso());
+  const ctx = ctxCompanies(companyIds);
+
+  const domainBase = [
+    ["parent_state", "=", "posted"],
+    ["date", "<=", as_of],
+  ];
+  if (companyIds) domainBase.push(["company_id", "in", companyIds]);
+
+  // Traer agrupado por internal_group (asset/liability/equity)
+  const groups = ["asset", "liability", "equity"];
+  const results = await Promise.all(
+    groups.map(g => odoo.readGroup(
+      "account.move.line",
+      [...domainBase, ["account_id.internal_group", "=", g]],
+      ["balance:sum", "account_id"],
+      ["account_id"],
+      { context: ctx, lazy: false, limit: 500 }
+    ))
+  );
+
+  // También trae la utilidad del período (income - expense acumulada hasta as_of)
+  const [incomeGroups, expenseGroups] = await Promise.all([
+    odoo.readGroup(
+      "account.move.line",
+      [...domainBase, ["account_id.internal_group", "=", "income"]],
+      ["balance:sum"],
+      [],
+      { context: ctx, lazy: false }
+    ),
+    odoo.readGroup(
+      "account.move.line",
+      [...domainBase, ["account_id.internal_group", "=", "expense"]],
+      ["balance:sum"],
+      [],
+      { context: ctx, lazy: false }
+    ),
+  ]);
+
+  const totalIncome = -(incomeGroups[0]?.balance || 0);
+  const totalExpense = expenseGroups[0]?.balance || 0;
+  const retainedEarnings = totalIncome - totalExpense;
+
+  const mapAccounts = (arr, invert = false) => arr.map(g => ({
+    account_id: g.account_id?.[0],
+    account_name: g.account_id?.[1],
+    amount: invert ? -(g.balance || 0) : (g.balance || 0),
+  })).filter(r => Math.abs(r.amount) > 0.005);
+
+  // Activo: balance positivo (débito). Pasivo/Patrimonio: balance negativo (crédito) → invertir.
+  const assets = mapAccounts(results[0], false);
+  const liabilities = mapAccounts(results[1], true);
+  const equity = mapAccounts(results[2], true);
+
+  const totalAssets = assets.reduce((s, r) => s + r.amount, 0);
+  const totalLiabilities = liabilities.reduce((s, r) => s + r.amount, 0);
+  const totalEquity = equity.reduce((s, r) => s + r.amount, 0);
+
+  res.json({
+    filters: { company_ids: companyIds, as_of },
+    assets,
+    liabilities,
+    equity,
+    retained_earnings: retainedEarnings,
+    totals: {
+      assets: totalAssets,
+      liabilities: totalLiabilities,
+      equity: totalEquity + retainedEarnings,
+      liabilities_plus_equity: totalLiabilities + totalEquity + retainedEarnings,
+      balance_check: totalAssets - (totalLiabilities + totalEquity + retainedEarnings),
+    },
+  });
+}));
+
+// GET /api/admin/finanzas/ar-ap — Cuentas x Cobrar y x Pagar con aging
+// Query params: company_id, as_of (default hoy)
+app.get("/api/admin/finanzas/ar-ap", wrap(async (req, res) => {
+  const companyIds = parseCompanyIds(req.query);
+  const as_of = String(req.query.as_of || todayIso());
+  const ctx = ctxCompanies(companyIds);
+  const asOfDate = new Date(as_of);
+
+  // Facturas abiertas: state=posted, payment_state IN ('not_paid','partial','in_payment')
+  // move_type: 'out_invoice','out_refund' → AR ; 'in_invoice','in_refund' → AP
+  const domainBase = [
+    ["state", "=", "posted"],
+    ["payment_state", "in", ["not_paid", "partial", "in_payment"]],
+    ["amount_residual", ">", 0],
+  ];
+  if (companyIds) domainBase.push(["company_id", "in", companyIds]);
+
+  const fields = ["id", "name", "partner_id", "invoice_date", "invoice_date_due",
+                  "amount_total", "amount_residual", "amount_residual_signed",
+                  "currency_id", "company_id", "move_type", "payment_state"];
+
+  const [ar, ap] = await Promise.all([
+    odoo.searchRead(
+      "account.move",
+      [...domainBase, ["move_type", "in", ["out_invoice", "out_refund"]]],
+      fields,
+      { context: ctx, limit: 2000, order: "invoice_date_due asc" }
+    ),
+    odoo.searchRead(
+      "account.move",
+      [...domainBase, ["move_type", "in", ["in_invoice", "in_refund"]]],
+      fields,
+      { context: ctx, limit: 2000, order: "invoice_date_due asc" }
+    ),
+  ]);
+
+  function buildAging(invoices) {
+    const buckets = { current: 0, d1_30: 0, d31_60: 0, d61_90: 0, d90plus: 0 };
+    const byPartner = new Map();
+    const rows = invoices.map(inv => {
+      const due = inv.invoice_date_due ? new Date(inv.invoice_date_due) : null;
+      const daysOverdue = due ? Math.floor((asOfDate - due) / (1000 * 60 * 60 * 24)) : 0;
+      let bucket = "current";
+      if (daysOverdue > 90) bucket = "d90plus";
+      else if (daysOverdue > 60) bucket = "d61_90";
+      else if (daysOverdue > 30) bucket = "d31_60";
+      else if (daysOverdue > 0) bucket = "d1_30";
+      buckets[bucket] += inv.amount_residual || 0;
+
+      const partnerId = inv.partner_id?.[0] || 0;
+      const partnerName = inv.partner_id?.[1] || "(sin partner)";
+      if (!byPartner.has(partnerId)) {
+        byPartner.set(partnerId, {
+          partner_id: partnerId, partner_name: partnerName,
+          total: 0, current: 0, d1_30: 0, d31_60: 0, d61_90: 0, d90plus: 0, count: 0
+        });
+      }
+      const p = byPartner.get(partnerId);
+      p.total += inv.amount_residual || 0;
+      p[bucket] += inv.amount_residual || 0;
+      p.count += 1;
+
+      return {
+        id: inv.id,
+        name: inv.name,
+        partner_id: partnerId,
+        partner_name: partnerName,
+        company_id: inv.company_id?.[0],
+        company_name: inv.company_id?.[1],
+        invoice_date: inv.invoice_date,
+        due_date: inv.invoice_date_due,
+        days_overdue: daysOverdue,
+        bucket,
+        amount_total: inv.amount_total,
+        amount_residual: inv.amount_residual,
+        currency: inv.currency_id?.[1] || "USD",
+        payment_state: inv.payment_state,
+      };
+    });
+    const total = buckets.current + buckets.d1_30 + buckets.d31_60 + buckets.d61_90 + buckets.d90plus;
+    const byPartnerArr = Array.from(byPartner.values()).sort((a, b) => b.total - a.total);
+    return { rows, buckets, total, by_partner: byPartnerArr };
+  }
+
+  res.json({
+    filters: { company_ids: companyIds, as_of },
+    ar: buildAging(ar),
+    ap: buildAging(ap),
+  });
+}));
+
+// GET /api/admin/finanzas/cashflow — Flujo de caja y saldos bancarios
+// Query params: company_id, date_from, date_to
+app.get("/api/admin/finanzas/cashflow", wrap(async (req, res) => {
+  const companyIds = parseCompanyIds(req.query);
+  const date_from = String(req.query.date_from || firstDayOfMonthIso());
+  const date_to = String(req.query.date_to || todayIso());
+  const ctx = ctxCompanies(companyIds);
+
+  // Cuentas de banco/caja: internal_type = 'liquidity' (bancos y cajas)
+  const accountDomain = [["internal_type", "=", "liquidity"]];
+  if (companyIds) accountDomain.push(["company_id", "in", companyIds]);
+
+  const bankAccounts = await odoo.searchRead(
+    "account.account",
+    accountDomain,
+    ["id", "code", "name", "company_id", "currency_id"],
+    { context: ctx, order: "code asc", limit: 200 }
+  );
+
+  if (bankAccounts.length === 0) {
+    return res.json({
+      filters: { company_ids: companyIds, date_from, date_to },
+      bank_accounts: [], totals: { opening: 0, inflows: 0, outflows: 0, closing: 0, net_change: 0 },
+      by_journal: [],
+    });
+  }
+
+  const bankAccIds = bankAccounts.map(a => a.id);
+
+  // Saldo apertura: suma de balance hasta date_from-1
+  const openingDomain = [
+    ["parent_state", "=", "posted"],
+    ["date", "<", date_from],
+    ["account_id", "in", bankAccIds],
+  ];
+  if (companyIds) openingDomain.push(["company_id", "in", companyIds]);
+
+  // Movimientos del período
+  const periodDomain = [
+    ["parent_state", "=", "posted"],
+    ["date", ">=", date_from],
+    ["date", "<=", date_to],
+    ["account_id", "in", bankAccIds],
+  ];
+  if (companyIds) periodDomain.push(["company_id", "in", companyIds]);
+
+  const [openingGroups, byAccountGroups, byJournalGroups] = await Promise.all([
+    odoo.readGroup(
+      "account.move.line", openingDomain,
+      ["balance:sum"], [], { context: ctx, lazy: false }
+    ),
+    odoo.readGroup(
+      "account.move.line", periodDomain,
+      ["debit:sum", "credit:sum", "balance:sum", "account_id"],
+      ["account_id"],
+      { context: ctx, lazy: false, limit: 200 }
+    ),
+    odoo.readGroup(
+      "account.move.line", periodDomain,
+      ["debit:sum", "credit:sum", "balance:sum", "journal_id"],
+      ["journal_id"],
+      { context: ctx, lazy: false, limit: 100 }
+    ),
+  ]);
+
+  const opening = openingGroups[0]?.balance || 0;
+
+  const movementsByAccount = new Map();
+  for (const g of byAccountGroups) {
+    movementsByAccount.set(g.account_id?.[0], {
+      inflows: g.debit || 0,
+      outflows: g.credit || 0,
+      net: g.balance || 0,
+    });
+  }
+
+  // También necesitamos saldo apertura por cuenta
+  const openingByAcc = await odoo.readGroup(
+    "account.move.line", openingDomain,
+    ["balance:sum", "account_id"], ["account_id"],
+    { context: ctx, lazy: false, limit: 200 }
+  );
+  const openingByAccMap = new Map();
+  for (const g of openingByAcc) openingByAccMap.set(g.account_id?.[0], g.balance || 0);
+
+  const bankRows = bankAccounts.map(a => {
+    const m = movementsByAccount.get(a.id) || { inflows: 0, outflows: 0, net: 0 };
+    const op = openingByAccMap.get(a.id) || 0;
+    return {
+      account_id: a.id,
+      code: a.code,
+      name: a.name,
+      company_id: a.company_id?.[0],
+      company_name: a.company_id?.[1],
+      currency: a.currency_id?.[1] || null,
+      opening_balance: op,
+      inflows: m.inflows,
+      outflows: m.outflows,
+      net_change: m.net,
+      closing_balance: op + m.net,
+    };
+  });
+
+  const totalInflows = bankRows.reduce((s, r) => s + r.inflows, 0);
+  const totalOutflows = bankRows.reduce((s, r) => s + r.outflows, 0);
+  const totalClosing = bankRows.reduce((s, r) => s + r.closing_balance, 0);
+  const totalOpening = bankRows.reduce((s, r) => s + r.opening_balance, 0);
+
+  const byJournal = byJournalGroups.map(g => ({
+    journal_id: g.journal_id?.[0],
+    journal_name: g.journal_id?.[1],
+    inflows: g.debit || 0,
+    outflows: g.credit || 0,
+    net: g.balance || 0,
+  })).sort((a, b) => Math.abs(b.net) - Math.abs(a.net));
+
+  res.json({
+    filters: { company_ids: companyIds, date_from, date_to },
+    bank_accounts: bankRows,
+    by_journal: byJournal,
+    totals: {
+      opening: totalOpening,
+      inflows: totalInflows,
+      outflows: totalOutflows,
+      net_change: totalInflows - totalOutflows,
+      closing: totalClosing,
+    },
+  });
 }));
 
 const PORT = process.env.PORT || 5050;
