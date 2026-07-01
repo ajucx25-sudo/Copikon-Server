@@ -2087,6 +2087,8 @@ app.get("/api/admin/finanzas/ar-ap", wrap(async (req, res) => {
 
   // Facturas abiertas: state=posted, payment_state IN ('not_paid','partial','in_payment')
   // move_type: 'out_invoice','out_refund' → AR ; 'in_invoice','in_refund' → AP
+  // Nota: filtramos por amount_residual (moneda factura) para no perder facturas en Bs,
+  // pero SUMAMOS por amount_residual_signed (siempre en moneda de la compañía = USD)
   const domainBase = [
     ["state", "=", "posted"],
     ["payment_state", "in", ["not_paid", "partial", "in_payment"]],
@@ -2095,8 +2097,8 @@ app.get("/api/admin/finanzas/ar-ap", wrap(async (req, res) => {
   if (companyIds) domainBase.push(["company_id", "in", companyIds]);
 
   const fields = ["id", "name", "partner_id", "invoice_date", "invoice_date_due",
-                  "amount_total", "amount_residual", "amount_residual_signed",
-                  "currency_id", "company_id", "move_type", "payment_state"];
+                  "amount_total", "amount_total_signed", "amount_residual", "amount_residual_signed",
+                  "currency_id", "company_id", "company_currency_id", "move_type", "payment_state"];
 
   const [ar, ap] = await Promise.all([
     odoo.searchRead(
@@ -2113,7 +2115,7 @@ app.get("/api/admin/finanzas/ar-ap", wrap(async (req, res) => {
     ),
   ]);
 
-  function buildAging(invoices) {
+  function buildAging(invoices, isAR) {
     const buckets = { current: 0, d1_30: 0, d31_60: 0, d61_90: 0, d90plus: 0 };
     const byPartner = new Map();
     const rows = invoices.map(inv => {
@@ -2124,7 +2126,15 @@ app.get("/api/admin/finanzas/ar-ap", wrap(async (req, res) => {
       else if (daysOverdue > 60) bucket = "d61_90";
       else if (daysOverdue > 30) bucket = "d31_60";
       else if (daysOverdue > 0) bucket = "d1_30";
-      buckets[bucket] += inv.amount_residual || 0;
+
+      // amount_residual_signed está en moneda de compañía (USD) y viene con signo:
+      //   AR (out_invoice): positivo   / out_refund: negativo
+      //   AP (in_invoice):  negativo   / in_refund: positivo
+      // Tomamos valor absoluto para presentación consistente.
+      const residualUsd = Math.abs(inv.amount_residual_signed || 0);
+      const totalUsd = Math.abs(inv.amount_total_signed || 0);
+
+      buckets[bucket] += residualUsd;
 
       const partnerId = inv.partner_id?.[0] || 0;
       const partnerName = inv.partner_id?.[1] || "(sin partner)";
@@ -2135,8 +2145,8 @@ app.get("/api/admin/finanzas/ar-ap", wrap(async (req, res) => {
         });
       }
       const p = byPartner.get(partnerId);
-      p.total += inv.amount_residual || 0;
-      p[bucket] += inv.amount_residual || 0;
+      p.total += residualUsd;
+      p[bucket] += residualUsd;
       p.count += 1;
 
       return {
@@ -2150,9 +2160,14 @@ app.get("/api/admin/finanzas/ar-ap", wrap(async (req, res) => {
         due_date: inv.invoice_date_due,
         days_overdue: daysOverdue,
         bucket,
-        amount_total: inv.amount_total,
-        amount_residual: inv.amount_residual,
-        currency: inv.currency_id?.[1] || "USD",
+        // Montos en USD (moneda de la compañía) - siempre positivos
+        amount_total: totalUsd,
+        amount_residual: residualUsd,
+        // Montos originales en moneda de la factura (para referencia/debug)
+        amount_total_original: inv.amount_total,
+        amount_residual_original: inv.amount_residual,
+        currency_original: inv.currency_id?.[1] || "USD",
+        currency: inv.company_currency_id?.[1] || "USD",
         payment_state: inv.payment_state,
       };
     });
@@ -2163,8 +2178,8 @@ app.get("/api/admin/finanzas/ar-ap", wrap(async (req, res) => {
 
   res.json({
     filters: { company_ids: companyIds, as_of },
-    ar: buildAging(ar),
-    ap: buildAging(ap),
+    ar: buildAging(ar, true),
+    ap: buildAging(ap, false),
   });
 }));
 
