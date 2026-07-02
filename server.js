@@ -2369,6 +2369,112 @@ app.get("/api/admin/finanzas/ar-ap", wrap(async (req, res) => {
   });
 }));
 
+// GET /api/admin/finanzas/ar-ap/diag/odoo — Ejecuta el report EXACTO Aged Receivable de Odoo
+app.get("/api/admin/finanzas/ar-ap/diag/odoo", wrap(async (req, res) => {
+  const companyIds = parseCompanyIds(req.query);
+  const as_of = String(req.query.as_of || todayIso());
+  const ctx = ctxCompanies(companyIds);
+
+  // Odoo v15: model account.aged.partner.balance — no existe como model
+  // El reporte usa account.report.aged.trial.balance con context o hits directos a account_move_line
+  //
+  // Prueba 1: llamar directamente a account.report.aged.receivable con `_get_lines`
+  const attempts = {};
+
+  // Attempt A: account.move.line con SOLO account_type=receivable y filter parent_state='posted' y date_maturity
+  try {
+    const dom = [
+      ["parent_state", "=", "posted"],
+      ["account_id.internal_type", "=", "receivable"],
+      ["date", "<=", as_of],
+      ["reconciled", "=", false],
+    ];
+    if (companyIds) dom.push(["company_id", "in", companyIds]);
+    const lines = await odoo.searchRead("account.move.line", dom,
+      ["amount_residual", "balance"], { context: ctx, limit: 50000 });
+    attempts.internal_type_receivable = {
+      count: lines.length,
+      sum_residual: lines.reduce((s, l) => s + (l.amount_residual || 0), 0),
+      sum_balance: lines.reduce((s, l) => s + (l.balance || 0), 0),
+    };
+  } catch (e) { attempts.internal_type_receivable = { error: String(e).slice(0,200) }; }
+
+  // Attempt B: mismo pero SIN filter parent_state (incluye drafts?)
+  try {
+    const dom = [
+      ["account_id.user_type_id.type", "=", "receivable"],
+      ["date", "<=", as_of],
+      ["reconciled", "=", false],
+    ];
+    if (companyIds) dom.push(["company_id", "in", companyIds]);
+    const lines = await odoo.searchRead("account.move.line", dom,
+      ["amount_residual", "balance", "parent_state"], { context: ctx, limit: 50000 });
+    const posted = lines.filter(l => l.parent_state === "posted");
+    const draft = lines.filter(l => l.parent_state === "draft");
+    attempts.without_posted_filter = {
+      count_total: lines.length,
+      count_posted: posted.length,
+      count_draft: draft.length,
+      sum_residual_all: lines.reduce((s, l) => s + (l.amount_residual || 0), 0),
+      sum_residual_posted: posted.reduce((s, l) => s + (l.amount_residual || 0), 0),
+      sum_residual_draft: draft.reduce((s, l) => s + (l.amount_residual || 0), 0),
+      sum_balance_all: lines.reduce((s, l) => s + (l.balance || 0), 0),
+    };
+  } catch (e) { attempts.without_posted_filter = { error: String(e).slice(0,200) }; }
+
+  // Attempt C: intentar leer el reporte vía action account_reports
+  try {
+    // En Odoo v15 con account_reports (Enterprise) existe account.report
+    const reports = await odoo.searchRead("ir.model", [["model", "=", "account.aged.receivable"]], ["id", "model"], { limit: 5 });
+    attempts.aged_receivable_model_exists = reports.length > 0;
+  } catch (e) { attempts.aged_receivable_model_exists = { error: String(e).slice(0,200) }; }
+
+  // Attempt D: sin filtro reconciled, usando full_reconcile_id o matched_debit_ids/matched_credit_ids
+  // Simula el SQL del reporte: (lines where reconciled=False) OR (lines fully reconciled after as_of)
+  try {
+    const dom = [
+      ["parent_state", "=", "posted"],
+      ["account_id.user_type_id.type", "=", "receivable"],
+      ["date", "<=", as_of],
+    ];
+    if (companyIds) dom.push(["company_id", "in", companyIds]);
+    const allLines = await odoo.searchRead("account.move.line", dom,
+      ["amount_residual", "balance", "reconciled", "full_reconcile_id", "date", "date_maturity", "id"],
+      { context: ctx, limit: 50000 });
+
+    // Para lineas reconciled=true con full_reconcile: verificar si el full reconcile fue DESPUES del as_of
+    const reconciledLines = allLines.filter(l => l.reconciled && l.full_reconcile_id && l.full_reconcile_id[0]);
+    const fullReconIds = Array.from(new Set(reconciledLines.map(l => l.full_reconcile_id[0])));
+    let reversedFromFull = 0;
+    if (fullReconIds.length > 0) {
+      const fullRecs = await odoo.searchRead("account.full.reconcile",
+        [["id", "in", fullReconIds]], ["id", "reconciled_line_ids", "create_date"], { limit: 50000 });
+      const fullRecInfo = new Map(fullRecs.map(f => [f.id, f]));
+      // Las lineas con full_reconcile creado después del as_of deben incluirse
+      for (const line of reconciledLines) {
+        const fr = fullRecInfo.get(line.full_reconcile_id[0]);
+        if (fr && fr.create_date && fr.create_date.slice(0,10) > as_of) {
+          reversedFromFull += line.balance || 0;
+        }
+      }
+    }
+    const openLinesSum = allLines.filter(l => !l.reconciled).reduce((s, l) => s + (l.balance || 0), 0);
+    const openLinesResidualSum = allLines.filter(l => !l.reconciled).reduce((s, l) => s + (l.amount_residual || 0), 0);
+    attempts.reverse_full_recon_after_asof = {
+      lines_total: allLines.length,
+      lines_open: allLines.filter(l => !l.reconciled).length,
+      lines_recon: reconciledLines.length,
+      sum_balance_open_only: openLinesSum,
+      sum_residual_open_only: openLinesResidualSum,
+      reversed_from_full_after_asof: reversedFromFull,
+      total_v15_exact: openLinesResidualSum + reversedFromFull,
+      total_v15_balance: openLinesSum + reversedFromFull,
+    };
+  } catch (e) { attempts.reverse_full_recon_after_asof = { error: String(e).slice(0,300) }; }
+
+  res.json({ filters: { company_ids: companyIds, as_of }, attempts });
+}));
+
 // GET /api/admin/finanzas/ar-ap/diag/lines — Exporta líneas AR/AP abiertas para reconciliar
 // vs el Aged Receivable de Odoo. Query: kind=receivable|payable, as_of, company_id
 app.get("/api/admin/finanzas/ar-ap/diag/lines", wrap(async (req, res) => {
