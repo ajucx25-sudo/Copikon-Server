@@ -2152,9 +2152,13 @@ app.get("/api/admin/finanzas/ar-ap", wrap(async (req, res) => {
   const ar_gl_balance = arGlLines.reduce((s, l) => s + (l.balance || 0), 0);
   const ap_gl_balance = Math.abs(apGlLines.reduce((s, l) => s + (l.balance || 0), 0));
 
+  // IMPORTANTE: mismo filtro de fecha que el Aged Receivable de Odoo.
+  // Sin "date <= as_of" incluiríamos facturas emitidas después del corte,
+  // y el KPI ya no cuadraría con el reporte oficial de Odoo.
   const lineDomainBase = [
     ["parent_state", "=", "posted"],
     ["reconciled", "=", false],
+    ["date", "<=", as_of],
   ];
   if (companyIds) lineDomainBase.push(["company_id", "in", companyIds]);
 
@@ -2360,6 +2364,68 @@ app.get("/api/admin/finanzas/ar-ap", wrap(async (req, res) => {
     filters: { company_ids: companyIds, as_of },
     ar: arAging,
     ap: apAging,
+  });
+}));
+
+// GET /api/admin/finanzas/ar-ap/diag — Diagnóstico: compara 4 fórmulas de CxC/CxP
+// para identificar la discrepancia con el Aged Receivable de Odoo.
+app.get("/api/admin/finanzas/ar-ap/diag", wrap(async (req, res) => {
+  const companyIds = parseCompanyIds(req.query);
+  const as_of = String(req.query.as_of || todayIso());
+  const ctx = ctxCompanies(companyIds);
+
+  const baseDom = [["parent_state", "=", "posted"]];
+  if (companyIds) baseDom.push(["company_id", "in", companyIds]);
+
+  const results = {};
+
+  for (const kind of ["receivable", "payable"]) {
+    const typeFilter = ["account_id.user_type_id.type", "=", kind];
+    const sign = kind === "receivable" ? 1 : -1;
+
+    // F1: gl_balance = sum(balance) hasta as_of (sin filtrar reconciled)
+    const glLines = await odoo.searchRead("account.move.line",
+      [...baseDom, ["date", "<=", as_of], typeFilter],
+      ["balance"], { context: ctx, limit: 50000 });
+    const f1 = glLines.reduce((s, l) => s + (l.balance || 0), 0) * sign;
+
+    // F2: sum(amount_residual) de lineas NO reconciliadas con date <= as_of (nuestro nuevo KPI)
+    const openLinesDated = await odoo.searchRead("account.move.line",
+      [...baseDom, ["reconciled", "=", false], ["date", "<=", as_of], typeFilter],
+      ["amount_residual"], { context: ctx, limit: 50000 });
+    const f2 = openLinesDated.reduce((s, l) => s + (l.amount_residual || 0), 0) * sign;
+
+    // F3: sum(amount_residual) de lineas NO reconciliadas SIN filtro de fecha (viejo KPI)
+    const openLinesAll = await odoo.searchRead("account.move.line",
+      [...baseDom, ["reconciled", "=", false], typeFilter],
+      ["amount_residual"], { context: ctx, limit: 50000 });
+    const f3 = openLinesAll.reduce((s, l) => s + (l.amount_residual || 0), 0) * sign;
+
+    // F4: sum(balance) de lineas NO reconciliadas con date <= as_of (equivalente Aged Odoo con historicos)
+    const openLinesBal = await odoo.searchRead("account.move.line",
+      [...baseDom, ["reconciled", "=", false], ["date", "<=", as_of], typeFilter],
+      ["balance"], { context: ctx, limit: 50000 });
+    const f4 = openLinesBal.reduce((s, l) => s + (l.balance || 0), 0) * sign;
+
+    results[kind] = {
+      f1_gl_balance_asof: f1,
+      f2_residual_open_dated: f2,
+      f3_residual_open_alltime: f3,
+      f4_balance_open_dated: f4,
+      lines_open_dated: openLinesDated.length,
+      lines_open_all: openLinesAll.length,
+    };
+  }
+
+  res.json({
+    filters: { company_ids: companyIds, as_of },
+    legend: {
+      f1_gl_balance_asof: "Balance General de Odoo (sum balance en cta AR/AP hasta as_of)",
+      f2_residual_open_dated: "KPI actual: sum(amount_residual) de lineas NO reconciliadas con date <= as_of",
+      f3_residual_open_alltime: "KPI viejo: sum(amount_residual) NO reconc SIN filtro de fecha",
+      f4_balance_open_dated: "Aged Receivable Odoo: sum(balance) NO reconciliadas hasta as_of",
+    },
+    results,
   });
 }));
 
