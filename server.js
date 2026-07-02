@@ -2152,12 +2152,14 @@ app.get("/api/admin/finanzas/ar-ap", wrap(async (req, res) => {
   const ar_gl_balance = arGlLines.reduce((s, l) => s + (l.balance || 0), 0);
   const ap_gl_balance = Math.abs(apGlLines.reduce((s, l) => s + (l.balance || 0), 0));
 
-  // IMPORTANTE: mismo filtro de fecha que el Aged Receivable de Odoo.
-  // Sin "date <= as_of" incluiríamos facturas emitidas después del corte,
-  // y el KPI ya no cuadraría con el reporte oficial de Odoo.
+  // IMPORTANTE: usamos el MISMO filtro del reporte Aged Receivable de Odoo v15:
+  //   full_reconcile_id = false  (no totalmente reconciliadas — incluye parcialmente reconciliadas)
+  //   date <= as_of              (excluye facturas emitidas después del corte)
+  // Antes usabamos reconciled=false, que excluía las líneas parcialmente reconciliadas
+  // y por eso el KPI no cuadraba con el reporte oficial de Odoo.
   const lineDomainBase = [
     ["parent_state", "=", "posted"],
-    ["reconciled", "=", false],
+    ["full_reconcile_id", "=", false],
     ["date", "<=", as_of],
   ];
   if (companyIds) lineDomainBase.push(["company_id", "in", companyIds]);
