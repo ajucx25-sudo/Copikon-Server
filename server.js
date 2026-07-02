@@ -2472,6 +2472,108 @@ app.get("/api/admin/finanzas/ar-ap/diag/odoo", wrap(async (req, res) => {
     };
   } catch (e) { attempts.reverse_full_recon_after_asof = { error: String(e).slice(0,300) }; }
 
+  // Attempt E: reversar PARTIAL reconciles creados después del as_of (además de full)
+  // Odoo Aged Receivable v15 hace: para cada línea, calcular amount_residual como si el as_of fuera hoy
+  // Esto significa: si una línea fue parcialmente reconciliada DESPUÉS del as_of, el reporte debe
+  // reversar esa parcial y mostrar el residual ORIGINAL (o al as_of).
+  try {
+    const dom = [
+      ["parent_state", "=", "posted"],
+      ["account_id.user_type_id.type", "=", "receivable"],
+      ["date", "<=", as_of],
+    ];
+    if (companyIds) dom.push(["company_id", "in", companyIds]);
+    const allLines = await odoo.searchRead("account.move.line", dom,
+      ["amount_residual", "balance", "reconciled", "full_reconcile_id", "matched_debit_ids", "matched_credit_ids", "date", "id"],
+      { context: ctx, limit: 50000 });
+
+    // Recolectar todos los partial_reconcile IDs de líneas open y reconciled
+    const allPartialIds = new Set();
+    for (const line of allLines) {
+      (line.matched_debit_ids || []).forEach(id => allPartialIds.add(id));
+      (line.matched_credit_ids || []).forEach(id => allPartialIds.add(id));
+    }
+
+    let reversalsAfterAsof = 0;  // total amount to add back
+    let partialsAfterCount = 0;
+    let partialsAfterTotal = 0;
+    if (allPartialIds.size > 0) {
+      // Leer partial reconciles en batches
+      const partialIdsArr = Array.from(allPartialIds);
+      const BATCH = 5000;
+      const partialsAfter = [];
+      for (let i = 0; i < partialIdsArr.length; i += BATCH) {
+        const batch = partialIdsArr.slice(i, i + BATCH);
+        const partials = await odoo.searchRead("account.partial.reconcile",
+          [["id", "in", batch]],
+          ["id", "amount", "debit_move_id", "credit_move_id", "create_date", "max_date"],
+          { limit: 50000 });
+        for (const p of partials) {
+          const pdate = (p.max_date || (p.create_date ? p.create_date.slice(0,10) : null));
+          if (pdate && pdate > as_of) {
+            partialsAfter.push(p);
+            partialsAfterTotal += p.amount || 0;
+          }
+        }
+      }
+      partialsAfterCount = partialsAfter.length;
+      reversalsAfterAsof = partialsAfterTotal;
+    }
+
+    // Sum balance/residual actual
+    const currentResidual = allLines.reduce((s, l) => s + (l.amount_residual || 0), 0);
+    const currentBalance = allLines.reduce((s, l) => s + (l.balance || 0), 0);
+
+    // Restaurar reversals: si la línea es AR (debit), la partial reduce el residual → sumamos back
+    // El signo depende. Simplemente sumamos el monto (positive) al residual actual.
+    attempts.reverse_partials_after_asof = {
+      lines_total: allLines.length,
+      partials_total_ids: allPartialIds.size,
+      partials_after_asof: partialsAfterCount,
+      reversals_amount: reversalsAfterAsof,
+      current_residual: currentResidual,
+      current_balance: currentBalance,
+      total_with_reversals: currentResidual + reversalsAfterAsof,
+      total_balance_with_reversals: currentBalance + reversalsAfterAsof,
+    };
+  } catch (e) { attempts.reverse_partials_after_asof = { error: String(e).slice(0,300) }; }
+
+  // Attempt F: agrupar por partner y filtrar out los sin partner + drafts. Y con date_maturity
+  try {
+    const dom = [
+      ["parent_state", "=", "posted"],
+      ["account_id.user_type_id.type", "=", "receivable"],
+      ["date", "<=", as_of],
+      ["partner_id", "!=", false],
+      ["full_reconcile_id", "=", false],
+    ];
+    if (companyIds) dom.push(["company_id", "in", companyIds]);
+    const lines = await odoo.searchRead("account.move.line", dom,
+      ["amount_residual", "balance", "partner_id", "date_maturity"], { context: ctx, limit: 50000 });
+    const groups = new Map();
+    for (const l of lines) {
+      const pid = l.partner_id ? l.partner_id[0] : 0;
+      const cur = groups.get(pid) || { residual: 0, balance: 0, count: 0 };
+      cur.residual += l.amount_residual || 0;
+      cur.balance += l.balance || 0;
+      cur.count += 1;
+      groups.set(pid, cur);
+    }
+    // Aged receivable NO netea partners con saldo positivo y negativo por defecto — muestra todo
+    // Pero SI netea líneas dentro de la misma línea (residual ya es neto).
+    attempts.by_partner_no_null = {
+      count_lines: lines.length,
+      count_partners: groups.size,
+      sum_residual: lines.reduce((s, l) => s + (l.amount_residual || 0), 0),
+      sum_balance: lines.reduce((s, l) => s + (l.balance || 0), 0),
+      // Top partners con mayor deuda
+      top_5_partners: Array.from(groups.entries())
+        .sort((a,b) => b[1].residual - a[1].residual)
+        .slice(0, 5)
+        .map(([pid, v]) => ({ partner_id: pid, residual: v.residual, count: v.count })),
+    };
+  } catch (e) { attempts.by_partner_no_null = { error: String(e).slice(0,300) }; }
+
   res.json({ filters: { company_ids: companyIds, as_of }, attempts });
 }));
 
