@@ -2407,11 +2407,32 @@ app.get("/api/admin/finanzas/ar-ap/diag", wrap(async (req, res) => {
       ["balance"], { context: ctx, limit: 50000 });
     const f4 = openLinesBal.reduce((s, l) => s + (l.balance || 0), 0) * sign;
 
+    // F5: Aged Receivable Odoo exact — agrupa por partner, excluye partners con saldo negativo (neto anticipo)
+    const openLinesPartner = await odoo.searchRead("account.move.line",
+      [...baseDom, ["reconciled", "=", false], ["date", "<=", as_of], typeFilter],
+      ["amount_residual", "partner_id"], { context: ctx, limit: 50000 });
+    const partnerSums = new Map();
+    for (const l of openLinesPartner) {
+      const pid = l.partner_id?.[0] || 0;
+      partnerSums.set(pid, (partnerSums.get(pid) || 0) + (l.amount_residual || 0) * sign);
+    }
+    let f5_positive_only = 0, f5_all = 0;
+    let partnersPositive = 0, partnersNegative = 0;
+    for (const v of partnerSums.values()) {
+      f5_all += v;
+      if (v > 0) { f5_positive_only += v; partnersPositive++; }
+      else if (v < 0) partnersNegative++;
+    }
+
     results[kind] = {
       f1_gl_balance_asof: f1,
       f2_residual_open_dated: f2,
       f3_residual_open_alltime: f3,
       f4_balance_open_dated: f4,
+      f5_partner_positive_only: f5_positive_only,
+      f5_partner_all: f5_all,
+      partners_positive: partnersPositive,
+      partners_negative: partnersNegative,
       lines_open_dated: openLinesDated.length,
       lines_open_all: openLinesAll.length,
     };
@@ -2424,6 +2445,8 @@ app.get("/api/admin/finanzas/ar-ap/diag", wrap(async (req, res) => {
       f2_residual_open_dated: "KPI actual: sum(amount_residual) de lineas NO reconciliadas con date <= as_of",
       f3_residual_open_alltime: "KPI viejo: sum(amount_residual) NO reconc SIN filtro de fecha",
       f4_balance_open_dated: "Aged Receivable Odoo: sum(balance) NO reconciliadas hasta as_of",
+      f5_partner_positive_only: "Aged Receivable exact: sum por partner, solo partners con saldo positivo (excluye partners con anticipo neto)",
+      f5_partner_all: "Aged Receivable con anticipos netos: sum por partner incluyendo negativos",
     },
     results,
   });
