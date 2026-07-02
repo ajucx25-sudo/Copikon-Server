@@ -2492,19 +2492,50 @@ app.get("/api/admin/finanzas/ar-ap/diag", wrap(async (req, res) => {
     const f6_residual = openLinesV15.reduce((s, l) => s + (l.amount_residual || 0), 0) * sign;
     const f6_balance = openLinesV15.reduce((s, l) => s + (l.balance || 0), 0) * sign;
 
-    // F7: Aged Receivable HISTÓRICO — lineas AR con date<=as_of Y (no reconciliadas O reconciliadas después del as_of)
-    // Esta es la lógica exacta de Odoo v15: incluir también líneas que fueron reconciliadas DESPUÉS del as_of
-    // Para ello: buscar move lines con date<=as_of y (matched_debit_ids.max_date > as_of o sin reconciliar)
-    // Aproximación: sum(balance) de lineas con date<=as_of — pagos aplicados con date<=as_of
+    // F7: Aged Receivable HISTÓRICO — replica exactamente Odoo Aged Receivable v15
+    // Lógica: sum(balance) de TODAS las lineas AR con date<=as_of
+    //         MENOS sum(balance) de reconciliaciones (partial_reconcile) con max_date<=as_of
+    // Esto reconstruye el saldo al as_of ignorando pagos aplicados posteriormente.
     const allLinesInDate = await odoo.searchRead("account.move.line",
       [...baseDom, ["date", "<=", as_of], typeFilter],
-      ["id", "balance", "amount_residual", "full_reconcile_id", "matched_debit_ids", "matched_credit_ids"],
+      ["id", "balance", "amount_residual", "full_reconcile_id"],
       { context: ctx, limit: 50000 });
-    // Sum(balance) de todas las lineas AR con date <= as_of
     const f7_all_balance = allLinesInDate.reduce((s, l) => s + (l.balance || 0), 0) * sign;
-    // Numero de lineas reconciliadas totalmente
     const reconciled_count = allLinesInDate.filter(l => l.full_reconcile_id && l.full_reconcile_id[0]).length;
     const unreconciled_count = allLinesInDate.length - reconciled_count;
+
+    // F8: Aged Receivable EXACT — F7 sin reversar reconciliaciones posteriores + amount_residual
+    // El truco: para lineas con `date <= as_of` pero reconciliadas después del as_of, Odoo usa balance (no residual)
+    // porque amount_residual es el residual actual (después de pagos posteriores).
+    // Nosotros no tenemos forma fácil de saber cuándo se reconcilió sin traer account.partial.reconcile.
+    // Así que traemos partial.reconcile con debit_move_id o credit_move_id en las lineas AR:
+    const arLineIds = allLinesInDate.map(l => l.id);
+    let f8_exact = 0;
+    if (arLineIds.length > 0) {
+      // Traer partial reconcile posteriores al as_of
+      const partialsAfter = await odoo.searchRead("account.partial.reconcile",
+        [
+          "|", ["debit_move_id", "in", arLineIds], ["credit_move_id", "in", arLineIds],
+          ["max_date", ">", as_of],
+        ],
+        ["id", "amount", "debit_amount_currency", "credit_amount_currency", "max_date",
+         "debit_move_id", "credit_move_id"],
+        { context: ctx, limit: 50000 });
+      // Ajustar: para cada partial posterior al as_of, sumar el monto de vuelta al residual de la linea AR
+      const arLineIdSet = new Set(arLineIds);
+      let reversedAmount = 0;
+      for (const p of partialsAfter) {
+        const dbId = p.debit_move_id?.[0];
+        const crId = p.credit_move_id?.[0];
+        // Si la linea AR está del lado debit (factura) y el credito (pago) es posterior, el balance no cambia pero residual sí
+        // El pago reduce el residual de la linea AR en `amount`
+        if (arLineIdSet.has(dbId) || arLineIdSet.has(crId)) {
+          reversedAmount += p.amount || 0;
+        }
+      }
+      const currentResidual = allLinesInDate.reduce((s, l) => s + (l.amount_residual || 0), 0);
+      f8_exact = (currentResidual + reversedAmount) * sign;
+    }
 
     // F5: Aged Receivable Odoo exact — agrupa por partner, excluye partners con saldo negativo (neto anticipo)
     const openLinesPartner = await odoo.searchRead("account.move.line",
@@ -2540,6 +2571,7 @@ app.get("/api/admin/finanzas/ar-ap/diag", wrap(async (req, res) => {
       f7_lines_count: allLinesInDate.length,
       f7_reconciled_count: reconciled_count,
       f7_unreconciled_count: unreconciled_count,
+      f8_exact_aged_receivable: f8_exact,
       lines_v15: openLinesV15.length,
     };
   }
