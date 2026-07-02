@@ -2367,6 +2367,82 @@ app.get("/api/admin/finanzas/ar-ap", wrap(async (req, res) => {
   });
 }));
 
+// GET /api/admin/finanzas/ar-ap/diag/lines — Exporta líneas AR/AP abiertas para reconciliar
+// vs el Aged Receivable de Odoo. Query: kind=receivable|payable, as_of, company_id
+app.get("/api/admin/finanzas/ar-ap/diag/lines", wrap(async (req, res) => {
+  const companyIds = parseCompanyIds(req.query);
+  const as_of = String(req.query.as_of || todayIso());
+  const kind = String(req.query.kind || "receivable");
+  const ctx = ctxCompanies(companyIds);
+
+  const dom = [
+    ["parent_state", "=", "posted"],
+    ["reconciled", "=", false],
+    ["date", "<=", as_of],
+    ["account_id.user_type_id.type", "=", kind],
+  ];
+  if (companyIds) dom.push(["company_id", "in", companyIds]);
+
+  const lines = await odoo.searchRead("account.move.line",
+    dom,
+    ["id", "move_id", "move_name", "partner_id", "account_id", "journal_id",
+     "balance", "amount_residual", "debit", "credit",
+     "date", "date_maturity", "name", "ref"],
+    { context: ctx, limit: 50000, order: "date asc" });
+
+  // Buscar move_type para clasificar
+  const moveIds = Array.from(new Set(lines.map(l => l.move_id?.[0]).filter(Boolean)));
+  const moves = await odoo.searchRead("account.move",
+    [["id", "in", moveIds]],
+    ["id", "move_type", "state", "payment_state", "invoice_date"],
+    { context: ctx, limit: 50000 });
+  const moveInfo = new Map(moves.map(m => [m.id, m]));
+
+  // Agrupar por tipo de asiento y ver la suma
+  const groups = {};
+  for (const l of lines) {
+    const mi = moveInfo.get(l.move_id?.[0]) || {};
+    const key = `${mi.move_type || "entry"}_${l.journal_id?.[1] || "?"}`;
+    if (!groups[key]) groups[key] = { count: 0, sum_balance: 0, sum_residual: 0 };
+    groups[key].count++;
+    groups[key].sum_balance += l.balance || 0;
+    groups[key].sum_residual += l.amount_residual || 0;
+  }
+
+  // Lineas sin partner_id (Odoo Aged excluye estas)
+  const noPartner = lines.filter(l => !l.partner_id || !l.partner_id[0]);
+  const noPartnerSum = {
+    count: noPartner.length,
+    sum_balance: noPartner.reduce((s, l) => s + (l.balance || 0), 0),
+    sum_residual: noPartner.reduce((s, l) => s + (l.amount_residual || 0), 0),
+  };
+
+  // Lineas de tipo "entry" (asientos manuales) vs invoices
+  const byType = { invoice: { count: 0, sum_residual: 0 }, entry: { count: 0, sum_residual: 0 }, other: { count: 0, sum_residual: 0 } };
+  for (const l of lines) {
+    const mi = moveInfo.get(l.move_id?.[0]) || {};
+    const t = mi.move_type || "entry";
+    const cat = (t === "out_invoice" || t === "out_refund" || t === "in_invoice" || t === "in_refund") ? "invoice"
+      : t === "entry" ? "entry" : "other";
+    byType[cat].count++;
+    byType[cat].sum_residual += l.amount_residual || 0;
+  }
+
+  res.json({
+    filters: { company_ids: companyIds, as_of, kind },
+    total_lines: lines.length,
+    total_balance: lines.reduce((s, l) => s + (l.balance || 0), 0),
+    total_residual: lines.reduce((s, l) => s + (l.amount_residual || 0), 0),
+    lines_without_partner: noPartnerSum,
+    by_move_type: byType,
+    groups_by_type_journal: groups,
+    sample_no_partner: noPartner.slice(0, 20).map(l => ({
+      id: l.id, move: l.move_name, journal: l.journal_id?.[1],
+      balance: l.balance, residual: l.amount_residual, date: l.date, name: l.name, ref: l.ref,
+    })),
+  });
+}));
+
 // GET /api/admin/finanzas/ar-ap/diag — Diagnóstico: compara 4 fórmulas de CxC/CxP
 // para identificar la discrepancia con el Aged Receivable de Odoo.
 app.get("/api/admin/finanzas/ar-ap/diag", wrap(async (req, res) => {
