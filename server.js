@@ -2283,21 +2283,47 @@ app.get("/api/admin/finanzas/ar-ap", wrap(async (req, res) => {
       }
     }
 
+    // === Aplicar anticipos por partner a los buckets, empezando por los más vencidos ===
+    // Esto refleja la realidad: si tengo un anticipo con un proveedor, mi deuda REAL vencida
+    // se reduce por ese anticipo. Aplico waterfall d90plus → d61_90 → d31_60 → d1_30 → current.
+    // Los buckets_gross se conservan para referencia histórica (bruto sin aplicar).
+    const bucketsGross = { ...buckets };
+    const bucketOrder = ["d90plus", "d61_90", "d31_60", "d1_30", "current"];
+    let netAdvances = 0; // anticipos que no encontraron deuda contra qué aplicar (sobrantes)
+
+    for (const p of byPartner.values()) {
+      let remaining = p.advances;
+      if (remaining <= 0) continue;
+      for (const b of bucketOrder) {
+        if (remaining <= 0) break;
+        const bucketVal = p[b];
+        if (bucketVal <= 0) continue;
+        const applied = Math.min(remaining, bucketVal);
+        p[b] = bucketVal - applied;      // reducir bucket del partner
+        buckets[b] -= applied;            // reducir bucket global
+        remaining -= applied;
+      }
+      // Guardamos el neto no aplicable (partner con anticipo mayor que su deuda)
+      if (remaining > 0) netAdvances += remaining;
+    }
+
     // Ordenar y limpiar partners (algunos pueden tener total=0 si anticipos == deuda)
     const byPartnerArr = Array.from(byPartner.values())
       .filter(p => p.total !== 0 || p.advances > 0)
       .sort((a, b) => b.total - a.total);
 
-    const grossTotal = buckets.current + buckets.d1_30 + buckets.d31_60 + buckets.d61_90 + buckets.d90plus;
+    const grossTotal = bucketsGross.current + bucketsGross.d1_30 + bucketsGross.d31_60 + bucketsGross.d61_90 + bucketsGross.d90plus;
     const netTotal = grossTotal - advancesTotal;
 
     return {
       rows,
       advances: advanceRows,
-      buckets,
-      total: netTotal,          // NETO tras aplicar anticipos (balance final real)
-      gross_total: grossTotal,  // Bruto sin anticipos (facturas abiertas)
+      buckets,                    // NETO por bucket (anticipos ya aplicados desde d90plus hacia abajo)
+      buckets_gross: bucketsGross, // Bruto por bucket (sin aplicar anticipos, para auditoría)
+      total: netTotal,             // NETO tras aplicar anticipos (balance final real)
+      gross_total: grossTotal,     // Bruto sin anticipos (facturas abiertas)
       advances_total: advancesTotal,
+      advances_unapplied: netAdvances, // Anticipos sobrantes (mayor que deuda del partner)
       advances_count: advancesCount,
       by_partner: byPartnerArr,
     };
