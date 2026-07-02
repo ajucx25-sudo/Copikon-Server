@@ -2284,13 +2284,16 @@ app.get("/api/admin/finanzas/ar-ap", wrap(async (req, res) => {
     }
 
     // === Aplicar anticipos por partner a los buckets, empezando por los más vencidos ===
-    // Esto refleja la realidad: si tengo un anticipo con un proveedor, mi deuda REAL vencida
-    // se reduce por ese anticipo. Aplico waterfall d90plus → d61_90 → d31_60 → d1_30 → current.
-    // Los buckets_gross se conservan para referencia histórica (bruto sin aplicar).
+    // Fase 1: cada partner aplica sus anticipos a SUS propios buckets (d90plus → current).
+    // Fase 2: los sobrantes de cada partner (anticipo > su deuda) se agrupan y aplican al
+    //   bucket global vencido más antiguo. Esto refleja que el saldo NETO del Balance
+    //   General ya considera esos anticipos, por lo que los buckets deben sumar exactamente
+    //   el saldo neto (y el % vencido no puede pasar del 100%).
     const bucketsGross = { ...buckets };
     const bucketOrder = ["d90plus", "d61_90", "d31_60", "d1_30", "current"];
-    let netAdvances = 0; // anticipos que no encontraron deuda contra qué aplicar (sobrantes)
+    let unappliedByPartner = 0;
 
+    // Fase 1 — aplicar anticipos dentro de cada partner
     for (const p of byPartner.values()) {
       let remaining = p.advances;
       if (remaining <= 0) continue;
@@ -2299,13 +2302,32 @@ app.get("/api/admin/finanzas/ar-ap", wrap(async (req, res) => {
         const bucketVal = p[b];
         if (bucketVal <= 0) continue;
         const applied = Math.min(remaining, bucketVal);
-        p[b] = bucketVal - applied;      // reducir bucket del partner
-        buckets[b] -= applied;            // reducir bucket global
+        p[b] = bucketVal - applied;
+        buckets[b] -= applied;
         remaining -= applied;
       }
-      // Guardamos el neto no aplicable (partner con anticipo mayor que su deuda)
-      if (remaining > 0) netAdvances += remaining;
+      if (remaining > 0) {
+        // Este partner tiene anticipo sobrante (nos debe menos de lo que nos pagó por adelantado)
+        unappliedByPartner += remaining;
+        p.advances_unapplied = remaining;
+      }
     }
+
+    // Fase 2 — aplicar sobrantes globales al bucket más vencido del total
+    // Esto asegura que sum(buckets) == netTotal (saldo neto real del Balance General)
+    let netAdvances = unappliedByPartner;
+    let overflow = unappliedByPartner;
+    for (const b of bucketOrder) {
+      if (overflow <= 0) break;
+      const bucketVal = buckets[b];
+      if (bucketVal <= 0) continue;
+      const applied = Math.min(overflow, bucketVal);
+      buckets[b] = bucketVal - applied;
+      overflow -= applied;
+    }
+    // Si aún queda overflow, significa que hay más anticipos que deuda total
+    // (raro, solo si el saldo neto es realmente negativo). Se refleja como saldo a favor.
+    netAdvances = overflow;
 
     // Ordenar y limpiar partners (algunos pueden tener total=0 si anticipos == deuda)
     const byPartnerArr = Array.from(byPartner.values())
