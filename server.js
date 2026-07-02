@@ -2486,13 +2486,25 @@ app.get("/api/admin/finanzas/ar-ap/diag", wrap(async (req, res) => {
     const f4 = openLinesBal.reduce((s, l) => s + (l.balance || 0), 0) * sign;
 
     // F6: Aged Receivable v15 EXACT — usa read_group para replicar SQL de Odoo
-    // El reporte v15 hace: SELECT sum(amount_residual) WHERE account.type=receivable AND date<=as_of AND (full_reconcile_id IS NULL OR reconcile_after_asof)
-    // Simplificado: filtrar full_reconcile_id=False (no completamente reconciliado)
     const openLinesV15 = await odoo.searchRead("account.move.line",
       [...baseDom, ["full_reconcile_id", "=", false], ["date", "<=", as_of], typeFilter],
       ["amount_residual", "balance"], { context: ctx, limit: 50000 });
     const f6_residual = openLinesV15.reduce((s, l) => s + (l.amount_residual || 0), 0) * sign;
     const f6_balance = openLinesV15.reduce((s, l) => s + (l.balance || 0), 0) * sign;
+
+    // F7: Aged Receivable HISTÓRICO — lineas AR con date<=as_of Y (no reconciliadas O reconciliadas después del as_of)
+    // Esta es la lógica exacta de Odoo v15: incluir también líneas que fueron reconciliadas DESPUÉS del as_of
+    // Para ello: buscar move lines con date<=as_of y (matched_debit_ids.max_date > as_of o sin reconciliar)
+    // Aproximación: sum(balance) de lineas con date<=as_of — pagos aplicados con date<=as_of
+    const allLinesInDate = await odoo.searchRead("account.move.line",
+      [...baseDom, ["date", "<=", as_of], typeFilter],
+      ["id", "balance", "amount_residual", "full_reconcile_id", "matched_debit_ids", "matched_credit_ids"],
+      { context: ctx, limit: 50000 });
+    // Sum(balance) de todas las lineas AR con date <= as_of
+    const f7_all_balance = allLinesInDate.reduce((s, l) => s + (l.balance || 0), 0) * sign;
+    // Numero de lineas reconciliadas totalmente
+    const reconciled_count = allLinesInDate.filter(l => l.full_reconcile_id && l.full_reconcile_id[0]).length;
+    const unreconciled_count = allLinesInDate.length - reconciled_count;
 
     // F5: Aged Receivable Odoo exact — agrupa por partner, excluye partners con saldo negativo (neto anticipo)
     const openLinesPartner = await odoo.searchRead("account.move.line",
@@ -2524,6 +2536,10 @@ app.get("/api/admin/finanzas/ar-ap/diag", wrap(async (req, res) => {
       lines_open_all: openLinesAll.length,
       f6_residual_no_fullreconcile: f6_residual,
       f6_balance_no_fullreconcile: f6_balance,
+      f7_all_lines_balance: f7_all_balance,
+      f7_lines_count: allLinesInDate.length,
+      f7_reconciled_count: reconciled_count,
+      f7_unreconciled_count: unreconciled_count,
       lines_v15: openLinesV15.length,
     };
   }
