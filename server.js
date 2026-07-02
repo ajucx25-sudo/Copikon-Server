@@ -2483,6 +2483,15 @@ app.get("/api/admin/finanzas/ar-ap/diag", wrap(async (req, res) => {
       ["balance"], { context: ctx, limit: 50000 });
     const f4 = openLinesBal.reduce((s, l) => s + (l.balance || 0), 0) * sign;
 
+    // F6: Aged Receivable v15 EXACT — usa read_group para replicar SQL de Odoo
+    // El reporte v15 hace: SELECT sum(amount_residual) WHERE account.type=receivable AND date<=as_of AND (full_reconcile_id IS NULL OR reconcile_after_asof)
+    // Simplificado: filtrar full_reconcile_id=False (no completamente reconciliado)
+    const openLinesV15 = await odoo.searchRead("account.move.line",
+      [...baseDom, ["full_reconcile_id", "=", false], ["date", "<=", as_of], typeFilter],
+      ["amount_residual", "balance"], { context: ctx, limit: 50000 });
+    const f6_residual = openLinesV15.reduce((s, l) => s + (l.amount_residual || 0), 0) * sign;
+    const f6_balance = openLinesV15.reduce((s, l) => s + (l.balance || 0), 0) * sign;
+
     // F5: Aged Receivable Odoo exact — agrupa por partner, excluye partners con saldo negativo (neto anticipo)
     const openLinesPartner = await odoo.searchRead("account.move.line",
       [...baseDom, ["reconciled", "=", false], ["date", "<=", as_of], typeFilter],
@@ -2511,6 +2520,9 @@ app.get("/api/admin/finanzas/ar-ap/diag", wrap(async (req, res) => {
       partners_negative: partnersNegative,
       lines_open_dated: openLinesDated.length,
       lines_open_all: openLinesAll.length,
+      f6_residual_no_fullreconcile: f6_residual,
+      f6_balance_no_fullreconcile: f6_balance,
+      lines_v15: openLinesV15.length,
     };
   }
 
