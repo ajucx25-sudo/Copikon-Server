@@ -2431,8 +2431,9 @@ app.get("/api/admin/finanzas/ar-ap", wrap(async (req, res) => {
   }
 
   // Si tenemos el reporte oficial, sobreescribimos el total y buckets con los de Odoo
-  // para que el KPI cuadre 100% con lo que ve el usuario en Odoo
-  if (odooReport.ar && !odooReport.ar.error && odooReport.ar.total > 0) {
+  // para que el KPI cuadre 100% con lo que ve el usuario en Odoo.
+  // gl_balance queda como el saldo contable original del Balance General (para auditoría cruzada).
+  if (odooReport.ar && !odooReport.ar.error && Math.abs(odooReport.ar.total) > 0) {
     arAging.odoo_report = odooReport.ar;
     arAging.total = odooReport.ar.total;
     arAging.buckets = {
@@ -2442,8 +2443,10 @@ app.get("/api/admin/finanzas/ar-ap", wrap(async (req, res) => {
       d61_90: odooReport.ar.buckets.d61_90,
       d90plus: odooReport.ar.buckets.d90plus,
     };
+    // gl_balance ahora se toma del propio reporte de Odoo (que ES el saldo oficial)
+    arAging.gl_balance = odooReport.ar.total;
   }
-  if (odooReport.ap && !odooReport.ap.error && odooReport.ap.total > 0) {
+  if (odooReport.ap && !odooReport.ap.error && Math.abs(odooReport.ap.total) > 0) {
     apAging.odoo_report = odooReport.ap;
     apAging.total = odooReport.ap.total;
     apAging.buckets = {
@@ -2453,6 +2456,7 @@ app.get("/api/admin/finanzas/ar-ap", wrap(async (req, res) => {
       d61_90: odooReport.ap.buckets.d61_90,
       d90plus: odooReport.ap.buckets.d90plus,
     };
+    apAging.gl_balance = odooReport.ap.total;
   }
 
   res.json({
