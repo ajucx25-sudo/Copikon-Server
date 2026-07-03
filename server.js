@@ -2608,7 +2608,7 @@ app.get("/api/admin/finanzas/ar-ap/diag/odoo", wrap(async (req, res) => {
         const lines = await odoo.searchRead(
           "account.aged.receivable",
           [],
-          ["balance", "partner_id", "date", "date_maturity", "account_id", "move_name", "debit", "credit"],
+          ["balance", "partner_id", "date", "expected_pay_date", "report_date", "account_id", "debit", "credit", "parent_state"],
           { context: c, limit: 30000 }
         );
         results.push({
