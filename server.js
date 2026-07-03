@@ -2605,7 +2605,14 @@ app.get("/api/admin/finanzas/ar-ap/diag/odoo", wrap(async (req, res) => {
     const results = [];
     for (const { name, ctx: c } of testContexts) {
       try {
-        // Restringir con dominio [("date", "<=", as_of)] a ver si respeta
+        // Ver primeras 5 y últimas 5 líneas para entender
+        const linesSample = await odoo.searchRead(
+          "account.aged.receivable",
+          [["date", "<=", as_of]],
+          ["balance", "partner_id", "date", "expected_pay_date", "report_date", "account_id", "debit", "credit", "parent_state", "move_id", "name"],
+          { context: c, limit: 3 }
+        );
+        results.push({ SAMPLE: linesSample });
         const lines = await odoo.searchRead(
           "account.aged.receivable",
           [["date", "<=", as_of]],
