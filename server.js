@@ -2382,37 +2382,86 @@ app.get("/api/admin/finanzas/ar-ap", wrap(async (req, res) => {
       };
       const html = await odoo.execute(modelName, "get_html", [[], options], { context: ctx });
       const htmlStr = String(html);
-      // Extraer todos los cells del último bloque (totales)
+      const parseAmt = s => {
+        if (!s) return 0;
+        const norm = String(s).replace(/\./g, '').replace(',', '.');
+        return parseFloat(norm) || 0;
+      };
+      // Extraer todos los cells de valor
       const cellPattern = /o_account_report_column_value">\s*\$?\s*([\-\d\.,]+)\s*</g;
       const allCells = [];
       let m;
       while ((m = cellPattern.exec(htmlStr)) !== null) allCells.push(m[1]);
-      // El total del reporte está en las últimas 7 celdas: [current, 1-30, 31-60, 61-90, 91-120, older, TOTAL]
       if (allCells.length < 7) return { error: "HTML sin celdas suficientes", cells_count: allCells.length };
-      // Convertir formato Odoo: "46.146,55" → 46146.55 (europeo)
-      const parseAmt = s => {
-        if (!s) return 0;
-        // Formato europeo: puntos son miles, coma es decimal
-        const norm = s.replace(/\./g, '').replace(',', '.');
-        return parseFloat(norm) || 0;
-      };
       const last7 = allCells.slice(-7);
-      const [current, d1_30, d31_60, d61_90, d91_120, older, total] = last7.map(parseAmt);
-      // d90plus en nuestro modelo = d91_120 + older (Odoo usa 91-120 y >120)
-      // Pero para consistencia con nuestro reporte, agregamos ambos
+      const [current_g, d1_30_g, d31_60_g, d61_90_g, d91_120_g, older_g, total] = last7.map(parseAmt);
+
+      // NUEVO: extraer filas por partner del HTML para hacer buckets NETOS
+      // Cada partner tiene un total y buckets brutos; agrupamos su neto en el bucket más antiguo con saldo
+      const trPattern = /<tr\b[\s\S]*?<\/tr>/g;
+      const allTrs = htmlStr.match(trPattern) || [];
+      const partnerRows = [];
+      for (const trHtml of allTrs) {
+        const cellVals = [...trHtml.matchAll(/o_account_report_column_value">\s*\$?\s*([\-\d\.,]+)\s*</g)].map(x => parseAmt(x[1]));
+        if (cellVals.length >= 7) {
+          const textOnly = trHtml.replace(/<[^>]+>/g, ' ').replace(/&nbsp;/g, ' ').replace(/\s+/g, ' ').trim();
+          const name = textOnly.split(/\s+Conciliar\s+/)[0].replace(/\s+/g, ' ').trim().slice(0, 100);
+          // Filas relevantes: partner headers (7 buckets exactos) - excluir fila Total
+          const isTotalRow = /^Total\s+Total/i.test(name);
+          if (!isTotalRow && cellVals.length === 7) {
+            const [c, d1, d3, d6, d9, o, t] = cellVals.slice(-7);
+            partnerRows.push({ name, current: c, d1_30: d1, d31_60: d3, d61_90: d6, d91_120: d9, older: o, total: t });
+          }
+        }
+      }
+
+      // Buckets NETOS: para cada partner, asignar su NETO al bucket más antiguo con saldo POSITIVO
+      // Si el partner es NETO negativo (anticipos > facturas), sumarlo a 'current' (como anticipo neto)
+      const bucketsNet = { current: 0, d1_30: 0, d31_60: 0, d61_90: 0, d91_120: 0, older: 0 };
+      // Deduplicar por nombre (el HTML tiene filas anidadas: header + detalle)
+      const seenPartners = new Map();
+      for (const p of partnerRows) {
+        if (!seenPartners.has(p.name)) seenPartners.set(p.name, p);
+      }
+      for (const p of seenPartners.values()) {
+        const net = p.total;
+        if (Math.abs(net) < 0.01) continue;
+        // Encontrar el bucket más antiguo con saldo (positivo o negativo del mismo signo que el neto)
+        const bucketsInOrder = ['older', 'd91_120', 'd61_90', 'd31_60', 'd1_30', 'current'];
+        const values = { older: p.older, d91_120: p.d91_120, d61_90: p.d61_90, d31_60: p.d31_60, d1_30: p.d1_30, current: p.current };
+        // Estrategia: buscar el bucket más antiguo cuyo valor tenga el mismo signo que net (deuda real más vieja del partner)
+        let assigned = false;
+        for (const b of bucketsInOrder) {
+          if (Math.sign(values[b]) === Math.sign(net) && Math.abs(values[b]) > 0.01) {
+            bucketsNet[b] += net;
+            assigned = true;
+            break;
+          }
+        }
+        if (!assigned) {
+          // Fallback: asignar al bucket más antiguo con mayor magnitud
+          bucketsNet.current += net;
+        }
+      }
+
       return {
+        buckets_gross: {
+          current: current_g, d1_30: d1_30_g, d31_60: d31_60_g,
+          d61_90: d61_90_g, d91_120: d91_120_g, older: older_g,
+          d90plus: d91_120_g + older_g,
+        },
         buckets: {
-          current,
-          d1_30,
-          d31_60,
-          d61_90,
-          d91_120,
-          older,
-          d90plus: d91_120 + older,  // suma para compatibilidad con nuestro esquema anterior
+          current: bucketsNet.current,
+          d1_30: bucketsNet.d1_30,
+          d31_60: bucketsNet.d31_60,
+          d61_90: bucketsNet.d61_90,
+          d91_120: bucketsNet.d91_120,
+          older: bucketsNet.older,
+          d90plus: bucketsNet.d91_120 + bucketsNet.older,
         },
         total,
-        source: "odoo_official_report_html",
-        cells_last_7: last7,
+        partner_count: seenPartners.size,
+        source: "odoo_official_report_html_net_by_partner",
       };
     } catch (e) {
       return { error: String(e).slice(0, 300) };
