@@ -2362,6 +2362,99 @@ app.get("/api/admin/finanzas/ar-ap", wrap(async (req, res) => {
   arAging.gl_balance = ar_gl_balance;   // saldo contable según Balance General
   apAging.gl_balance = ap_gl_balance;
 
+  // NUEVO: traer el reporte OFICIAL de Odoo (Aged Receivable/Payable) vía get_html
+  // Extrae los buckets y el total exactos que Odoo calcula
+  const odooReport = { ar: null, ap: null };
+  async function fetchOdooAgedReport(modelName) {
+    try {
+      const options = {
+        date: { date_to: as_of, filter: "custom", mode: "single", string: as_of },
+        all_entries: false,
+        unfold_all: false,
+        unposted_in_period: false,
+        partner_ids: null,
+        partner_categories: null,
+        analytic_accounts: null,
+        analytic_tags: null,
+        journals: [],
+        filter_account_type: modelName === "account.aged.receivable" ? "receivable" : "payable",
+        multi_company: companyIds ? companyIds.map(id => ({ id })) : [],
+      };
+      const html = await odoo.execute(modelName, "get_html", [[], options], { context: ctx });
+      const htmlStr = String(html);
+      // Extraer todos los cells del último bloque (totales)
+      const cellPattern = /o_account_report_column_value">\s*\$?\s*([\-\d\.,]+)\s*</g;
+      const allCells = [];
+      let m;
+      while ((m = cellPattern.exec(htmlStr)) !== null) allCells.push(m[1]);
+      // El total del reporte está en las últimas 7 celdas: [current, 1-30, 31-60, 61-90, 91-120, older, TOTAL]
+      if (allCells.length < 7) return { error: "HTML sin celdas suficientes", cells_count: allCells.length };
+      // Convertir formato Odoo: "46.146,55" → 46146.55 (europeo)
+      const parseAmt = s => {
+        if (!s) return 0;
+        // Formato europeo: puntos son miles, coma es decimal
+        const norm = s.replace(/\./g, '').replace(',', '.');
+        return parseFloat(norm) || 0;
+      };
+      const last7 = allCells.slice(-7);
+      const [current, d1_30, d31_60, d61_90, d91_120, older, total] = last7.map(parseAmt);
+      // d90plus en nuestro modelo = d91_120 + older (Odoo usa 91-120 y >120)
+      // Pero para consistencia con nuestro reporte, agregamos ambos
+      return {
+        buckets: {
+          current,
+          d1_30,
+          d31_60,
+          d61_90,
+          d91_120,
+          older,
+          d90plus: d91_120 + older,  // suma para compatibilidad con nuestro esquema anterior
+        },
+        total,
+        source: "odoo_official_report_html",
+        cells_last_7: last7,
+      };
+    } catch (e) {
+      return { error: String(e).slice(0, 300) };
+    }
+  }
+
+  try {
+    const [arRep, apRep] = await Promise.all([
+      fetchOdooAgedReport("account.aged.receivable"),
+      fetchOdooAgedReport("account.aged.payable"),
+    ]);
+    odooReport.ar = arRep;
+    odooReport.ap = apRep;
+  } catch (e) {
+    odooReport.error = String(e).slice(0, 300);
+  }
+
+  // Si tenemos el reporte oficial, sobreescribimos el total y buckets con los de Odoo
+  // para que el KPI cuadre 100% con lo que ve el usuario en Odoo
+  if (odooReport.ar && !odooReport.ar.error && odooReport.ar.total > 0) {
+    arAging.odoo_report = odooReport.ar;
+    arAging.total = odooReport.ar.total;
+    arAging.buckets = {
+      current: odooReport.ar.buckets.current,
+      d1_30: odooReport.ar.buckets.d1_30,
+      d31_60: odooReport.ar.buckets.d31_60,
+      d61_90: odooReport.ar.buckets.d61_90,
+      d90plus: odooReport.ar.buckets.d90plus,
+    };
+  }
+  if (odooReport.ap && !odooReport.ap.error && odooReport.ap.total > 0) {
+    apAging.odoo_report = odooReport.ap;
+    apAging.total = odooReport.ap.total;
+    apAging.buckets = {
+      current: odooReport.ap.buckets.current,
+      d1_30: odooReport.ap.buckets.d1_30,
+      d31_60: odooReport.ap.buckets.d31_60,
+      d61_90: odooReport.ap.buckets.d61_90,
+      d90plus: odooReport.ap.buckets.d90plus,
+    };
+  }
+
   res.json({
     filters: { company_ids: companyIds, as_of },
     ar: arAging,
