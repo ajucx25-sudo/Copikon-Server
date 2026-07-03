@@ -2653,19 +2653,31 @@ app.get("/api/admin/finanzas/ar-ap/diag/odoo", wrap(async (req, res) => {
       filter_account_type: "receivable",
       multi_company: [{ id: 12, name: "COPIKON C.A." }],
     };
-    try {
-      const html = await odoo.execute("account.aged.receivable", "get_html", [options], { context: ctx });
-      // Extraer el total del HTML
-      const htmlStr = typeof html === 'string' ? html : JSON.stringify(html);
-      // Buscar montos en el HTML
-      const matches = htmlStr.match(/[\$\s]+[\d,]+\.\d{2}/g) || [];
-      attempts.get_html_result = {
-        html_length: htmlStr.length,
-        html_start: htmlStr.slice(0, 500),
-        html_end: htmlStr.slice(-2000),
-        amounts_found: matches.slice(-20),
-      };
-    } catch (e) { attempts.get_html_result = { error: String(e).slice(0, 300) }; }
+    // Probar diferentes signatures
+    const signatures = [
+      { name: "positional_options", args: [options], kw: { context: ctx } },
+      { name: "kw_options", args: [], kw: { options: options, context: ctx } },
+      { name: "in_context", args: [], kw: { context: { ...ctx, report_options: options } } },
+      { name: "with_ids", args: [[], options], kw: { context: ctx } },
+    ];
+    const sigResults = [];
+    for (const { name, args, kw } of signatures) {
+      try {
+        const r = await odoo.execute("account.aged.receivable", "get_html", args, kw);
+        const rStr = typeof r === 'string' ? r : JSON.stringify(r);
+        // Buscar montos y totales en el HTML/data
+        const amounts = rStr.match(/[\d,]+\.\d{2}/g) || [];
+        sigResults.push({
+          sig: name,
+          type: typeof r,
+          keys: (r && typeof r === 'object') ? Object.keys(r).slice(0,10) : null,
+          data_length: rStr.length,
+          data_end: rStr.slice(-1500),
+          amounts_last_20: amounts.slice(-20),
+        });
+      } catch (e) { sigResults.push({ sig: name, error: String(e).slice(0, 200) }); }
+    }
+    attempts.get_html_result = sigResults;
   } catch (e) { attempts.get_html_result = { error: String(e).slice(0, 300) }; }
 
   // Attempt G: intentar llamar directamente el reporte Aged Receivable de Odoo
