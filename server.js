@@ -2637,43 +2637,36 @@ app.get("/api/admin/finanzas/ar-ap/diag/odoo", wrap(async (req, res) => {
     attempts.abstract_aged_receivable = { fields: fieldNames.slice(0, 40), results };
   } catch (e) { attempts.abstract_aged_receivable = { error: String(e).slice(0,300) }; }
 
-  // Attempt J: llamar directamente los métodos del reporte (get_report_values, _get_report_data)
+  // Attempt J: llamar get_html() del reporte con options apropiadas
   try {
-    const methods_to_probe = [
-      "get_report_values",
-      "_get_report_values",
-      "_get_lines",
-      "_get_data",
-      "_query_get",
-      "_get_query",
-      "_do_query",
-      "get_html",
-      "_get_totals",
-      "_get_report_line_total",
-      "_get_aged_report_data",
-    ];
-    const found = [];
-    for (const m of methods_to_probe) {
-      try {
-        // Try to check if method exists via check_access_rights first — not reliable
-        // Just try calling with report_options and catch
-        const reportOptions = {
-          date: { date_to: as_of, filter: "custom", mode: "single" },
-          all_entries: false,
-          filter_account_type: "receivable",
-          multi_company: [{ id: 12 }],
-        };
-        const r = await odoo.execute("account.aged.receivable", m, [reportOptions], { context: { ...ctx, report_options: reportOptions } });
-        found.push({ method: m, has_data: !!r, sample: JSON.stringify(r).slice(0, 500) });
-      } catch (e) {
-        const msg = String(e).slice(0, 150);
-        if (!/does not exist|no method|not a valid|AttributeError/i.test(msg)) {
-          found.push({ method: m, error: msg });
-        }
-      }
-    }
-    attempts.report_methods_probe = found;
-  } catch (e) { attempts.report_methods_probe = { error: String(e).slice(0,300) }; }
+    // Odoo Enterprise v15: account.aged.receivable.get_html(options) devuelve HTML del reporte
+    const options = {
+      date: { date_to: as_of, filter: "custom", mode: "single", string: as_of },
+      all_entries: false,
+      unfold_all: false,
+      unposted_in_period: false,
+      partner_ids: null,
+      partner_categories: null,
+      analytic_accounts: null,
+      analytic_tags: null,
+      journals: [],
+      filter_account_type: "receivable",
+      multi_company: [{ id: 12, name: "COPIKON C.A." }],
+    };
+    try {
+      const html = await odoo.execute("account.aged.receivable", "get_html", [options], { context: ctx });
+      // Extraer el total del HTML
+      const htmlStr = typeof html === 'string' ? html : JSON.stringify(html);
+      // Buscar montos en el HTML
+      const matches = htmlStr.match(/[\$\s]+[\d,]+\.\d{2}/g) || [];
+      attempts.get_html_result = {
+        html_length: htmlStr.length,
+        html_start: htmlStr.slice(0, 500),
+        html_end: htmlStr.slice(-2000),
+        amounts_found: matches.slice(-20),
+      };
+    } catch (e) { attempts.get_html_result = { error: String(e).slice(0, 300) }; }
+  } catch (e) { attempts.get_html_result = { error: String(e).slice(0, 300) }; }
 
   // Attempt G: intentar llamar directamente el reporte Aged Receivable de Odoo
   // En Odoo 15 (Community o Enterprise), el reporte se ejecuta vía wizard/model.
