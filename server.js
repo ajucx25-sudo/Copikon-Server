@@ -2592,9 +2592,15 @@ app.get("/api/admin/finanzas/ar-ap/diag/odoo", wrap(async (req, res) => {
       account_type: [{ id: "trade_receivable", selected: true }],
       multi_company: [{ id: 12, name: "COPIKON C.A." }],
     };
+    // Primero: descubrir todos los fields del modelo
+    let fieldNames = [];
+    try {
+      const fg = await odoo.execute("account.aged.receivable", "fields_get", [], { attributes: ["string", "type", "store"] });
+      fieldNames = Object.entries(fg).map(([n, f]) => ({ name: n, type: f.type, string: f.string, store: f.store }));
+    } catch (e) { fieldNames = [{ error: String(e) }]; }
+
     const testContexts = [
       { name: "filter_receivable", ctx: { ...ctx, report_options: reportOptions, model: "account.aged.receivable" } },
-      { name: "filter_full", ctx: { ...ctx, report_options: { ...reportOptions, filter_account_type: ["trade_receivable"] }, model: "account.aged.receivable" } },
     ];
     const results = [];
     for (const { name, ctx: c } of testContexts) {
@@ -2602,18 +2608,20 @@ app.get("/api/admin/finanzas/ar-ap/diag/odoo", wrap(async (req, res) => {
         const lines = await odoo.searchRead(
           "account.aged.receivable",
           [],
-          ["amount_residual", "balance", "partner_id", "date", "date_maturity", "account_id", "move_name"],
+          ["balance", "partner_id", "date", "date_maturity", "account_id", "move_name", "debit", "credit"],
           { context: c, limit: 30000 }
         );
         results.push({
           ctx: name,
           count: lines.length,
-          sum_residual: lines.reduce((s, l) => s + (l.amount_residual || 0), 0),
           sum_balance: lines.reduce((s, l) => s + (l.balance || 0), 0),
+          sum_debit: lines.reduce((s, l) => s + (l.debit || 0), 0),
+          sum_credit: lines.reduce((s, l) => s + (l.credit || 0), 0),
+          net: lines.reduce((s, l) => s + ((l.debit || 0) - (l.credit || 0)), 0),
         });
       } catch (e) { results.push({ ctx: name, error: String(e).slice(0,300) }); }
     }
-    attempts.abstract_aged_receivable = results;
+    attempts.abstract_aged_receivable = { fields: fieldNames.slice(0, 40), results };
   } catch (e) { attempts.abstract_aged_receivable = { error: String(e).slice(0,300) }; }
 
   // Attempt G: intentar llamar directamente el reporte Aged Receivable de Odoo
