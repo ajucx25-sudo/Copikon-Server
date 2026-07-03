@@ -2653,31 +2653,60 @@ app.get("/api/admin/finanzas/ar-ap/diag/odoo", wrap(async (req, res) => {
       filter_account_type: "receivable",
       multi_company: [{ id: 12, name: "COPIKON C.A." }],
     };
-    // Probar diferentes signatures
-    const signatures = [
-      { name: "positional_options", args: [options], kw: { context: ctx } },
-      { name: "kw_options", args: [], kw: { options: options, context: ctx } },
-      { name: "in_context", args: [], kw: { context: { ...ctx, report_options: options } } },
-      { name: "with_ids", args: [[], options], kw: { context: ctx } },
-    ];
-    const sigResults = [];
-    for (const { name, args, kw } of signatures) {
-      try {
-        const r = await odoo.execute("account.aged.receivable", "get_html", args, kw);
-        const rStr = typeof r === 'string' ? r : JSON.stringify(r);
-        // Buscar montos y totales en el HTML/data
-        const amounts = rStr.match(/[\d,]+\.\d{2}/g) || [];
-        sigResults.push({
-          sig: name,
-          type: typeof r,
-          keys: (r && typeof r === 'object') ? Object.keys(r).slice(0,10) : null,
-          data_length: rStr.length,
-          data_end: rStr.slice(-1500),
-          amounts_last_20: amounts.slice(-20),
-        });
-      } catch (e) { sigResults.push({ sig: name, error: String(e).slice(0, 200) }); }
-    }
-    attempts.get_html_result = sigResults;
+    try {
+      const html = await odoo.execute("account.aged.receivable", "get_html", [[], options], { context: ctx });
+      const htmlStr = String(html);
+      // El reporte de Odoo tiene una fila "Total" al final con la totalización
+      // Buscar la línea de total y sus valores
+      // Típicamente: <tr class="o_account_reports_totals ..."> con "Total" en primera celda
+      // o <tfoot> con los totales
+      
+      // Extraer todos los montos del footer/total
+      // El formato es "$ 660.136,26" o "$ 660,136.26"
+      const totalMatches = [];
+      // Buscar todas las ocurrencias de "Total" cerca de montos
+      const totalPattern = /Total[^<]{0,50}<[^>]*>[^<]*<[^>]*>\s*\$?\s*([\d,\.]+)/gi;
+      let m;
+      while ((m = totalPattern.exec(htmlStr)) !== null) {
+        totalMatches.push(m[1]);
+      }
+      
+      // Alternativa: extraer las últimas 6-7 celdas del HTML (footer del reporte)
+      // Odoo Aged tiene columnas: Partner, Not Due, 1-30, 31-60, 61-90, 91-120, Older, Total
+      const lastCells = [];
+      const cellPattern = /o_account_report_column_value">\s*\$?\s*([\-\d\.,]+)\s*</g;
+      const allCells = [];
+      while ((m = cellPattern.exec(htmlStr)) !== null) {
+        allCells.push(m[1]);
+      }
+      
+      // El reporte agrupa por partner, cada partner tiene 6 columnas (aging + total)
+      // La última fila con class "o_account_reports_totals" tiene los subtotales
+      // Buscamos el patrón de la fila de totales
+      const totalRowMatch = htmlStr.match(/<tr[^>]*class="[^"]*o_account_reports_totals[^"]*"[^>]*>([\s\S]{0,2000}?)<\/tr>/);
+      let totalRowValues = [];
+      if (totalRowMatch) {
+        const rowHtml = totalRowMatch[1];
+        const values = [];
+        let vm;
+        const vp = /o_account_report_column_value">\s*\$?\s*([\-\d\.,]+)/g;
+        while ((vm = vp.exec(rowHtml)) !== null) values.push(vm[1]);
+        totalRowValues = values;
+      }
+      
+      attempts.get_html_result = {
+        html_length: htmlStr.length,
+        total_row_values: totalRowValues,
+        total_matches_from_pattern: totalMatches.slice(0, 10),
+        all_cells_count: allCells.length,
+        last_10_cells: allCells.slice(-10),
+        // Buscar todos los montos > 1000
+        big_amounts: allCells.filter(a => {
+          const n = parseFloat(a.replace(/\./g, '').replace(',', '.'));
+          return !isNaN(n) && n > 100000;
+        }).slice(0, 20),
+      };
+    } catch (e) { attempts.get_html_result = { error: String(e).slice(0, 500) }; }
   } catch (e) { attempts.get_html_result = { error: String(e).slice(0, 300) }; }
 
   // Attempt G: intentar llamar directamente el reporte Aged Receivable de Odoo
