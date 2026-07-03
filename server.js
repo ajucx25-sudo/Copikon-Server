@@ -2415,33 +2415,68 @@ app.get("/api/admin/finanzas/ar-ap", wrap(async (req, res) => {
         }
       }
 
-      // Buckets NETOS: para cada partner, asignar su NETO al bucket más antiguo con saldo POSITIVO
-      // Si el partner es NETO negativo (anticipos > facturas), sumarlo a 'current' (como anticipo neto)
-      const bucketsNet = { current: 0, d1_30: 0, d31_60: 0, d61_90: 0, d91_120: 0, older: 0 };
       // Deduplicar por nombre (el HTML tiene filas anidadas: header + detalle)
+      // Regla: la primera fila con ese nombre suele ser el HEADER del partner con totales agregados
       const seenPartners = new Map();
       for (const p of partnerRows) {
         if (!seenPartners.has(p.name)) seenPartners.set(p.name, p);
       }
+
+      // Buckets NETOS por partner:
+      // Para cada partner, distribuir su NETO POSITIVO entre sus buckets brutos con signo positivo,
+      // proporcionalmente. Los anticipos (buckets negativos) se aplican primero al bucket más reciente
+      // con saldo positivo (deuda más nueva se paga primero con el anticipo).
+      // Esto respeta el total oficial y muestra el aging real de la deuda pendiente.
+      const bucketsNet = { current: 0, d1_30: 0, d31_60: 0, d61_90: 0, d91_120: 0, older: 0 };
+      const netByOldestPositive = { current: 0, d1_30: 0, d31_60: 0, d61_90: 0, d91_120: 0, older: 0 };
+
       for (const p of seenPartners.values()) {
+        const bruteBuckets = { current: p.current, d1_30: p.d1_30, d31_60: p.d31_60, d61_90: p.d61_90, d91_120: p.d91_120, older: p.older };
         const net = p.total;
         if (Math.abs(net) < 0.01) continue;
-        // Encontrar el bucket más antiguo con saldo (positivo o negativo del mismo signo que el neto)
-        const bucketsInOrder = ['older', 'd91_120', 'd61_90', 'd31_60', 'd1_30', 'current'];
-        const values = { older: p.older, d91_120: p.d91_120, d61_90: p.d61_90, d31_60: p.d31_60, d1_30: p.d1_30, current: p.current };
-        // Estrategia: buscar el bucket más antiguo cuyo valor tenga el mismo signo que net (deuda real más vieja del partner)
+
+        // Sumar positivos y negativos de este partner
+        const positives = {};
+        let sumPositives = 0;
+        let sumNegatives = 0;
+        for (const b of Object.keys(bruteBuckets)) {
+          if (bruteBuckets[b] > 0) { positives[b] = bruteBuckets[b]; sumPositives += bruteBuckets[b]; }
+          else if (bruteBuckets[b] < 0) { sumNegatives += bruteBuckets[b]; }
+        }
+
+        // Aplicar anticipos (sumNegatives es negativo) desde los buckets más nuevos hacia los más viejos
+        // Así lo que queda "vencido" es realmente lo más viejo neto
+        let remainingAdvance = -sumNegatives; // valor positivo del anticipo total
+        const orderNewestFirst = ['current', 'd1_30', 'd31_60', 'd61_90', 'd91_120', 'older'];
+        const adjustedPos = { ...positives };
+        for (const b of orderNewestFirst) {
+          if (remainingAdvance <= 0) break;
+          if (adjustedPos[b] && adjustedPos[b] > 0) {
+            const applied = Math.min(remainingAdvance, adjustedPos[b]);
+            adjustedPos[b] -= applied;
+            remainingAdvance -= applied;
+          }
+        }
+        // Si aún queda anticipo (más anticipos que deuda), va como saldo negativo en 'current'
+        if (remainingAdvance > 0.01) {
+          adjustedPos.current = (adjustedPos.current || 0) - remainingAdvance;
+        }
+        // Sumar al bucketsNet global
+        for (const b of Object.keys(adjustedPos)) {
+          bucketsNet[b] += adjustedPos[b] || 0;
+        }
+
+        // Métrica alternativa: asignar todo el neto al bucket más antiguo con saldo positivo
+        const oldestFirst = ['older', 'd91_120', 'd61_90', 'd31_60', 'd1_30', 'current'];
         let assigned = false;
-        for (const b of bucketsInOrder) {
-          if (Math.sign(values[b]) === Math.sign(net) && Math.abs(values[b]) > 0.01) {
-            bucketsNet[b] += net;
+        for (const b of oldestFirst) {
+          if (bruteBuckets[b] > 0.01) {
+            netByOldestPositive[b] += net;
             assigned = true;
             break;
           }
         }
-        if (!assigned) {
-          // Fallback: asignar al bucket más antiguo con mayor magnitud
-          bucketsNet.current += net;
-        }
+        if (!assigned) netByOldestPositive.current += net;
       }
 
       return {
