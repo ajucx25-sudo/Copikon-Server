@@ -2605,55 +2605,33 @@ app.get("/api/admin/finanzas/ar-ap/diag/odoo", wrap(async (req, res) => {
     const results = [];
     for (const { name, ctx: c } of testContexts) {
       try {
-        // Ver primeras 5 y últimas 5 líneas para entender
-        const linesSample = await odoo.searchRead(
-          "account.aged.receivable",
-          [["date", "<=", as_of]],
-          ["balance", "partner_id", "date", "expected_pay_date", "report_date", "account_id", "debit", "credit", "parent_state", "move_id", "name"],
-          { context: c, limit: 3 }
-        );
-        results.push({ SAMPLE: linesSample });
-        const lines = await odoo.searchRead(
-          "account.aged.receivable",
-          [["date", "<=", as_of]],
-          ["balance", "partner_id", "date", "expected_pay_date", "report_date", "account_id", "debit", "credit", "parent_state", "move_id"],
-          { context: c, limit: 30000 }
-        );
-        // Agrupar por partner_id como hace el reporte
-        const byPartner = new Map();
-        let sumBalancePos = 0, sumBalanceNeg = 0;
-        for (const l of lines) {
-          const pid = l.partner_id ? l.partner_id[0] : 0;
-          const cur = byPartner.get(pid) || { balance: 0, count: 0 };
-          cur.balance += l.balance || 0;
-          cur.count += 1;
-          byPartner.set(pid, cur);
-          if ((l.balance || 0) > 0) sumBalancePos += l.balance;
-          else sumBalanceNeg += l.balance;
+        // Probamos varios dominios para ver cuál cuadra con Odoo $660,136.26
+        const doms = [
+          { n: "date_only", d: [["date", "<=", as_of]] },
+          { n: "date_full_reconcile", d: [["date", "<=", as_of], ["full_reconcile_id", "=", false]] },
+          { n: "date_reconciled", d: [["date", "<=", as_of], ["reconciled", "=", false]] },
+        ];
+        for (const { n, d } of doms) {
+          try {
+            const lns = await odoo.searchRead("account.aged.receivable", d,
+              ["balance", "partner_id"], { context: c, limit: 30000 });
+            const byP = new Map();
+            for (const l of lns) {
+              const p = l.partner_id ? l.partner_id[0] : 0;
+              byP.set(p, (byP.get(p) || 0) + (l.balance || 0));
+            }
+            const totalNet = Array.from(byP.values()).reduce((s,b) => s+b, 0);
+            const onlyPos = Array.from(byP.values()).filter(b => b > 0).reduce((s,b) => s+b, 0);
+            results.push({
+              domain: n,
+              lines: lns.length,
+              partners: byP.size,
+              sum_balance_lines: lns.reduce((s,l) => s + (l.balance || 0), 0),
+              net_by_partner: totalNet,
+              positive_partners_only: onlyPos,
+            });
+          } catch (e) { results.push({ domain: n, error: String(e).slice(0,200) }); }
         }
-        // El reporte v15 muestra TODAS las filas (positivas y negativas) pero al total les suma neto
-        // Sin embargo, algunas versiones muestran solo positivos.
-        const partnerBalances = Array.from(byPartner.entries()).map(([pid, v]) => v.balance);
-        const onlyPositivePartners = partnerBalances.filter(b => b > 0).reduce((s,b) => s+b, 0);
-        const onlyNegativePartners = partnerBalances.filter(b => b < 0).reduce((s,b) => s+b, 0);
-        
-        results.push({
-          ctx: name,
-          count: lines.length,
-          count_partners: byPartner.size,
-          sum_balance: lines.reduce((s, l) => s + (l.balance || 0), 0),
-          sum_debit: lines.reduce((s, l) => s + (l.debit || 0), 0),
-          sum_credit: lines.reduce((s, l) => s + (l.credit || 0), 0),
-          net: lines.reduce((s, l) => s + ((l.debit || 0) - (l.credit || 0)), 0),
-          sum_lines_positive: sumBalancePos,
-          sum_lines_negative: sumBalanceNeg,
-          sum_partners_positive: onlyPositivePartners,
-          sum_partners_negative: onlyNegativePartners,
-          top5_partners: Array.from(byPartner.entries())
-            .sort((a,b) => b[1].balance - a[1].balance)
-            .slice(0, 5)
-            .map(([pid, v]) => ({ partner_id: pid, balance: v.balance, count: v.count })),
-        });
       } catch (e) { results.push({ ctx: name, error: String(e).slice(0,300) }); }
     }
     attempts.abstract_aged_receivable = { fields: fieldNames.slice(0, 40), results };
