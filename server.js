@@ -3484,6 +3484,43 @@ app.get("/api/admin/tesoreria/conciliacion", wrap(async (req, res) => {
     } catch (e) { /* ignore */ }
   }
 
+  // 7b) Partida abierta más antigua por cuenta (primera fecha sin conciliar)
+  //     Y separación cobros (debit > 0) vs pagos (credit > 0)
+  const oldestOpenByAccount = {};
+  const cobrosOpenByAccount = {}; // debit > 0 (entradas al banco)
+  const pagosOpenByAccount = {};  // credit > 0 (salidas del banco)
+  if (bankAccIds.length) {
+    try {
+      const oldestLines = await odoo.searchRead(
+        "account.move.line",
+        [
+          ["parent_state", "=", "posted"],
+          ["account_id", "in", bankAccIds],
+          ["reconciled", "=", false],
+          ["date", "<=", as_of],
+          ...(companyIds ? [["company_id", "in", companyIds]] : []),
+        ],
+        ["account_id", "date", "debit", "credit"],
+        { context: ctx, order: "date asc", limit: 20000 }
+      );
+      for (const l of oldestLines) {
+        const aid = l.account_id?.[0];
+        if (!aid) continue;
+        if (!oldestOpenByAccount[aid]) oldestOpenByAccount[aid] = l.date;
+        if ((l.debit || 0) > 0) {
+          if (!cobrosOpenByAccount[aid]) cobrosOpenByAccount[aid] = { count: 0, amount: 0 };
+          cobrosOpenByAccount[aid].count++;
+          cobrosOpenByAccount[aid].amount += (l.debit || 0);
+        }
+        if ((l.credit || 0) > 0) {
+          if (!pagosOpenByAccount[aid]) pagosOpenByAccount[aid] = { count: 0, amount: 0 };
+          pagosOpenByAccount[aid].count++;
+          pagosOpenByAccount[aid].amount += (l.credit || 0);
+        }
+      }
+    } catch (e) { /* ignore */ }
+  }
+
   // 8) Balance total por cuenta (para GL balance)
   const balDomain = [
     ["parent_state", "=", "posted"],
@@ -3560,6 +3597,18 @@ app.get("/api/admin/tesoreria/conciliacion", wrap(async (req, res) => {
     if (openCount === 0 && stmtCount === 0) status = "conciliado";
     if (openCount > 100 || stmtCount > 50) status = "crítico";
 
+    // Cálculo de días de atraso
+    const asOfDate = new Date(as_of);
+    const lastReconDate = lastReconByAccount[acc.id] ? new Date(lastReconByAccount[acc.id]) : null;
+    const oldestOpenDate = oldestOpenByAccount[acc.id] ? new Date(oldestOpenByAccount[acc.id]) : null;
+    const daysSinceLastRecon = lastReconDate
+      ? Math.floor((asOfDate.getTime() - lastReconDate.getTime()) / 86400000) : null;
+    const daysOldestOpen = oldestOpenDate
+      ? Math.floor((asOfDate.getTime() - oldestOpenDate.getTime()) / 86400000) : null;
+
+    const cobros = cobrosOpenByAccount[acc.id] || { count: 0, amount: 0 };
+    const pagos = pagosOpenByAccount[acc.id] || { count: 0, amount: 0 };
+
     return {
       account_id: acc.id,
       account_code: acc.code,
@@ -3574,6 +3623,13 @@ app.get("/api/admin/tesoreria/conciliacion", wrap(async (req, res) => {
       reconciled_lines: recon.count || 0,
       reconciled_balance: recon.balance || 0,
       last_reconciled_date: lastReconByAccount[acc.id] || null,
+      oldest_open_date: oldestOpenByAccount[acc.id] || null,
+      days_since_last_recon: daysSinceLastRecon,
+      days_oldest_open: daysOldestOpen,
+      cobros_pendientes_count: cobros.count,
+      cobros_pendientes_amount: cobros.amount,
+      pagos_pendientes_count: pagos.count,
+      pagos_pendientes_amount: pagos.amount,
       journal_id: journal?.id || null,
       journal_name: journal?.name || null,
       stmt_pending_lines: stmt?.count || 0,
@@ -3598,14 +3654,101 @@ app.get("/api/admin/tesoreria/conciliacion", wrap(async (req, res) => {
     accounts_criticas: rows.filter(r => r.status === "crítico").length,
   };
 
+  // Ordenar por atraso: primero por días de partida más antigua abierta (desc)
+  rows.sort((a, b) => (b.days_oldest_open || 0) - (a.days_oldest_open || 0));
+
   res.json({
     filters: { company_ids: companyIds, as_of },
     totals,
-    rows: rows.sort((a, b) => Math.abs(b.open_balance) - Math.abs(a.open_balance)),
+    rows,
     journals: journals.map(j => ({
       id: j.id, code: j.code, name: j.name, type: j.type,
       default_account_id: j.default_account_id?.[0],
     })),
+  });
+}));
+
+// ───────────────────────────────────────────────────────
+// GET /api/admin/tesoreria/conciliacion/detalle/:accountId
+// Lista de partidas contables abiertas de UNA cuenta bancaria, separadas
+// en cobros (debit > 0) y pagos (credit > 0)
+// ───────────────────────────────────────────────────────
+app.get("/api/admin/tesoreria/conciliacion/detalle/:accountId", wrap(async (req, res) => {
+  const accountId = Number(req.params.accountId);
+  if (!Number.isFinite(accountId) || accountId <= 0) {
+    return res.status(400).json({ error: "accountId inválido" });
+  }
+  const companyIds = parseCompanyIds(req.query);
+  const as_of = String(req.query.as_of || todayIso());
+  const ctx = ctxCompanies(companyIds);
+  const limit = Math.min(Number(req.query.limit) || 500, 2000);
+
+  const domain = [
+    ["parent_state", "=", "posted"],
+    ["account_id", "=", accountId],
+    ["reconciled", "=", false],
+    ["date", "<=", as_of],
+  ];
+  if (companyIds) domain.push(["company_id", "in", companyIds]);
+
+  const lines = await odoo.searchRead(
+    "account.move.line",
+    domain,
+    [
+      "id", "date", "name", "ref", "debit", "credit", "amount_residual",
+      "partner_id", "move_id", "journal_id", "balance",
+    ],
+    { context: ctx, order: "date asc", limit }
+  );
+
+  // Info de la cuenta
+  const accs = await odoo.searchRead(
+    "account.account", [["id", "=", accountId]],
+    ["id", "code", "name", "currency_id"],
+    { context: ctx, limit: 1 }
+  );
+  const account = accs[0] || null;
+
+  // Separar en cobros (debit>0) y pagos (credit>0)
+  const cobros = [];
+  const pagos = [];
+  for (const l of lines) {
+    const row = {
+      id: l.id,
+      date: l.date,
+      name: l.name || "",
+      ref: l.ref || "",
+      partner_id: l.partner_id?.[0] || null,
+      partner_name: l.partner_id?.[1] || null,
+      move_id: l.move_id?.[0] || null,
+      move_name: l.move_id?.[1] || null,
+      debit: l.debit || 0,
+      credit: l.credit || 0,
+      amount_residual: l.amount_residual || 0,
+      balance: l.balance || 0,
+      journal_name: l.journal_id?.[1] || null,
+    };
+    if (row.debit > 0) cobros.push(row);
+    if (row.credit > 0) pagos.push(row);
+  }
+
+  const totalCobros = cobros.reduce((s, r) => s + r.debit, 0);
+  const totalPagos = pagos.reduce((s, r) => s + r.credit, 0);
+
+  res.json({
+    account,
+    filters: { company_ids: companyIds, as_of, limit },
+    cobros: {
+      count: cobros.length,
+      amount: totalCobros,
+      lines: cobros,
+    },
+    pagos: {
+      count: pagos.length,
+      amount: totalPagos,
+      lines: pagos,
+    },
+    total_lines: lines.length,
   });
 }));
 
