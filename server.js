@@ -2416,67 +2416,52 @@ app.get("/api/admin/finanzas/ar-ap", wrap(async (req, res) => {
       }
 
       // Deduplicar por nombre (el HTML tiene filas anidadas: header + detalle)
-      // Regla: la primera fila con ese nombre suele ser el HEADER del partner con totales agregados
       const seenPartners = new Map();
       for (const p of partnerRows) {
         if (!seenPartners.has(p.name)) seenPartners.set(p.name, p);
       }
 
-      // Buckets NETOS por partner:
-      // Para cada partner, distribuir su NETO POSITIVO entre sus buckets brutos con signo positivo,
-      // proporcionalmente. Los anticipos (buckets negativos) se aplican primero al bucket más reciente
-      // con saldo positivo (deuda más nueva se paga primero con el anticipo).
-      // Esto respeta el total oficial y muestra el aging real de la deuda pendiente.
+      // Buckets NETOS por partner (FIFO desde el más NUEVO):
+      // Para cada partner con NETO POSITIVO (nos debe/le debemos):
+      //   1) Tomar solo sus buckets con saldo positivo (deuda real)
+      //   2) Aplicar sus anticipos (buckets negativos) empezando por el bucket más NUEVO
+      //      Esto es la lógica contable estándar: el anticipo cubre primero la deuda más reciente
+      //   3) Lo que queda son los buckets NETOS del partner (todos >= 0)
+      // Para cada partner con NETO NEGATIVO (tenemos anticipo neto sobrante):
+      //   → Se cuenta como 'anticipos_netos' aparte, NO se resta de ningún bucket
       const bucketsNet = { current: 0, d1_30: 0, d31_60: 0, d61_90: 0, d91_120: 0, older: 0 };
-      const netByOldestPositive = { current: 0, d1_30: 0, d31_60: 0, d61_90: 0, d91_120: 0, older: 0 };
+      let anticiposNetosSobrantes = 0;
+      let partnersWithNetPositive = 0;
+      let partnersWithNetNegative = 0;
 
       for (const p of seenPartners.values()) {
         const bruteBuckets = { current: p.current, d1_30: p.d1_30, d31_60: p.d31_60, d61_90: p.d61_90, d91_120: p.d91_120, older: p.older };
         const net = p.total;
         if (Math.abs(net) < 0.01) continue;
 
-        // Sumar positivos y negativos de este partner
-        const positives = {};
-        let sumPositives = 0;
-        let sumNegatives = 0;
-        for (const b of Object.keys(bruteBuckets)) {
-          if (bruteBuckets[b] > 0) { positives[b] = bruteBuckets[b]; sumPositives += bruteBuckets[b]; }
-          else if (bruteBuckets[b] < 0) { sumNegatives += bruteBuckets[b]; }
+        if (net < 0) {
+          // Partner con anticipo NETO sobrante: no toca ningún bucket, se contabiliza aparte
+          anticiposNetosSobrantes += net; // negativo
+          partnersWithNetNegative++;
+          continue;
         }
 
-        // Aplicar anticipos (sumNegatives es negativo) desde los buckets más nuevos hacia los más viejos
-        // Así lo que queda "vencido" es realmente lo más viejo neto
-        let remainingAdvance = -sumNegatives; // valor positivo del anticipo total
+        partnersWithNetPositive++;
+        // Partner con NETO POSITIVO: aplicar anticipos internos desde el bucket más nuevo
+        const positives = { current: Math.max(0, bruteBuckets.current), d1_30: Math.max(0, bruteBuckets.d1_30), d31_60: Math.max(0, bruteBuckets.d31_60), d61_90: Math.max(0, bruteBuckets.d61_90), d91_120: Math.max(0, bruteBuckets.d91_120), older: Math.max(0, bruteBuckets.older) };
+        let negTotal = 0;
+        for (const b of Object.keys(bruteBuckets)) if (bruteBuckets[b] < 0) negTotal += bruteBuckets[b];
+        let remainingAdvance = -negTotal;
+
         const orderNewestFirst = ['current', 'd1_30', 'd31_60', 'd61_90', 'd91_120', 'older'];
-        const adjustedPos = { ...positives };
         for (const b of orderNewestFirst) {
           if (remainingAdvance <= 0) break;
-          if (adjustedPos[b] && adjustedPos[b] > 0) {
-            const applied = Math.min(remainingAdvance, adjustedPos[b]);
-            adjustedPos[b] -= applied;
-            remainingAdvance -= applied;
-          }
+          const applied = Math.min(remainingAdvance, positives[b]);
+          positives[b] -= applied;
+          remainingAdvance -= applied;
         }
-        // Si aún queda anticipo (más anticipos que deuda), va como saldo negativo en 'current'
-        if (remainingAdvance > 0.01) {
-          adjustedPos.current = (adjustedPos.current || 0) - remainingAdvance;
-        }
-        // Sumar al bucketsNet global
-        for (const b of Object.keys(adjustedPos)) {
-          bucketsNet[b] += adjustedPos[b] || 0;
-        }
-
-        // Métrica alternativa: asignar todo el neto al bucket más antiguo con saldo positivo
-        const oldestFirst = ['older', 'd91_120', 'd61_90', 'd31_60', 'd1_30', 'current'];
-        let assigned = false;
-        for (const b of oldestFirst) {
-          if (bruteBuckets[b] > 0.01) {
-            netByOldestPositive[b] += net;
-            assigned = true;
-            break;
-          }
-        }
-        if (!assigned) netByOldestPositive.current += net;
+        // Ahora positives[] contiene los buckets netos del partner (todos >= 0, suman net)
+        for (const b of Object.keys(positives)) bucketsNet[b] += positives[b];
       }
 
       return {
@@ -2496,6 +2481,9 @@ app.get("/api/admin/finanzas/ar-ap", wrap(async (req, res) => {
         },
         total,
         partner_count: seenPartners.size,
+        partners_positive: partnersWithNetPositive,
+        partners_negative: partnersWithNetNegative,
+        anticipos_netos_sobrantes: anticiposNetosSobrantes, // valor negativo: monto de anticipos que no compensan deuda del mismo partner
         source: "odoo_official_report_html_net_by_partner",
       };
     } catch (e) {
@@ -2527,6 +2515,7 @@ app.get("/api/admin/finanzas/ar-ap", wrap(async (req, res) => {
       d61_90: odooReport.ar.buckets.d61_90,
       d90plus: odooReport.ar.buckets.d90plus,
     };
+    arAging.anticipos_netos_sobrantes = odooReport.ar.anticipos_netos_sobrantes || 0;
     // gl_balance ahora se toma del propio reporte de Odoo (que ES el saldo oficial)
     arAging.gl_balance = odooReport.ar.total;
   }
@@ -2540,6 +2529,7 @@ app.get("/api/admin/finanzas/ar-ap", wrap(async (req, res) => {
       d61_90: odooReport.ap.buckets.d61_90,
       d90plus: odooReport.ap.buckets.d90plus,
     };
+    apAging.anticipos_netos_sobrantes = odooReport.ap.anticipos_netos_sobrantes || 0;
     apAging.gl_balance = odooReport.ap.total;
   }
 
