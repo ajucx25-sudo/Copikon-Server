@@ -3365,8 +3365,12 @@ app.get("/api/admin/tesoreria/conciliacion", wrap(async (req, res) => {
   const as_of = String(req.query.as_of || todayIso());
   const ctx = ctxCompanies(companyIds);
 
-  // 1) Cuentas de banco/caja (liquidity)
-  const bankAccDomain = [["internal_type", "=", "liquidity"]];
+  // 1) Cuentas de banco/caja (liquidity + código 111xxx/112xxx que son Caja/Bancos)
+  //    Odoo marca como "liquidity" también algunas cuentas de anticipos; filtramos por código.
+  const bankAccDomain = [
+    ["internal_type", "=", "liquidity"],
+    "|", ["code", "=like", "111%"], ["code", "=like", "112%"],
+  ];
   if (companyIds) bankAccDomain.push(["company_id", "in", companyIds]);
   const bankAccounts = await odoo.searchRead(
     "account.account",
@@ -3554,7 +3558,7 @@ app.get("/api/admin/tesoreria/conciliacion", wrap(async (req, res) => {
     if (openCount > 0 && openAbs > 1) status = "pendiente";
     if (stmtCount > 0) status = "pendiente";
     if (openCount === 0 && stmtCount === 0) status = "conciliado";
-    if (openCount > 20 || stmtCount > 20) status = "crítico";
+    if (openCount > 100 || stmtCount > 50) status = "crítico";
 
     return {
       account_id: acc.id,
