@@ -2574,6 +2574,49 @@ app.get("/api/admin/finanzas/ar-ap/diag/odoo", wrap(async (req, res) => {
     };
   } catch (e) { attempts.by_partner_no_null = { error: String(e).slice(0,300) }; }
 
+  // Attempt H: search_read contra el MODELO abstracto account.aged.receivable
+  // Este modelo abstracto ES el que usa el reporte de Odoo v15
+  try {
+    // El modelo abstracto ya incluye la lógica del reporte (default_get / _query)
+    // Probamos con dominios sencillos y complejos
+    const doms = [
+      { name: "empty_domain", dom: [] },
+      { name: "as_of_only", dom: [["date", "<=", as_of]] },
+      { name: "as_of_posted", dom: [["date", "<=", as_of], ["parent_state", "=", "posted"]] },
+      { name: "as_of_posted_company", dom: [["date", "<=", as_of], ["parent_state", "=", "posted"], ["company_id", "in", companyIds]] },
+    ];
+    const results = [];
+    for (const { name, dom } of doms) {
+      try {
+        const lines = await odoo.searchRead(
+          "account.aged.receivable",
+          dom,
+          ["amount_residual", "balance", "partner_id", "date", "date_maturity", "account_id", "move_id", "reconciled", "full_reconcile_id"],
+          { context: ctx, limit: 20000 }
+        );
+        results.push({
+          domain: name,
+          count: lines.length,
+          sum_residual: lines.reduce((s, l) => s + (l.amount_residual || 0), 0),
+          sum_balance: lines.reduce((s, l) => s + (l.balance || 0), 0),
+        });
+      } catch (e) { results.push({ domain: name, error: String(e).slice(0,200) }); }
+    }
+    attempts.abstract_aged_receivable = results;
+  } catch (e) { attempts.abstract_aged_receivable = { error: String(e).slice(0,300) }; }
+
+  // Attempt I: intentar leer aging via read_group agrupado como Odoo Enterprise
+  try {
+    const g = await odoo.readGroup(
+      "account.aged.receivable",
+      [["date", "<=", as_of], ["parent_state", "=", "posted"], ["company_id", "in", companyIds]],
+      ["amount_residual:sum", "balance:sum"],
+      ["company_id"],
+      {}
+    );
+    attempts.aged_receivable_readgroup = g;
+  } catch (e) { attempts.aged_receivable_readgroup = { error: String(e).slice(0,300) }; }
+
   // Attempt G: intentar llamar directamente el reporte Aged Receivable de Odoo
   // En Odoo 15 (Community o Enterprise), el reporte se ejecuta vía wizard/model.
   try {
