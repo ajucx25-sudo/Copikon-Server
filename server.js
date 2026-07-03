@@ -12,6 +12,9 @@ import compression from "compression";
 import cors from "cors";
 import pkg from "pg";
 import * as odoo from "./odoo-client.js";
+import XLSX from "xlsx";
+import { createRequire } from "module";
+const _require = createRequire(import.meta.url);
 
 const { Pool } = pkg;
 
@@ -3753,6 +3756,446 @@ app.get("/api/admin/tesoreria/conciliacion/detalle/:accountId", wrap(async (req,
 }));
 
 const PORT = process.env.PORT || 5050;
+
+// ═══════════════════════════════════════════════════════════════════
+// AUTO-MATCH DE CONCILIACIÓN BANCARIA
+// Flujo: parse extracto → match contra Odoo → export XLSX Odoo
+// ═══════════════════════════════════════════════════════════════════
+
+// ───────── Helpers de parsing ─────────
+function parseNumber(s) {
+  if (s === null || s === undefined) return null;
+  if (typeof s === "number") return s;
+  const str = String(s).trim().replace(/[^\d,.\-]/g, "");
+  if (!str) return null;
+  // Detectar formato: 1.234,56 (VE/EU) vs 1,234.56 (US)
+  const lastComma = str.lastIndexOf(",");
+  const lastDot = str.lastIndexOf(".");
+  let norm;
+  if (lastComma > lastDot) {
+    // VE/EU: coma es decimal
+    norm = str.replace(/\./g, "").replace(",", ".");
+  } else {
+    // US: punto es decimal
+    norm = str.replace(/,/g, "");
+  }
+  const n = parseFloat(norm);
+  return Number.isFinite(n) ? n : null;
+}
+
+function parseDate(s) {
+  if (!s) return null;
+  if (s instanceof Date) return s.toISOString().slice(0, 10);
+  const str = String(s).trim();
+  // ISO YYYY-MM-DD
+  let m = str.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (m) return `${m[1]}-${m[2]}-${m[3]}`;
+  // DD/MM/YYYY o DD-MM-YYYY
+  m = str.match(/^(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{2,4})/);
+  if (m) {
+    let [, d, mo, y] = m;
+    if (y.length === 2) y = "20" + y;
+    return `${y}-${mo.padStart(2, "0")}-${d.padStart(2, "0")}`;
+  }
+  // MM/DD/YYYY (US) — cuando el primer número es > 12 asumimos DD/MM
+  return null;
+}
+
+// Parsear texto de PDF: heurística basada en líneas con fecha + monto
+function parsePdfText(text) {
+  const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+  const rows = [];
+  const dateRe = /(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4}|\d{4}-\d{2}-\d{2})/;
+  const amountRe = /(-?\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2}))/g;
+
+  for (const line of lines) {
+    const dm = line.match(dateRe);
+    if (!dm) continue;
+    const date = parseDate(dm[1]);
+    if (!date) continue;
+    // Buscar 1-3 montos en la línea; el último suele ser saldo, penúltimo débito/crédito
+    const amounts = [...line.matchAll(amountRe)].map(m => parseNumber(m[1])).filter(n => n !== null);
+    if (amounts.length === 0) continue;
+    // Descripción: quitar fecha y montos
+    let desc = line.replace(dateRe, "").replace(amountRe, "").replace(/\s+/g, " ").trim();
+    // Heurística: si hay 2+ montos, el último es saldo, el anterior es el movimiento
+    let amount;
+    if (amounts.length >= 2) {
+      amount = amounts[amounts.length - 2];
+    } else {
+      amount = amounts[0];
+    }
+    // Detectar signo por palabras clave
+    const upper = desc.toUpperCase();
+    let signHint = 0;
+    if (/DEBIT|CARGO|RETIRO|COMISION|PAGO|TRANS.*EMIT/i.test(upper)) signHint = -1;
+    if (/CREDIT|ABONO|DEPOSITO|TRANS.*RECIB|COBRO/i.test(upper)) signHint = 1;
+    if (signHint !== 0 && Math.sign(amount) !== signHint) amount = signHint * Math.abs(amount);
+    rows.push({ date, description: desc.slice(0, 200), ref: "", amount });
+  }
+  return rows;
+}
+
+// Parsear XLSX: buscar columnas por nombre
+function parseXlsxBuffer(buf) {
+  const wb = XLSX.read(buf, { type: "buffer", cellDates: true });
+  const rows = [];
+  for (const sheetName of wb.SheetNames) {
+    const sheet = wb.Sheets[sheetName];
+    const json = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "", raw: false });
+    if (!json.length) continue;
+    // Buscar fila header (contiene "fecha" o "date")
+    let headerRow = -1;
+    for (let i = 0; i < Math.min(json.length, 20); i++) {
+      const cells = json[i].map(c => String(c).toLowerCase());
+      if (cells.some(c => /fecha|date/i.test(c))) {
+        headerRow = i;
+        break;
+      }
+    }
+    if (headerRow < 0) continue;
+    const headers = json[headerRow].map(c => String(c).toLowerCase().trim());
+    // Localizar índices de columnas por nombre
+    const findCol = (patterns) => headers.findIndex(h => patterns.some(p => h.includes(p)));
+    const iDate = findCol(["fecha", "date"]);
+    const iDesc = findCol(["descripc", "concepto", "descripti", "detalle", "narr"]);
+    const iRef = findCol(["ref", "documento", "operaci", "comprobante"]);
+    const iDebit = findCol(["debit", "cargo", "salida", "retiro"]);
+    const iCredit = findCol(["credit", "abono", "entrada", "deposito"]);
+    const iAmount = findCol(["monto", "importe", "amount"]);
+    if (iDate < 0) continue;
+    for (let i = headerRow + 1; i < json.length; i++) {
+      const row = json[i];
+      if (!row || !row[iDate]) continue;
+      const date = parseDate(row[iDate]);
+      if (!date) continue;
+      let amount;
+      if (iDebit >= 0 || iCredit >= 0) {
+        const debit = parseNumber(row[iDebit]) || 0;
+        const credit = parseNumber(row[iCredit]) || 0;
+        // Débito = salida = negativo; Crédito = entrada = positivo
+        amount = credit - debit;
+      } else if (iAmount >= 0) {
+        amount = parseNumber(row[iAmount]);
+      } else {
+        continue;
+      }
+      if (amount === null || amount === 0) continue;
+      rows.push({
+        date,
+        description: iDesc >= 0 ? String(row[iDesc] || "").slice(0, 200) : "",
+        ref: iRef >= 0 ? String(row[iRef] || "").slice(0, 60) : "",
+        amount,
+      });
+    }
+  }
+  return rows;
+}
+
+// Parsear CSV
+function parseCsvText(text) {
+  const lines = text.split(/\r?\n/).filter(Boolean);
+  if (!lines.length) return [];
+  // Detectar separador
+  const sep = (lines[0].match(/;/g) || []).length > (lines[0].match(/,/g) || []).length ? ";" : ",";
+  const splitCsv = (l) => {
+    const out = [];
+    let cur = "", q = false;
+    for (const c of l) {
+      if (c === '"') q = !q;
+      else if (c === sep && !q) { out.push(cur); cur = ""; }
+      else cur += c;
+    }
+    out.push(cur);
+    return out.map(s => s.trim().replace(/^"|"$/g, ""));
+  };
+  const parsed = lines.map(splitCsv);
+  // Convertir a formato XLSX-like para reusar el parser
+  const wb = XLSX.utils.book_new();
+  const ws = XLSX.utils.aoa_to_sheet(parsed);
+  XLSX.utils.book_append_sheet(wb, ws, "csv");
+  const buf = XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
+  return parseXlsxBuffer(buf);
+}
+
+// ───────── POST /api/admin/tesoreria/automatch/parse ─────────
+// Body: { filename: string, content_base64: string }
+// Detecta formato por extensión y devuelve filas normalizadas
+app.post("/api/admin/tesoreria/automatch/parse", wrap(async (req, res) => {
+  const { filename, content_base64 } = req.body || {};
+  if (!filename || !content_base64) {
+    return res.status(400).json({ error: "filename y content_base64 requeridos" });
+  }
+  const buf = Buffer.from(content_base64, "base64");
+  const ext = filename.toLowerCase().split(".").pop();
+  let rows = [];
+  let parser_used = "";
+
+  try {
+    if (ext === "pdf") {
+      const pdfParse = _require("pdf-parse");
+      const data = await pdfParse(buf);
+      rows = parsePdfText(data.text);
+      parser_used = "pdf";
+    } else if (ext === "xlsx" || ext === "xls") {
+      rows = parseXlsxBuffer(buf);
+      parser_used = "xlsx";
+    } else if (ext === "csv") {
+      rows = parseCsvText(buf.toString("utf8"));
+      parser_used = "csv";
+    } else if (ext === "txt") {
+      rows = parsePdfText(buf.toString("utf8"));
+      parser_used = "txt";
+    } else {
+      return res.status(400).json({ error: `Formato .${ext} no soportado. Usa PDF, XLSX, CSV o TXT.` });
+    }
+  } catch (e) {
+    return res.status(500).json({ error: `Error parseando archivo: ${e.message}` });
+  }
+
+  // Ordenar por fecha
+  rows.sort((a, b) => a.date.localeCompare(b.date));
+
+  // Estadísticas
+  const cobros = rows.filter(r => r.amount > 0);
+  const pagos = rows.filter(r => r.amount < 0);
+
+  res.json({
+    ok: true,
+    parser_used,
+    filename,
+    stats: {
+      total_lines: rows.length,
+      cobros_count: cobros.length,
+      cobros_amount: cobros.reduce((s, r) => s + r.amount, 0),
+      pagos_count: pagos.length,
+      pagos_amount: Math.abs(pagos.reduce((s, r) => s + r.amount, 0)),
+      date_from: rows[0]?.date || null,
+      date_to: rows[rows.length - 1]?.date || null,
+    },
+    rows,
+  });
+}));
+
+// ───────── POST /api/admin/tesoreria/automatch/match ─────────
+// Body: { company_id, account_id, statement_lines: [{date, description, ref, amount}] }
+// Devuelve 3 grupos: sure_matches, possible_matches, no_match
+app.post("/api/admin/tesoreria/automatch/match", wrap(async (req, res) => {
+  const { company_id, account_id, statement_lines } = req.body || {};
+  const companyId = Number(company_id);
+  const accountId = Number(account_id);
+  if (!Number.isFinite(companyId) || !Number.isFinite(accountId)) {
+    return res.status(400).json({ error: "company_id y account_id requeridos" });
+  }
+  if (!Array.isArray(statement_lines) || statement_lines.length === 0) {
+    return res.status(400).json({ error: "statement_lines requeridas" });
+  }
+
+  // 1) Traer apuntes abiertos de Odoo para esta cuenta
+  const odooLines = await odoo.searchRead(
+    "account.move.line",
+    [
+      ["account_id", "=", accountId],
+      ["company_id", "=", companyId],
+      ["parent_state", "=", "posted"],
+      ["reconciled", "=", false],
+      ["full_reconcile_id", "=", false],
+    ],
+    ["id", "date", "name", "ref", "debit", "credit", "move_name", "partner_id", "amount_residual"],
+    { limit: 5000, order: "date asc" }
+  );
+
+  // Normalizar: crear signed_amount (debit=entrada al banco=positivo; credit=salida=negativo)
+  const odooPool = odooLines.map(l => ({
+    id: l.id,
+    date: l.date,
+    signed_amount: (l.debit || 0) - (l.credit || 0),
+    debit: l.debit || 0,
+    credit: l.credit || 0,
+    name: l.name || "",
+    ref: l.ref || "",
+    move_name: l.move_name || "",
+    partner_name: Array.isArray(l.partner_id) ? l.partner_id[1] : "",
+    matched: false,
+  }));
+
+  // 2) Matching por 3 pasadas
+  // Pasada 1: monto exacto (±0.01) + fecha exacta o ±3 días
+  // Pasada 2: monto exacto ±0.01 + fecha ±15 días
+  // Pasada 3: monto ±1% + fecha ±3 días
+  const sure = [];
+  const possible = [];
+  const noMatch = [];
+
+  const daysBetween = (d1, d2) => {
+    const a = new Date(d1), b = new Date(d2);
+    return Math.abs((a - b) / (1000 * 60 * 60 * 24));
+  };
+
+  const findMatch = (stmt, tolerance) => {
+    // tolerance: { amountAbs, amountPct, dayWindow }
+    const candidates = [];
+    for (const line of odooPool) {
+      if (line.matched) continue;
+      const amountDiff = Math.abs(line.signed_amount - stmt.amount);
+      const amountPct = Math.abs(stmt.amount) > 0 ? amountDiff / Math.abs(stmt.amount) : 1;
+      const dayDiff = daysBetween(stmt.date, line.date);
+      if (amountDiff <= tolerance.amountAbs && dayDiff <= tolerance.dayWindow) {
+        candidates.push({ line, amountDiff, dayDiff, score: dayDiff * 10 + amountDiff });
+      } else if (amountPct <= tolerance.amountPct && dayDiff <= tolerance.dayWindow) {
+        candidates.push({ line, amountDiff, dayDiff, score: dayDiff * 10 + amountDiff + 5 });
+      }
+    }
+    if (!candidates.length) return null;
+    candidates.sort((a, b) => a.score - b.score);
+    return candidates[0];
+  };
+
+  // Enriquecer statement con id local
+  const stmtLines = statement_lines.map((s, i) => ({ ...s, stmt_idx: i }));
+
+  // Pasada 1: matches seguros
+  for (const stmt of stmtLines) {
+    const m = findMatch(stmt, { amountAbs: 0.01, amountPct: 0, dayWindow: 3 });
+    if (m) {
+      m.line.matched = true;
+      sure.push({
+        stmt_idx: stmt.stmt_idx,
+        statement: stmt,
+        odoo_line: m.line,
+        confidence: "sure",
+        amount_diff: m.amountDiff,
+        day_diff: m.dayDiff,
+      });
+    }
+  }
+
+  // Pasada 2 y 3: para las statements sin match seguro, buscar posibles
+  const matchedStmts = new Set(sure.map(s => s.stmt_idx));
+  for (const stmt of stmtLines) {
+    if (matchedStmts.has(stmt.stmt_idx)) continue;
+    // Pasada 2: monto exacto, ventana ±15 días
+    let m = findMatch(stmt, { amountAbs: 0.01, amountPct: 0, dayWindow: 15 });
+    // Pasada 3: monto ±1%, ventana ±3 días
+    if (!m) m = findMatch(stmt, { amountAbs: 0, amountPct: 0.01, dayWindow: 3 });
+    if (m) {
+      m.line.matched = true;
+      possible.push({
+        stmt_idx: stmt.stmt_idx,
+        statement: stmt,
+        odoo_line: m.line,
+        confidence: "possible",
+        amount_diff: m.amountDiff,
+        day_diff: m.dayDiff,
+      });
+      matchedStmts.add(stmt.stmt_idx);
+    }
+  }
+
+  // Sin match
+  for (const stmt of stmtLines) {
+    if (matchedStmts.has(stmt.stmt_idx)) continue;
+    noMatch.push({ stmt_idx: stmt.stmt_idx, statement: stmt });
+  }
+
+  // Apuntes de Odoo que no matcharon con ningún statement
+  const unmatchedOdoo = odooPool.filter(l => !l.matched);
+
+  res.json({
+    ok: true,
+    account_id: accountId,
+    company_id: companyId,
+    stats: {
+      statement_lines: stmtLines.length,
+      odoo_open_lines: odooLines.length,
+      sure_matches: sure.length,
+      possible_matches: possible.length,
+      no_match_statements: noMatch.length,
+      unmatched_odoo_lines: unmatchedOdoo.length,
+    },
+    sure_matches: sure,
+    possible_matches: possible,
+    no_match_statements: noMatch,
+    unmatched_odoo_lines: unmatchedOdoo,
+  });
+}));
+
+// ───────── POST /api/admin/tesoreria/automatch/export-odoo ─────────
+// Body: { account_code, account_name, statement_date, approved_matches: [{statement, odoo_move_name, odoo_line_id}] }
+// Devuelve XLSX con formato importable en Odoo
+app.post("/api/admin/tesoreria/automatch/export-odoo", wrap(async (req, res) => {
+  const { account_code, account_name, statement_date, approved_matches } = req.body || {};
+  if (!Array.isArray(approved_matches) || approved_matches.length === 0) {
+    return res.status(400).json({ error: "approved_matches requeridas" });
+  }
+
+  // Hoja 1: Statement lines para importar
+  const stmtRows = [
+    ["Fecha", "Referencia externa", "Descripción", "Contraparte", "Monto (USD)", "Apunte Odoo (move_name)", "Odoo line_id", "Confianza"],
+    ...approved_matches.map(m => [
+      m.statement?.date || "",
+      m.statement?.ref || "",
+      m.statement?.description || "",
+      m.odoo_line?.partner_name || "",
+      m.statement?.amount || 0,
+      m.odoo_line?.move_name || "",
+      m.odoo_line?.id || "",
+      m.confidence || "manual",
+    ]),
+  ];
+
+  // Hoja 2: Resumen
+  const cobros = approved_matches.filter(m => (m.statement?.amount || 0) > 0);
+  const pagos = approved_matches.filter(m => (m.statement?.amount || 0) < 0);
+  const sumCobros = cobros.reduce((s, m) => s + (m.statement?.amount || 0), 0);
+  const sumPagos = pagos.reduce((s, m) => s + Math.abs(m.statement?.amount || 0), 0);
+  const summaryRows = [
+    ["Concepto", "Valor"],
+    ["Cuenta bancaria", `${account_code} — ${account_name}`],
+    ["Fecha de conciliación", statement_date || new Date().toISOString().slice(0, 10)],
+    ["Total movimientos", approved_matches.length],
+    ["Cobros (entradas)", cobros.length],
+    ["Monto cobros", sumCobros],
+    ["Pagos (salidas)", pagos.length],
+    ["Monto pagos", sumPagos],
+    ["Neto", sumCobros - sumPagos],
+    ["Generado", new Date().toISOString()],
+  ];
+
+  // Hoja 3: Instrucciones para el contador
+  const instrucciones = [
+    ["Instrucciones para aplicar en Odoo"],
+    [""],
+    ["1. Abre Odoo → Contabilidad → Diario contable de la cuenta bancaria"],
+    ["2. Localiza cada apunte por su 'move_name' (columna F de la hoja 'Matches')"],
+    ["3. Marca cada apunte como conciliado con el movimiento del extracto correspondiente"],
+    ["4. Para conciliación masiva: usa el menú Odoo → Contabilidad → Conciliación Bancaria"],
+    ["5. Los apuntes con Odoo line_id (columna G) están listos para conciliar 1-a-1"],
+    [""],
+    ["Confianza: 'sure' = match automático de alta confianza (mismo monto, ≤3 días)"],
+    ["Confianza: 'possible' = requiere validación manual"],
+    ["Confianza: 'manual' = aprobado manualmente por el usuario"],
+    [""],
+    [`Cuenta: ${account_code} — ${account_name}`],
+    [`Generado: ${new Date().toISOString()}`],
+    [`Total: ${approved_matches.length} movimientos`],
+  ];
+
+  const wb = XLSX.utils.book_new();
+  const wsStmt = XLSX.utils.aoa_to_sheet(stmtRows);
+  const wsSummary = XLSX.utils.aoa_to_sheet(summaryRows);
+  const wsInstr = XLSX.utils.aoa_to_sheet(instrucciones);
+  XLSX.utils.book_append_sheet(wb, wsSummary, "Resumen");
+  XLSX.utils.book_append_sheet(wb, wsStmt, "Matches");
+  XLSX.utils.book_append_sheet(wb, wsInstr, "Instrucciones");
+
+  const buf = XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
+  res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+  res.setHeader("Content-Disposition", `attachment; filename="conciliacion_${account_code}_${(statement_date || "").replace(/-/g, "")}.xlsx"`);
+  res.send(buf);
+}));
+
+
 (async () => {
   try {
     await ensureSchema();
