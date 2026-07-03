@@ -3354,6 +3354,257 @@ app.get("/api/admin/finanzas/cashflow", wrap(async (req, res) => {
   });
 }));
 
+// ─────────────────────────────────────────────────────────────────────
+// GET /api/admin/tesoreria/conciliacion
+// Estado de conciliación por banco: contable (account.move.line reconciled)
+// + bancaria (account.bank.statement.line is_reconciled) + partidas en tránsito
+// Query params: company_id (opcional), as_of (default hoy)
+// ─────────────────────────────────────────────────────────────────────
+app.get("/api/admin/tesoreria/conciliacion", wrap(async (req, res) => {
+  const companyIds = parseCompanyIds(req.query);
+  const as_of = String(req.query.as_of || todayIso());
+  const ctx = ctxCompanies(companyIds);
+
+  // 1) Cuentas de banco/caja (liquidity)
+  const bankAccDomain = [["internal_type", "=", "liquidity"]];
+  if (companyIds) bankAccDomain.push(["company_id", "in", companyIds]);
+  const bankAccounts = await odoo.searchRead(
+    "account.account",
+    bankAccDomain,
+    ["id", "code", "name", "company_id", "currency_id"],
+    { context: ctx, order: "code asc", limit: 300 }
+  );
+
+  // 2) Cuentas 131xxx (Recibos y Pagos pendientes = tránsito)
+  const transitDomain = [["code", "=like", "131%"]];
+  if (companyIds) transitDomain.push(["company_id", "in", companyIds]);
+  const transitAccounts = await odoo.searchRead(
+    "account.account",
+    transitDomain,
+    ["id", "code", "name"],
+    { context: ctx, order: "code asc", limit: 200 }
+  );
+  const transitByCode = {};
+  transitAccounts.forEach(a => { transitByCode[a.code] = a; });
+
+  // 3) Journals bancarios (para conciliación bancaria)
+  const journalDomain = [["type", "in", ["bank", "cash"]]];
+  if (companyIds) journalDomain.push(["company_id", "in", companyIds]);
+  const journals = await odoo.searchRead(
+    "account.journal",
+    journalDomain,
+    ["id", "name", "code", "type", "default_account_id", "currency_id", "company_id"],
+    { context: ctx, order: "code asc", limit: 200 }
+  );
+
+  const bankAccIds = bankAccounts.map(a => a.id);
+  const journalIds = journals.map(j => j.id);
+
+  // 4) Líneas contables abiertas por cuenta (reconciled = false, con date <= as_of)
+  const openLinesDomain = [
+    ["parent_state", "=", "posted"],
+    ["date", "<=", as_of],
+    ["account_id", "in", bankAccIds],
+    ["reconciled", "=", false],
+  ];
+  if (companyIds) openLinesDomain.push(["company_id", "in", companyIds]);
+  const openByAccount = bankAccIds.length ? await odoo.readGroup(
+    "account.move.line",
+    openLinesDomain,
+    ["balance:sum", "amount_residual:sum", "account_id"],
+    ["account_id"],
+    { context: ctx, lazy: false, limit: 500 }
+  ) : [];
+
+  // 5) Líneas contables reconciliadas (informativo - conteo)
+  const reconLinesDomain = [
+    ["parent_state", "=", "posted"],
+    ["date", "<=", as_of],
+    ["account_id", "in", bankAccIds],
+    ["reconciled", "=", true],
+  ];
+  if (companyIds) reconLinesDomain.push(["company_id", "in", companyIds]);
+  const reconByAccount = bankAccIds.length ? await odoo.readGroup(
+    "account.move.line",
+    reconLinesDomain,
+    ["balance:sum", "account_id"],
+    ["account_id"],
+    { context: ctx, lazy: false, limit: 500 }
+  ) : [];
+
+  // 6) Líneas del extracto bancario pendientes (account.bank.statement.line, is_reconciled=false)
+  //    Odoo v15+: es_reconciled indica si la línea del extracto ya fue aplicada a asientos.
+  const stmtLineDomain = [
+    ["journal_id", "in", journalIds],
+    ["date", "<=", as_of],
+    ["is_reconciled", "=", false],
+  ];
+  if (companyIds) stmtLineDomain.push(["company_id", "in", companyIds]);
+
+  let stmtPending = [];
+  try {
+    stmtPending = journalIds.length ? await odoo.readGroup(
+      "account.bank.statement.line",
+      stmtLineDomain,
+      ["amount:sum", "journal_id"],
+      ["journal_id"],
+      { context: ctx, lazy: false, limit: 500 }
+    ) : [];
+  } catch (e) {
+    // Si el campo is_reconciled no existe en esta versión, dejar vacío.
+    stmtPending = [];
+  }
+
+  // 7) Última fecha de conciliación por cuenta (última línea reconciliada)
+  let lastReconByAccount = {};
+  if (bankAccIds.length) {
+    try {
+      const lastLines = await odoo.searchRead(
+        "account.move.line",
+        [
+          ["parent_state", "=", "posted"],
+          ["account_id", "in", bankAccIds],
+          ["reconciled", "=", true],
+          ["full_reconcile_id", "!=", false],
+        ],
+        ["account_id", "date"],
+        { context: ctx, order: "date desc", limit: 2000 }
+      );
+      for (const l of lastLines) {
+        const aid = l.account_id?.[0];
+        if (!aid) continue;
+        if (!lastReconByAccount[aid] || l.date > lastReconByAccount[aid]) {
+          lastReconByAccount[aid] = l.date;
+        }
+      }
+    } catch (e) { /* ignore */ }
+  }
+
+  // 8) Balance total por cuenta (para GL balance)
+  const balDomain = [
+    ["parent_state", "=", "posted"],
+    ["date", "<=", as_of],
+    ["account_id", "in", bankAccIds],
+  ];
+  if (companyIds) balDomain.push(["company_id", "in", companyIds]);
+  const balByAccount = bankAccIds.length ? await odoo.readGroup(
+    "account.move.line",
+    balDomain,
+    ["balance:sum", "account_id"],
+    ["account_id"],
+    { context: ctx, lazy: false, limit: 500 }
+  ) : [];
+
+  // Indexar por account_id
+  const balMap = {}, openMap = {}, reconMap = {};
+  balByAccount.forEach(g => {
+    balMap[g.account_id?.[0]] = { balance: g.balance || 0, count: g.__count || 0 };
+  });
+  openByAccount.forEach(g => {
+    openMap[g.account_id?.[0]] = {
+      balance: g.balance || 0,
+      residual: g.amount_residual || 0,
+      count: g.__count || 0,
+    };
+  });
+  reconByAccount.forEach(g => {
+    reconMap[g.account_id?.[0]] = { balance: g.balance || 0, count: g.__count || 0 };
+  });
+
+  // Indexar pendientes de extracto por journal → default_account_id
+  const stmtPendingByJournal = {};
+  stmtPending.forEach(g => {
+    stmtPendingByJournal[g.journal_id?.[0]] = {
+      amount: g.amount || 0,
+      count: g.__count || 0,
+    };
+  });
+  const journalByDefaultAccount = {};
+  journals.forEach(j => {
+    const aid = j.default_account_id?.[0];
+    if (aid) journalByDefaultAccount[aid] = j;
+  });
+
+  // Ensamblar filas por cuenta bancaria
+  const rows = bankAccounts.map(acc => {
+    const bal = balMap[acc.id] || { balance: 0, count: 0 };
+    const open = openMap[acc.id] || { balance: 0, residual: 0, count: 0 };
+    const recon = reconMap[acc.id] || { balance: 0, count: 0 };
+    const journal = journalByDefaultAccount[acc.id];
+    const stmt = journal ? stmtPendingByJournal[journal.id] : null;
+
+    // Buscar cuenta tránsito con código análogo (ej. 112108 → 131208)
+    // Regla observada: 111xxx caja, 112xxx bancos, 131xxx tránsito con últimos 3 dígitos correlativos.
+    const codeSuffix = String(acc.code || "").slice(-2);
+    let transitAcc = null;
+    for (const t of transitAccounts) {
+      if (String(t.code || "").endsWith(codeSuffix) && String(t.code || "").startsWith("131")) {
+        transitAcc = t;
+        break;
+      }
+    }
+
+    // Determinar estado global
+    const openCount = open.count || 0;
+    const openAbs = Math.abs(open.balance || 0);
+    const stmtCount = stmt?.count || 0;
+    const stmtAbs = Math.abs(stmt?.amount || 0);
+
+    let status = "conciliado";
+    if (openCount > 0 && openAbs > 1) status = "pendiente";
+    if (stmtCount > 0) status = "pendiente";
+    if (openCount === 0 && stmtCount === 0) status = "conciliado";
+    if (openCount > 20 || stmtCount > 20) status = "crítico";
+
+    return {
+      account_id: acc.id,
+      account_code: acc.code,
+      account_name: acc.name,
+      company_id: acc.company_id?.[0],
+      currency: acc.currency_id?.[1] || null,
+      gl_balance: bal.balance || 0,
+      gl_lines_total: bal.count || 0,
+      open_balance: open.balance || 0,
+      open_residual: open.residual || 0,
+      open_lines: open.count || 0,
+      reconciled_lines: recon.count || 0,
+      reconciled_balance: recon.balance || 0,
+      last_reconciled_date: lastReconByAccount[acc.id] || null,
+      journal_id: journal?.id || null,
+      journal_name: journal?.name || null,
+      stmt_pending_lines: stmt?.count || 0,
+      stmt_pending_amount: stmt?.amount || 0,
+      transit_account_code: transitAcc?.code || null,
+      transit_account_name: transitAcc?.name || null,
+      status,
+    };
+  });
+
+  // Totales globales
+  const totals = {
+    accounts: rows.length,
+    gl_balance: rows.reduce((s, r) => s + r.gl_balance, 0),
+    open_lines: rows.reduce((s, r) => s + r.open_lines, 0),
+    open_balance: rows.reduce((s, r) => s + r.open_balance, 0),
+    reconciled_lines: rows.reduce((s, r) => s + r.reconciled_lines, 0),
+    stmt_pending_lines: rows.reduce((s, r) => s + r.stmt_pending_lines, 0),
+    stmt_pending_amount: rows.reduce((s, r) => s + r.stmt_pending_amount, 0),
+    accounts_pending: rows.filter(r => r.status !== "conciliado").length,
+    accounts_conciliadas: rows.filter(r => r.status === "conciliado").length,
+    accounts_criticas: rows.filter(r => r.status === "crítico").length,
+  };
+
+  res.json({
+    filters: { company_ids: companyIds, as_of },
+    totals,
+    rows: rows.sort((a, b) => Math.abs(b.open_balance) - Math.abs(a.open_balance)),
+    journals: journals.map(j => ({
+      id: j.id, code: j.code, name: j.name, type: j.type,
+      default_account_id: j.default_account_id?.[0],
+    })),
+  });
+}));
+
 const PORT = process.env.PORT || 5050;
 (async () => {
   try {
