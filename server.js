@@ -2574,6 +2574,37 @@ app.get("/api/admin/finanzas/ar-ap/diag/odoo", wrap(async (req, res) => {
     };
   } catch (e) { attempts.by_partner_no_null = { error: String(e).slice(0,300) }; }
 
+  // Attempt G: intentar llamar directamente el reporte Aged Receivable de Odoo
+  // En Odoo 15 (Community o Enterprise), el reporte se ejecuta vía wizard/model.
+  try {
+    // Estrategias a probar:
+    //   1. account.aged.receivable  (Enterprise v14/v15)
+    //   2. account.aged.partner.balance / accounting.report (Community v15)
+    //   3. account.report (Enterprise v16+, pero puede estar retro-portado)
+    const found = [];
+    for (const modelName of [
+      "account.aged.receivable",
+      "account.aged.payable",
+      "account.aged.partner.balance",
+      "account.aged.trial.balance",
+      "account.report.aged.receivable",
+      "account.report.aged.payable",
+      "accounting.report",
+      "account.common.report",
+      "account.common.partner.report",
+      "account.report",
+      "account.report.general.ledger",
+    ]) {
+      try {
+        const r = await odoo.execute(modelName, "fields_get", [], { attributes: ["string", "type"] });
+        found.push({ model: modelName, fields: Object.keys(r).slice(0, 20) });
+      } catch (e) {
+        // silently skip
+      }
+    }
+    attempts.available_report_models = found;
+  } catch (e) { attempts.available_report_models = { error: String(e).slice(0,300) }; }
+
   res.json({ filters: { company_ids: companyIds, as_of }, attempts });
 }));
 
