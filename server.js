@@ -2466,6 +2466,97 @@ app.get("/api/admin/finanzas/ar-ap", wrap(async (req, res) => {
   });
 }));
 
+// GET /api/admin/finanzas/ar-ap/diag/aged-html — Devuelve el HTML crudo del reporte Aged
+app.get("/api/admin/finanzas/ar-ap/diag/aged-html", wrap(async (req, res) => {
+  const companyIds = parseCompanyIds(req.query);
+  const as_of = String(req.query.as_of || todayIso());
+  const kind = String(req.query.kind || "payable"); // 'payable' or 'receivable'
+  const modelName = kind === "receivable" ? "account.aged.receivable" : "account.aged.payable";
+  const ctx = ctxCompanies(companyIds);
+  const options = {
+    date: { date_to: as_of, filter: "custom", mode: "single", string: as_of },
+    all_entries: false,
+    unfold_all: true,
+    unposted_in_period: false,
+    partner_ids: null,
+    partner_categories: null,
+    analytic_accounts: null,
+    analytic_tags: null,
+    journals: [],
+    filter_account_type: kind,
+    multi_company: companyIds ? companyIds.map(id => ({ id })) : [],
+  };
+  const html = await odoo.execute(modelName, "get_html", [[], options], { context: ctx });
+  // Parsear filas para entender la estructura: cada partner con sus 7 buckets
+  const htmlStr = String(html);
+  const parseAmt = s => {
+    if (!s) return 0;
+    const norm = s.replace(/\./g, '').replace(',', '.');
+    return parseFloat(norm) || 0;
+  };
+  // Extraer todas las filas <tr ...>...</tr>
+  const trPattern = /<tr[^>]*data-id="([^"]*)"[\s\S]*?<\/tr>/g;
+  const partnerRows = [];
+  let m;
+  while ((m = trPattern.exec(htmlStr)) !== null) {
+    const trHtml = m[0];
+    const dataId = m[1];
+    // Extraer nombre (primera celda o span con nombre)
+    const nameMatch = trHtml.match(/<span[^>]*class="[^"]*o_account_report_line[^"]*"[^>]*>([^<]+)</) || trHtml.match(/>\s*([A-Za-z0-9][^<]{2,80})\s*</);
+    const cellVals = [...trHtml.matchAll(/o_account_report_column_value">\s*\$?\s*([\-\d\.,]+)\s*</g)].map(x => parseAmt(x[1]));
+    if (cellVals.length >= 7) {
+      partnerRows.push({
+        data_id: dataId,
+        name: nameMatch ? nameMatch[1].trim().slice(0, 60) : null,
+        buckets: cellVals.slice(-7), // últimos 7: current, 1-30, 31-60, 61-90, 91-120, older, total
+      });
+    }
+  }
+  // Sumar cada bucket manualmente
+  const bucketSums = [0, 0, 0, 0, 0, 0, 0];
+  for (const r of partnerRows) {
+    for (let i = 0; i < 7; i++) bucketSums[i] += r.buckets[i] || 0;
+  }
+  // Fila total del reporte (última que tenga clase o_account_report_total)
+  const totalRowMatch = htmlStr.match(/<tr[^>]*class="[^"]*o_account_report_total[^"]*"[\s\S]*?<\/tr>/);
+  const totalCells = totalRowMatch ? [...totalRowMatch[0].matchAll(/o_account_report_column_value">\s*\$?\s*([\-\d\.,]+)\s*</g)].map(x => parseAmt(x[1])) : null;
+
+  res.json({
+    kind, as_of, companyIds,
+    html_length: htmlStr.length,
+    partner_rows_count: partnerRows.length,
+    bucket_sums_from_partners: {
+      current: bucketSums[0],
+      d1_30: bucketSums[1],
+      d31_60: bucketSums[2],
+      d61_90: bucketSums[3],
+      d91_120: bucketSums[4],
+      older: bucketSums[5],
+      total: bucketSums[6],
+    },
+    total_row_cells: totalCells,
+    top_10_by_total: partnerRows
+      .filter(r => Math.abs(r.buckets[6]) > 0)
+      .sort((a, b) => Math.abs(b.buckets[6]) - Math.abs(a.buckets[6]))
+      .slice(0, 10)
+      .map(r => ({
+        name: r.name, total: r.buckets[6],
+        current: r.buckets[0], d1_30: r.buckets[1], d31_60: r.buckets[2],
+        d61_90: r.buckets[3], d91_120: r.buckets[4], older: r.buckets[5],
+      })),
+    top_10_older: partnerRows
+      .filter(r => Math.abs(r.buckets[5]) > 0)
+      .sort((a, b) => Math.abs(b.buckets[5]) - Math.abs(a.buckets[5]))
+      .slice(0, 10)
+      .map(r => ({ name: r.name, older: r.buckets[5], total: r.buckets[6] })),
+    top_10_negative: partnerRows
+      .filter(r => r.buckets[6] < 0)
+      .sort((a, b) => a.buckets[6] - b.buckets[6])
+      .slice(0, 10)
+      .map(r => ({ name: r.name, total: r.buckets[6], current: r.buckets[0], d31_60: r.buckets[2], older: r.buckets[5] })),
+  });
+}));
+
 // GET /api/admin/finanzas/ar-ap/diag/odoo — Ejecuta el report EXACTO Aged Receivable de Odoo
 app.get("/api/admin/finanzas/ar-ap/diag/odoo", wrap(async (req, res) => {
   const companyIds = parseCompanyIds(req.query);
