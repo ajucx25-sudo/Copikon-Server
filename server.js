@@ -2637,6 +2637,44 @@ app.get("/api/admin/finanzas/ar-ap/diag/odoo", wrap(async (req, res) => {
     attempts.abstract_aged_receivable = { fields: fieldNames.slice(0, 40), results };
   } catch (e) { attempts.abstract_aged_receivable = { error: String(e).slice(0,300) }; }
 
+  // Attempt J: llamar directamente los métodos del reporte (get_report_values, _get_report_data)
+  try {
+    const methods_to_probe = [
+      "get_report_values",
+      "_get_report_values",
+      "_get_lines",
+      "_get_data",
+      "_query_get",
+      "_get_query",
+      "_do_query",
+      "get_html",
+      "_get_totals",
+      "_get_report_line_total",
+      "_get_aged_report_data",
+    ];
+    const found = [];
+    for (const m of methods_to_probe) {
+      try {
+        // Try to check if method exists via check_access_rights first — not reliable
+        // Just try calling with report_options and catch
+        const reportOptions = {
+          date: { date_to: as_of, filter: "custom", mode: "single" },
+          all_entries: false,
+          filter_account_type: "receivable",
+          multi_company: [{ id: 12 }],
+        };
+        const r = await odoo.execute("account.aged.receivable", m, [reportOptions], { context: { ...ctx, report_options: reportOptions } });
+        found.push({ method: m, has_data: !!r, sample: JSON.stringify(r).slice(0, 500) });
+      } catch (e) {
+        const msg = String(e).slice(0, 150);
+        if (!/does not exist|no method|not a valid|AttributeError/i.test(msg)) {
+          found.push({ method: m, error: msg });
+        }
+      }
+    }
+    attempts.report_methods_probe = found;
+  } catch (e) { attempts.report_methods_probe = { error: String(e).slice(0,300) }; }
+
   // Attempt G: intentar llamar directamente el reporte Aged Receivable de Odoo
   // En Odoo 15 (Community o Enterprise), el reporte se ejecuta vía wizard/model.
   try {
