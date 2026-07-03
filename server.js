@@ -2576,11 +2576,11 @@ app.get("/api/admin/finanzas/ar-ap/diag/odoo", wrap(async (req, res) => {
 
   // Attempt H: search_read contra el MODELO abstracto account.aged.receivable
   // Este modelo abstracto ES el que usa el reporte de Odoo v15
-  // REQUIERE report_options en el context
+  // REQUIERE report_options con filter_account_type en el context
   try {
     const reportOptions = {
-      date: { date_to: as_of, filter: "custom", mode: "single" },
-      all_entries: false,        // Solo posted
+      date: { date_to: as_of, filter: "custom", mode: "single", date_from: as_of },
+      all_entries: false,
       unfold_all: false,
       unposted_in_period: false,
       partner_ids: null,
@@ -2588,13 +2588,13 @@ app.get("/api/admin/finanzas/ar-ap/diag/odoo", wrap(async (req, res) => {
       analytic_accounts: null,
       analytic_tags: null,
       journals: [],
+      filter_account_type: "receivable",
       account_type: [{ id: "trade_receivable", selected: true }],
       multi_company: [{ id: 12, name: "COPIKON C.A." }],
     };
     const testContexts = [
-      { name: "basic_ro", ctx: { ...ctx, report_options: reportOptions } },
-      { name: "with_aged_ctx", ctx: { ...ctx, report_options: reportOptions, aged_balance: true, date: as_of } },
-      { name: "date_context", ctx: { ...ctx, date_to: as_of, all_entries: false, aged_balance: true } },
+      { name: "filter_receivable", ctx: { ...ctx, report_options: reportOptions, model: "account.aged.receivable" } },
+      { name: "filter_full", ctx: { ...ctx, report_options: { ...reportOptions, filter_account_type: ["trade_receivable"] }, model: "account.aged.receivable" } },
     ];
     const results = [];
     for (const { name, ctx: c } of testContexts) {
@@ -2602,8 +2602,8 @@ app.get("/api/admin/finanzas/ar-ap/diag/odoo", wrap(async (req, res) => {
         const lines = await odoo.searchRead(
           "account.aged.receivable",
           [],
-          ["amount_residual", "balance", "partner_id", "date", "date_maturity", "account_id"],
-          { context: c, limit: 20000 }
+          ["amount_residual", "balance", "partner_id", "date", "date_maturity", "account_id", "move_name"],
+          { context: c, limit: 30000 }
         );
         results.push({
           ctx: name,
