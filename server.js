@@ -2494,21 +2494,19 @@ app.get("/api/admin/finanzas/ar-ap/diag/aged-html", wrap(async (req, res) => {
     const norm = s.replace(/\./g, '').replace(',', '.');
     return parseFloat(norm) || 0;
   };
-  // Extraer todas las filas <tr ...>...</tr>
-  const trPattern = /<tr[^>]*data-id="([^"]*)"[\s\S]*?<\/tr>/g;
+  // Extraer TODAS las filas <tr>...</tr> del HTML
+  const trPattern = /<tr\b[\s\S]*?<\/tr>/g;
+  const allTrs = htmlStr.match(trPattern) || [];
   const partnerRows = [];
-  let m;
-  while ((m = trPattern.exec(htmlStr)) !== null) {
-    const trHtml = m[0];
-    const dataId = m[1];
-    // Extraer nombre (primera celda o span con nombre)
-    const nameMatch = trHtml.match(/<span[^>]*class="[^"]*o_account_report_line[^"]*"[^>]*>([^<]+)</) || trHtml.match(/>\s*([A-Za-z0-9][^<]{2,80})\s*</);
+  for (const trHtml of allTrs) {
+    // Extraer nombre: primer texto no vacío que no sea vacío
+    const textOnly = trHtml.replace(/<[^>]+>/g, ' ').replace(/&nbsp;/g, ' ').replace(/\s+/g, ' ').trim();
     const cellVals = [...trHtml.matchAll(/o_account_report_column_value">\s*\$?\s*([\-\d\.,]+)\s*</g)].map(x => parseAmt(x[1]));
     if (cellVals.length >= 7) {
       partnerRows.push({
-        data_id: dataId,
-        name: nameMatch ? nameMatch[1].trim().slice(0, 60) : null,
-        buckets: cellVals.slice(-7), // últimos 7: current, 1-30, 31-60, 61-90, 91-120, older, total
+        text: textOnly.slice(0, 100),
+        buckets: cellVals.slice(-7),
+        cell_count: cellVals.length,
       });
     }
   }
@@ -2535,25 +2533,25 @@ app.get("/api/admin/finanzas/ar-ap/diag/aged-html", wrap(async (req, res) => {
       total: bucketSums[6],
     },
     total_row_cells: totalCells,
-    top_10_by_total: partnerRows
+    top_20_by_total: partnerRows
       .filter(r => Math.abs(r.buckets[6]) > 0)
       .sort((a, b) => Math.abs(b.buckets[6]) - Math.abs(a.buckets[6]))
-      .slice(0, 10)
+      .slice(0, 20)
       .map(r => ({
-        name: r.name, total: r.buckets[6],
+        text: r.text, total: r.buckets[6],
         current: r.buckets[0], d1_30: r.buckets[1], d31_60: r.buckets[2],
         d61_90: r.buckets[3], d91_120: r.buckets[4], older: r.buckets[5],
       })),
-    top_10_older: partnerRows
+    top_20_older: partnerRows
       .filter(r => Math.abs(r.buckets[5]) > 0)
       .sort((a, b) => Math.abs(b.buckets[5]) - Math.abs(a.buckets[5]))
-      .slice(0, 10)
-      .map(r => ({ name: r.name, older: r.buckets[5], total: r.buckets[6] })),
-    top_10_negative: partnerRows
-      .filter(r => r.buckets[6] < 0)
-      .sort((a, b) => a.buckets[6] - b.buckets[6])
-      .slice(0, 10)
-      .map(r => ({ name: r.name, total: r.buckets[6], current: r.buckets[0], d31_60: r.buckets[2], older: r.buckets[5] })),
+      .slice(0, 20)
+      .map(r => ({ text: r.text, older: r.buckets[5], total: r.buckets[6], d31_60: r.buckets[2] })),
+    top_20_negative_31_60: partnerRows
+      .filter(r => r.buckets[2] < 0)
+      .sort((a, b) => a.buckets[2] - b.buckets[2])
+      .slice(0, 20)
+      .map(r => ({ text: r.text, d31_60: r.buckets[2], total: r.buckets[6], older: r.buckets[5] })),
   });
 }));
 
