@@ -108,6 +108,7 @@ const ROUTES = {
   "/api/erp/infra-maintenance-orders": "infraMaintenanceOrders",
   "/api/erp/infra-incidents": "infraIncidents",
   "/api/erp/infra-transfers": "infraTransfers",
+  "/api/erp/infra-opex": "infraOpex",
   // Pre-Leads (carga masiva antes de convertir a lead)
   "/api/erp/pre-leads": "preLeads",
   // Notificaciones in-app y reportes semanales de bitácora
