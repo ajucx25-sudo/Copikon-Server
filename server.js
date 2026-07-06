@@ -1683,8 +1683,28 @@ app.get("/api/rsi/fleet/summary", wrap(async (_req, res) => {
 }));
 
 // ───── Arranque ─────────────────────────────────────────────
-// Bitacora Generators - Recordatorios y Reportes Semanales
-const BITACORA_MODULE_PREFIX = "gen-";
+// Bitacora - Recordatorios y Reportes Semanales
+// Cada área tiene su propio prefijo de módulo y su propio manager referente.
+// Config unificada de bitácoras por área (Generators, Administración Corporativa, ...)
+const BITACORA_AREAS = {
+  generators: {
+    modulePrefix: "gen-",
+    label: "Copikon Generators",
+    managerDeptId: 31,
+    reportLinkBase: "/copikon-generators?module=bitacora",
+  },
+  administracion: {
+    modulePrefix: "adm-",
+    label: "Área Administrativa Corporativa",
+    // Departamento de la Central Administrativa Corporativa (raiz del área).
+    // Si no existe manager específico, notifica solo al CEO + directiva.
+    managerDeptId: null,
+    reportLinkBase: "/administracion?module=bitacora",
+  },
+};
+
+// Backward-compat: algún codigo puede referirse al prefijo Generators por const
+const BITACORA_MODULE_PREFIX = BITACORA_AREAS.generators.modulePrefix;
 
 function caracasNow() {
   return new Date(Date.now() - 4 * 60 * 60 * 1000);
@@ -1695,14 +1715,16 @@ function isWeekday(date) {
   return day >= 1 && day <= 5;
 }
 
-async function getBitacoraRecipients() {
+async function getBitacoraRecipients(managerDeptId = null) {
   const employees = await readCol("employees");
   const ceo = employees.find((e) => e && (e.level === "ceo" || e.username === "admin"));
-  const generatorsManager = employees.find(
-    (e) => e && Number(e.departmentId) === 31 && (e.level === "manager" || e.level === "gerente")
-  );
+  const areaManager = managerDeptId
+    ? employees.find(
+        (e) => e && Number(e.departmentId) === Number(managerDeptId) && (e.level === "manager" || e.level === "gerente")
+      )
+    : null;
   const managers = employees.filter((e) => e && (e.level === "manager" || e.level === "ceo"));
-  return { ceo, generatorsManager, directiva: managers };
+  return { ceo, areaManager, generatorsManager: areaManager, directiva: managers };
 }
 
 async function pushNotification({ userId, title, message, type = "info", link = null }) {
@@ -1725,19 +1747,24 @@ async function pushNotification({ userId, title, message, type = "info", link = 
   return notif;
 }
 
-app.post("/api/generators/bitacora/check-daily", wrap(async (_req, res) => {
+// Endpoint genérico parametrizado por área: /api/bitacora/:area/check-daily
+// (mantengo también /api/generators/bitacora/... por compatibilidad con crons existentes)
+async function bitacoraCheckDailyHandler(areaKey, res) {
+  const areaCfg = BITACORA_AREAS[areaKey];
+  if (!areaCfg) return res.status(404).json({ ok: false, error: `Área desconocida: ${areaKey}` });
+
   const caracasToday = caracasNow();
   const yesterday = new Date(caracasToday.getTime() - 24 * 60 * 60 * 1000);
   const yDateStr = yesterday.toISOString().slice(0, 10);
 
   if (!isWeekday(yesterday)) {
-    return res.json({ ok: true, skipped: true, reason: "yesterday-was-weekend", date: yDateStr });
+    return res.json({ ok: true, skipped: true, reason: "yesterday-was-weekend", date: yDateStr, area: areaKey });
   }
 
   const activities = await readCol("copikonGenActivities");
   const yActivities = (activities || []).filter((a) => {
     if (!a || a.type !== "bitacora") return false;
-    if (typeof a.module !== "string" || !a.module.startsWith(BITACORA_MODULE_PREFIX)) return false;
+    if (typeof a.module !== "string" || !a.module.startsWith(areaCfg.modulePrefix)) return false;
     const dates = [a.createdAt, a.startDate, a.completedDate, a.dueDate].filter(Boolean);
     return dates.some((d) => String(d).slice(0, 10) === yDateStr);
   });
@@ -1749,29 +1776,36 @@ app.post("/api/generators/bitacora/check-daily", wrap(async (_req, res) => {
       reason: "activities-found",
       date: yDateStr,
       count: yActivities.length,
+      area: areaKey,
     });
   }
 
-  const { ceo, generatorsManager } = await getBitacoraRecipients();
+  const { ceo, areaManager } = await getBitacoraRecipients(areaCfg.managerDeptId);
   const sent = [];
   const ddmm = yDateStr.split("-").reverse().slice(0, 2).join("/");
-  const title = `Sin actividades en bitacora (${ddmm})`;
-  const message = `No se registro ninguna actividad en la bitacora de Copikon Generators el dia ${ddmm}. Por favor verificar con los responsables.`;
-  const link = "/copikon-generators?module=bitacora";
+  const title = `Sin actividades en bitacora ${areaCfg.label} (${ddmm})`;
+  const message = `No se registro ninguna actividad en la bitacora de ${areaCfg.label} el dia ${ddmm}. Por favor verificar con los responsables.`;
+  const link = areaCfg.reportLinkBase;
 
   if (ceo) {
     const n = await pushNotification({ userId: ceo.id, title, message, type: "warning", link });
     sent.push({ userId: ceo.id, who: "ceo", id: n?.id });
   }
-  if (generatorsManager && generatorsManager.id !== ceo?.id) {
-    const n = await pushNotification({ userId: generatorsManager.id, title, message, type: "warning", link });
-    sent.push({ userId: generatorsManager.id, who: "gerente-generators", id: n?.id });
+  if (areaManager && areaManager.id !== ceo?.id) {
+    const n = await pushNotification({ userId: areaManager.id, title, message, type: "warning", link });
+    sent.push({ userId: areaManager.id, who: `gerente-${areaKey}`, id: n?.id });
   }
 
-  res.json({ ok: true, date: yDateStr, recipients: sent });
-}));
+  res.json({ ok: true, date: yDateStr, area: areaKey, recipients: sent });
+}
 
-app.post("/api/generators/bitacora/generate-weekly-report", wrap(async (_req, res) => {
+app.post("/api/generators/bitacora/check-daily", wrap((_req, res) => bitacoraCheckDailyHandler("generators", res)));
+app.post("/api/bitacora/:area/check-daily", wrap((req, res) => bitacoraCheckDailyHandler(req.params.area, res)));
+
+async function bitacoraWeeklyReportHandler(areaKey, res) {
+  const areaCfg = BITACORA_AREAS[areaKey];
+  if (!areaCfg) return res.status(404).json({ ok: false, error: `Área desconocida: ${areaKey}` });
+
   const caracas = caracasNow();
   const dow = caracas.getUTCDay();
   const monday = new Date(caracas);
@@ -1802,7 +1836,7 @@ app.post("/api/generators/bitacora/generate-weekly-report", wrap(async (_req, re
     (a) =>
       a && a.type === "bitacora" &&
       typeof a.module === "string" &&
-      a.module.startsWith(BITACORA_MODULE_PREFIX) &&
+      a.module.startsWith(areaCfg.modulePrefix) &&
       inWeek(a)
   );
 
@@ -1849,6 +1883,7 @@ app.post("/api/generators/bitacora/generate-weekly-report", wrap(async (_req, re
 
   const report = {
     id: Date.now(),
+    area: areaKey,
     weekStart: fromStr,
     weekEnd: toStr,
     generatedAt: new Date().toISOString(),
@@ -1866,25 +1901,27 @@ app.post("/api/generators/bitacora/generate-weekly-report", wrap(async (_req, re
   };
 
   const reports = await readCol("bitacoraReports");
-  const existingIdx = reports.findIndex((r) => r.weekStart === fromStr);
+  // Cada área tiene su propia serie de reportes (previa a este cambio no habia campo area,
+  // por lo que los que no tienen area se tratan como generators para compatibilidad)
+  const existingIdx = reports.findIndex((r) => r.weekStart === fromStr && ((r.area || "generators") === areaKey));
   if (existingIdx >= 0) {
     reports[existingIdx] = report;
   } else {
     reports.push(report);
   }
-  const trimmed = reports.length > 52 ? reports.slice(-52) : reports;
+  const trimmed = reports.length > 104 ? reports.slice(-104) : reports;
   await writeCol("bitacoraReports", trimmed);
 
-  const { ceo, generatorsManager, directiva } = await getBitacoraRecipients();
+  const { ceo, areaManager, directiva } = await getBitacoraRecipients(areaCfg.managerDeptId);
   const recipients = new Map();
   if (ceo) recipients.set(ceo.id, { who: "ceo", emp: ceo });
-  if (generatorsManager) recipients.set(generatorsManager.id, { who: "gerente-generators", emp: generatorsManager });
+  if (areaManager) recipients.set(areaManager.id, { who: `gerente-${areaKey}`, emp: areaManager });
   for (const m of directiva) recipients.set(m.id, { who: "directiva", emp: m });
 
   const fmtDdMm = (s) => s.split("-").reverse().slice(0, 2).join("/");
-  const title = `Reporte semanal bitacora (${fmtDdMm(fromStr)} - ${fmtDdMm(toStr)})`;
-  const message = `Disponible el reporte de bitacora de Copikon Generators de la semana. Total: ${totalActivities} actividades, ${completadas} completadas (${report.stats.completionRate}%), ${enProgreso} en progreso, ${pendientes} pendientes.`;
-  const link = `/copikon-generators?module=bitacora&report=${report.id}`;
+  const title = `Reporte semanal bitacora ${areaCfg.label} (${fmtDdMm(fromStr)} - ${fmtDdMm(toStr)})`;
+  const message = `Disponible el reporte de bitacora de ${areaCfg.label} de la semana. Total: ${totalActivities} actividades, ${completadas} completadas (${report.stats.completionRate}%), ${enProgreso} en progreso, ${pendientes} pendientes.`;
+  const link = `${areaCfg.reportLinkBase}&report=${report.id}`;
 
   const sent = [];
   for (const [userId, info] of recipients.entries()) {
@@ -1893,7 +1930,10 @@ app.post("/api/generators/bitacora/generate-weekly-report", wrap(async (_req, re
   }
 
   res.json({ ok: true, report, recipients: sent });
-}));
+}
+
+app.post("/api/generators/bitacora/generate-weekly-report", wrap((_req, res) => bitacoraWeeklyReportHandler("generators", res)));
+app.post("/api/bitacora/:area/generate-weekly-report", wrap((req, res) => bitacoraWeeklyReportHandler(req.params.area, res)));
 
 app.post("/api/notifications/:id/read", wrap(async (req, res) => {
   const id = Number(req.params.id);
