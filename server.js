@@ -110,6 +110,8 @@ const ROUTES = {
   "/api/erp/infra-transfers": "infraTransfers",
   "/api/erp/infra-components": "infraComponents",
   "/api/erp/infra-component-movements": "infraComponentMovements",
+  // Requerimientos especiales (Operaciones) - solicitudes ad-hoc entre unidades
+  "/api/erp/special-requirements": "specialRequirements",
   // Pre-Leads (carga masiva antes de convertir a lead)
   "/api/erp/pre-leads": "preLeads",
   // Notificaciones in-app y reportes semanales de bitácora
