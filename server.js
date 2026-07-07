@@ -801,40 +801,106 @@ app.get("/api/erp/products/odoo-sync-status", wrap(async (_req, res) => {
 // Rutas fuera de /api/erp/products/* para no chocar con CRUD /:id.
 // ============================================================
 
-// Nombre exacto de la compañía en Odoo. Se busca por partner con este RIF.
-const COPIKON_RIF = "J294654568";
+// Copikon Venezuela, C.A. — RIF J-29465456-8. Se prueba en múltiples formatos.
+const COPIKON_RIF_FORMATS = ["J294654568", "J-29465456-8", "J29465456-8", "J-294654568"];
+// Nombres válidos (case-insensitive). El primero que aparezca en res.company gana.
+const COPIKON_NAME_INCLUDES = ["COPIKON VENEZUELA", "COPIKON C.A", "COPIKON CA", "COPIKON, C.A"];
+// Nombres a EXCLUIR aunque contengan "COPIKON" (otras compañías del grupo)
+const COPIKON_NAME_EXCLUDES = ["LOGAN", "JJEL", "MANGO", "2BC", "CJR", "COPIKON JR", "GENERATOR", "CELLTEK"];
 
 // Cache del companyId de Copikon C.A. (evita lookups repetidos)
 let _copikonCompanyId = null;
 async function getCopikonCompanyId() {
   if (_copikonCompanyId) return _copikonCompanyId;
-  // Buscar por partner con el VAT/RIF exacto
-  const partners = await odoo.searchRead(
-    "res.partner", [["vat", "=", COPIKON_RIF]],
-    ["id", "name"], { limit: 5 }
-  );
-  if (partners.length) {
-    const partnerIds = partners.map(p => p.id);
-    const companies = await odoo.searchRead(
-      "res.company", [["partner_id", "in", partnerIds]],
-      ["id", "name"], { limit: 5 }
+  const debug = { tried: [] };
+
+  // Estrategia 1: buscar por VAT en varios formatos
+  for (const rif of COPIKON_RIF_FORMATS) {
+    const partners = await odoo.searchRead(
+      "res.partner", [["vat", "=", rif]],
+      ["id", "name", "vat"], { limit: 5 }
     );
-    if (companies.length) {
-      _copikonCompanyId = companies[0].id;
+    debug.tried.push({ strategy: "partner.vat=" + rif, hits: partners.length });
+    if (partners.length) {
+      const partnerIds = partners.map(p => p.id);
+      const companies = await odoo.searchRead(
+        "res.company", [["partner_id", "in", partnerIds]],
+        ["id", "name"], { limit: 5 }
+      );
+      if (companies.length) {
+        _copikonCompanyId = companies[0].id;
+        console.log("[getCopikonCompanyId] hit via VAT", rif, "→", companies[0]);
+        return _copikonCompanyId;
+      }
+    }
+  }
+
+  // Estrategia 2: listar TODAS las compañías, filtrar por nombre válido / excluir otras
+  const allCompanies = await odoo.searchRead(
+    "res.company", [], ["id", "name", "vat", "partner_id"], { limit: 100, order: "id asc" }
+  );
+  debug.tried.push({ strategy: "res.company all", hits: allCompanies.length });
+
+  // Buscar por nombre exacto en el orden de includes
+  for (const needle of COPIKON_NAME_INCLUDES) {
+    const found = allCompanies.find(c => {
+      const n = (c.name || "").toUpperCase();
+      if (!n.includes(needle.toUpperCase())) return false;
+      // no debe caer en excludes
+      return !COPIKON_NAME_EXCLUDES.some(x => n.includes(x.toUpperCase()));
+    });
+    if (found) {
+      _copikonCompanyId = found.id;
+      console.log("[getCopikonCompanyId] hit via name", needle, "→", found);
       return _copikonCompanyId;
     }
   }
-  // Fallback por nombre de compañía
-  const byName = await odoo.searchRead(
-    "res.company", [["name", "ilike", "COPIKON VENEZUELA"]],
-    ["id", "name"], { limit: 5 }
-  );
-  if (byName.length) {
-    _copikonCompanyId = byName[0].id;
+
+  // Estrategia 3: cualquier compañía que contenga COPIKON pero no esté en excludes
+  const fallback = allCompanies.find(c => {
+    const n = (c.name || "").toUpperCase();
+    return n.includes("COPIKON") && !COPIKON_NAME_EXCLUDES.some(x => n.includes(x.toUpperCase()));
+  });
+  if (fallback) {
+    _copikonCompanyId = fallback.id;
+    console.log("[getCopikonCompanyId] hit via fallback COPIKON", fallback);
     return _copikonCompanyId;
   }
+
+  console.warn("[getCopikonCompanyId] NO MATCH. Companies=", allCompanies.map(c => `${c.id}:${c.name}`).join(" | "));
   return null;
 }
+
+// GET /api/erp/companies-debug — lista todas las compañías del ERP (diagnóstico)
+app.get("/api/erp/companies-debug", wrap(async (_req, res) => {
+  if (!odoo.isConfigured()) return res.status(503).json({ ok: false, error: "Odoo no configurado" });
+  try {
+    const companies = await odoo.searchRead(
+      "res.company", [], ["id", "name", "vat", "partner_id", "currency_id", "parent_id"],
+      { limit: 100, order: "id asc" }
+    );
+    // Además intenta resolver el partner de cada compañía para ver el VAT real del partner
+    const partnerIds = companies.map(c => Array.isArray(c.partner_id) ? c.partner_id[0] : null).filter(Boolean);
+    const partners = partnerIds.length ? await odoo.searchRead(
+      "res.partner", [["id", "in", partnerIds]],
+      ["id", "name", "vat"], { limit: 100 }
+    ) : [];
+    const partnerMap = Object.fromEntries(partners.map(p => [p.id, p]));
+    const enriched = companies.map(c => ({
+      id: c.id,
+      name: c.name,
+      company_vat: c.vat || null,
+      partner_id: Array.isArray(c.partner_id) ? c.partner_id[0] : c.partner_id,
+      partner_vat: (partnerMap[Array.isArray(c.partner_id) ? c.partner_id[0] : c.partner_id] || {}).vat || null,
+      parent_id: c.parent_id || null,
+    }));
+    const detected = await getCopikonCompanyId();
+    res.json({ ok: true, count: companies.length, detectedCopikonId: detected, companies: enriched });
+  } catch (e) {
+    console.error("[companies-debug]", e);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+}));
 
 // GET /api/erp/warehouses — lista bodegas activas de Copikon C.A. desde Odoo
 app.get("/api/erp/warehouses", wrap(async (_req, res) => {
