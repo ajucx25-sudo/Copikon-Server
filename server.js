@@ -642,9 +642,12 @@ function mapOdooProduct(op, existingByOdooId = new Map(), existingBySku = new Ma
   base.syncStatus = "odoo";
   base.lastSyncAt = new Date().toISOString();
 
-  // Imagen: prefiere image_128 (más liviana) si viene, sino la que tenía
+  // Imagen: si viene inline la usa; sino apunta al endpoint on-demand.
+  // El endpoint sirve la imagen de Odoo solo cuando el picker la pide (lazy).
   if (op.image_128) {
     base.imageUrl = odooBinaryToDataUrl(op.image_128);
+  } else if (op.id) {
+    base.imageUrl = `/api/erp/products/odoo-image/${op.id}`;
   } else if (!base.imageUrl) {
     base.imageUrl = "";
   }
@@ -656,7 +659,7 @@ function mapOdooProduct(op, existingByOdooId = new Map(), existingBySku = new Ma
   return base;
 }
 
-async function syncOdooCatalog({ limit = 5000, includeImages = true } = {}) {
+async function syncOdooCatalog({ limit = 25000, includeImages = false } = {}) {
   if (!odoo.isConfigured()) {
     throw new Error("Odoo no configurado en el servidor");
   }
@@ -677,12 +680,22 @@ async function syncOdooCatalog({ limit = 5000, includeImages = true } = {}) {
     ["active", "=", true],
   ];
 
-  const odooRows = await odoo.searchRead(
-    "product.product",
-    domain,
-    fields,
-    { order: "default_code asc, name asc", limit }
-  );
+  // Odoo aplica límite server-side de 10.000 en search_read; paginamos manualmente
+  const pageSize = 2000;
+  const odooRows = [];
+  let offset = 0;
+  while (odooRows.length < limit) {
+    const remaining = Math.min(pageSize, limit - odooRows.length);
+    const page = await odoo.searchRead(
+      "product.product",
+      domain,
+      fields,
+      { order: "id asc", limit: remaining, offset }
+    );
+    odooRows.push(...page);
+    if (page.length < remaining) break; // última página
+    offset += page.length;
+  }
 
   // 2. Cargar productos manuales existentes
   const manual = await readCol("erpProducts");
@@ -779,6 +792,39 @@ app.get("/api/erp/products/odoo-sync-status", wrap(async (_req, res) => {
   const r = await pool.query("SELECT value FROM kv WHERE key = 'erpProductsOdooSyncMeta'");
   const meta = r.rows[0]?.value || null;
   res.json({ configured: odoo.isConfigured(), meta });
+}));
+
+// GET /api/erp/products/odoo-image/:odooId — sirve la imagen del producto desde Odoo (on-demand)
+// Cache 24h en cliente. Reduce el payload del catálogo (imagenes lazy).
+const _odooImageCache = new Map(); // odooId -> { dataUrl, at }
+const ODOO_IMG_TTL = 12 * 60 * 60 * 1000; // 12h
+app.get("/api/erp/products/odoo-image/:odooId", wrap(async (req, res) => {
+  const id = Number(req.params.odooId);
+  if (!id) return res.status(400).json({ error: "invalid id" });
+  const now = Date.now();
+  const cached = _odooImageCache.get(id);
+  if (cached && (now - cached.at) < ODOO_IMG_TTL) {
+    res.set("Cache-Control", "public, max-age=86400");
+    return res.type("image/jpeg").send(cached.buffer);
+  }
+  try {
+    const rows = await odoo.searchRead("product.product", [["id", "=", id]], ["image_128"], { limit: 1 });
+    const b64 = rows[0]?.image_128;
+    if (!b64) return res.status(404).end();
+    const buffer = Buffer.from(b64, "base64");
+    _odooImageCache.set(id, { buffer, at: now });
+    // limpiar cache si crece demasiado
+    if (_odooImageCache.size > 500) {
+      const oldest = Array.from(_odooImageCache.entries())
+        .sort((a, b) => a[1].at - b[1].at)
+        .slice(0, 100);
+      for (const [k] of oldest) _odooImageCache.delete(k);
+    }
+    res.set("Cache-Control", "public, max-age=86400");
+    res.type("image/jpeg").send(buffer);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 }));
 
 // ───── Adjuntos de tareas de proyectos ──────────────────────
