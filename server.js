@@ -580,6 +580,207 @@ app.delete("/api/erp/product-serials/:id", wrap(async (req, res) => {
   res.json(removed);
 }));
 
+// ───── Sincronización catálogo Odoo → erpProducts ────────────
+// Trae productos vendibles (sale_ok=True) de Odoo y los mergea con
+// los productos manuales del catálogo Copikon (por SKU/odooId).
+// El endpoint puede llamarse manualmente (para forzar refresh) o desde
+// el cron nocturno.
+
+function toStrOrEmpty(v) {
+  if (v == null || v === false) return "";
+  return String(v).trim();
+}
+
+function odooBinaryToDataUrl(b64) {
+  if (!b64 || typeof b64 !== "string") return "";
+  // Odoo devuelve la imagen como base64 sin prefijo
+  return `data:image/jpeg;base64,${b64}`;
+}
+
+// Mapea un product.product de Odoo al shape de erpProducts en Copikon
+function mapOdooProduct(op, existingByOdooId = new Map(), existingBySku = new Map()) {
+  const sku = toStrOrEmpty(op.default_code) || toStrOrEmpty(op.barcode);
+  const existing =
+    (op.id && existingByOdooId.get(op.id)) ||
+    (sku && existingBySku.get(sku.toUpperCase())) ||
+    null;
+
+  // Categoría de Odoo (categ_id es many2one → [id, display_name])
+  const odooCateg = Array.isArray(op.categ_id) ? op.categ_id[1] : "";
+  // UoM (uom_id many2one → [id, name])
+  const uomName = Array.isArray(op.uom_id) ? String(op.uom_id[1] || "und").toLowerCase() : "und";
+
+  const base = existing ? { ...existing } : {
+    id: null, // se asigna abajo
+    stock: 0,
+    stockCommitted: 0,
+    minStock: 0,
+    status: "activo",
+    location: "",
+    warehouse: "",
+    syncStatus: "odoo",
+    documents: null,
+    galleryImages: null,
+    maintenanceSchedule: null,
+    serialNumber: null,
+  };
+
+  // Sobrescribir con datos de Odoo (Odoo es la fuente de verdad para SKU/nombre/precio)
+  base.odooId = op.id;
+  base.odooSku = sku;
+  base.sku = sku || base.sku || "";
+  base.code = sku || base.code || "";
+  base.name = toStrOrEmpty(op.name) || base.name || "";
+  base.unit = uomName || base.unit || "und";
+  base.category = odooCateg ? odooCateg.toLowerCase().replace(/[\s\/]+/g, "_").slice(0, 60) : (base.category || "otros");
+  base.brand = base.brand || ""; // Odoo estándar no tiene brand; se conserva el manual
+  base.barcode = toStrOrEmpty(op.barcode) || base.barcode || "";
+  base.salePrice = op.list_price != null ? String(op.list_price) : (base.salePrice || "");
+  base.costPrice = op.standard_price != null ? String(op.standard_price) : (base.costPrice || "");
+  base.stock = typeof op.qty_available === "number" ? op.qty_available : (base.stock || 0);
+  base.status = op.active ? "activo" : "archivado";
+  base.syncStatus = "odoo";
+  base.lastSyncAt = new Date().toISOString();
+
+  // Imagen: prefiere image_128 (más liviana) si viene, sino la que tenía
+  if (op.image_128) {
+    base.imageUrl = odooBinaryToDataUrl(op.image_128);
+  } else if (!base.imageUrl) {
+    base.imageUrl = "";
+  }
+
+  // Descripción corta
+  const desc = toStrOrEmpty(op.description_sale) || toStrOrEmpty(op.description);
+  if (desc) base.description = desc;
+
+  return base;
+}
+
+async function syncOdooCatalog({ limit = 5000, includeImages = true } = {}) {
+  if (!odoo.isConfigured()) {
+    throw new Error("Odoo no configurado en el servidor");
+  }
+
+  // 1. Traer variantes vendibles activas de Odoo
+  //    Campos mínimos + imagen 128px para picker (baja resolución = pesa poco)
+  const fields = [
+    "id", "default_code", "barcode", "name", "active",
+    "list_price", "standard_price", "qty_available",
+    "uom_id", "categ_id",
+    "product_tmpl_id",
+    "description_sale", "description",
+  ];
+  if (includeImages) fields.push("image_128");
+
+  const domain = [
+    ["sale_ok", "=", true],
+    ["active", "=", true],
+  ];
+
+  const odooRows = await odoo.searchRead(
+    "product.product",
+    domain,
+    fields,
+    { order: "default_code asc, name asc", limit }
+  );
+
+  // 2. Cargar productos manuales existentes
+  const manual = await readCol("erpProducts");
+  const existingByOdooId = new Map();
+  const existingBySku = new Map();
+  let maxId = 0;
+  for (const p of manual) {
+    if (p.odooId) existingByOdooId.set(p.odooId, p);
+    if (p.sku) existingBySku.set(String(p.sku).trim().toUpperCase(), p);
+    if (Number(p.id) > maxId) maxId = Number(p.id);
+  }
+
+  // 3. Mapear y mergear
+  const merged = new Map(); // key = id de Copikon
+  // Primero conservar productos MANUALES no vinculados a Odoo (syncStatus !== 'odoo' o sin odooId)
+  for (const p of manual) {
+    if (!p.odooId && p.syncStatus !== "odoo") {
+      merged.set(p.id, p);
+    }
+  }
+
+  // Luego procesar los de Odoo (crear o actualizar)
+  let created = 0;
+  let updated = 0;
+  for (const op of odooRows) {
+    const mapped = mapOdooProduct(op, existingByOdooId, existingBySku);
+    if (!mapped.id) {
+      maxId += 1;
+      mapped.id = maxId;
+      created += 1;
+    } else {
+      updated += 1;
+    }
+    merged.set(mapped.id, mapped);
+  }
+
+  const finalArr = Array.from(merged.values()).sort((a, b) => Number(a.id) - Number(b.id));
+
+  // 4. Guardar en kv.erpProducts
+  await writeCol("erpProducts", finalArr);
+
+  // 5. Registrar la sincronización
+  const meta = {
+    lastSyncAt: new Date().toISOString(),
+    odooCount: odooRows.length,
+    total: finalArr.length,
+    created,
+    updated,
+    manualPreserved: finalArr.length - created - updated,
+  };
+  await pool.query(
+    `INSERT INTO kv (key, value, updated_at) VALUES ($1, $2::jsonb, $3)
+     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at`,
+    ["erpProductsOdooSyncMeta", JSON.stringify(meta), Date.now()]
+  );
+
+  return meta;
+}
+
+// POST /api/erp/products/sync-odoo — dispara sincronización manual
+app.post("/api/erp/products/sync-odoo", wrap(async (req, res) => {
+  if (!odoo.isConfigured()) {
+    return res.status(503).json({ ok: false, error: "Odoo no configurado" });
+  }
+  const limit = Math.min(Number(req.body?.limit) || 5000, 10000);
+  const includeImages = req.body?.includeImages !== false;
+  try {
+    const meta = await syncOdooCatalog({ limit, includeImages });
+    res.json({ ok: true, ...meta });
+  } catch (e) {
+    console.error("[odoo-sync]", e);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+}));
+
+// POST /api/erp/products/sync-odoo/preview — solo cuenta cuántos productos vendrían (sin escribir)
+app.post("/api/erp/products/sync-odoo/preview", wrap(async (_req, res) => {
+  if (!odoo.isConfigured()) {
+    return res.status(503).json({ ok: false, error: "Odoo no configurado" });
+  }
+  try {
+    const total = await odoo.count("product.product", [
+      ["sale_ok", "=", true],
+      ["active", "=", true],
+    ]);
+    res.json({ ok: true, wouldSync: total });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+}));
+
+// GET /api/erp/products/odoo-sync-status — devuelve la última sincronización
+app.get("/api/erp/products/odoo-sync-status", wrap(async (_req, res) => {
+  const r = await pool.query("SELECT value FROM kv WHERE key = 'erpProductsOdooSyncMeta'");
+  const meta = r.rows[0]?.value || null;
+  res.json({ configured: odoo.isConfigured(), meta });
+}));
+
 // ───── Adjuntos de tareas de proyectos ──────────────────────
 // Los attachments viven inline en cada projectTask bajo la propiedad
 // `attachments` (array). dataUrl base64 embebido (max 25MB por request).
