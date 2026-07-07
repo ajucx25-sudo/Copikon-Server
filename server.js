@@ -795,6 +795,165 @@ app.get("/api/erp/products/odoo-sync-status", wrap(async (_req, res) => {
   res.json({ configured: odoo.isConfigured(), meta });
 }));
 
+// ============================================================
+// STOCK POR BODEGA / SUCURSAL — Requerimientos especiales v2
+// ============================================================
+
+// GET /api/erp/warehouses — lista bodegas activas desde Odoo (stock.warehouse)
+app.get("/api/erp/warehouses", wrap(async (_req, res) => {
+  if (!odoo.isConfigured()) {
+    return res.status(503).json({ ok: false, error: "Odoo no configurado" });
+  }
+  try {
+    const warehouses = await odoo.searchRead(
+      "stock.warehouse",
+      [["active", "=", true]],
+      ["id", "name", "code", "lot_stock_id", "partner_id"],
+      { order: "sequence asc, name asc" }
+    );
+    // También traemos las ubicaciones internas de cada bodega para diagnóstico
+    const locations = await odoo.searchRead(
+      "stock.location",
+      [["usage", "=", "internal"], ["active", "=", true]],
+      ["id", "name", "complete_name", "warehouse_id"],
+      { limit: 200, order: "complete_name asc" }
+    );
+    res.json({ ok: true, warehouses, locations });
+  } catch (e) {
+    console.error("[warehouses]", e);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+}));
+
+// POST /api/erp/products/sync-stock-by-warehouse
+// Trae desglose de stock por bodega para todos los productos vendibles y lo guarda en kv.stockByWarehouse
+// Estructura: { [odooProductId]: { [warehouseId]: { warehouseName, warehouseCode, qty } } }
+app.post("/api/erp/products/sync-stock-by-warehouse", wrap(async (_req, res) => {
+  if (!odoo.isConfigured()) {
+    return res.status(503).json({ ok: false, error: "Odoo no configurado" });
+  }
+  try {
+    const t0 = Date.now();
+    // 1. Bodegas activas
+    const warehouses = await odoo.searchRead(
+      "stock.warehouse", [["active", "=", true]],
+      ["id", "name", "code", "view_location_id"],
+      { order: "sequence asc, name asc" }
+    );
+    if (!warehouses.length) {
+      return res.json({ ok: true, warehouses: 0, products: 0, note: "No hay bodegas activas en Odoo" });
+    }
+
+    // 2. Ubicaciones internas por bodega (usamos view_location_id como raíz)
+    //    parent_path en stock.location es como "1/5/12/" — hijas de view_location_id.
+    const allInternal = await odoo.searchRead(
+      "stock.location",
+      [["usage", "=", "internal"], ["active", "=", true]],
+      ["id", "warehouse_id", "parent_path"],
+      { limit: 5000 }
+    );
+    // Mapa: warehouseId -> Set(locationIds)
+    const locsByWh = new Map();
+    for (const loc of allInternal) {
+      const whId = Array.isArray(loc.warehouse_id) ? loc.warehouse_id[0] : null;
+      if (!whId) continue;
+      if (!locsByWh.has(whId)) locsByWh.set(whId, new Set());
+      locsByWh.get(whId).add(loc.id);
+    }
+
+    // 3. Agrupar stock.quant por (product_id, location_id) — solo ubicaciones internas activas
+    //    read_group con sum(quantity) es lo más eficiente
+    const internalLocIds = allInternal.map(l => l.id);
+    if (!internalLocIds.length) {
+      return res.json({ ok: true, warehouses: warehouses.length, products: 0, note: "Sin ubicaciones internas" });
+    }
+    const quantGroups = await odoo.readGroup(
+      "stock.quant",
+      [["location_id", "in", internalLocIds], ["quantity", "!=", 0]],
+      ["product_id", "location_id", "quantity"],
+      ["product_id", "location_id"],
+      { lazy: false, limit: 200000 }
+    );
+
+    // 4. Rearmar: por producto y bodega
+    //    quantGroups: [{ product_id: [id,name], location_id: [id,name], quantity: N, __count: X }]
+    const stockByWh = {}; // { productId: { whId: { warehouseName, warehouseCode, qty } } }
+    // Mapa locId -> whId
+    const locToWh = new Map();
+    for (const [whId, locSet] of locsByWh.entries()) {
+      for (const locId of locSet) locToWh.set(locId, whId);
+    }
+    const whMeta = new Map(); // whId -> {name, code}
+    for (const w of warehouses) whMeta.set(w.id, { name: w.name, code: w.code });
+
+    for (const g of quantGroups) {
+      const pid = Array.isArray(g.product_id) ? g.product_id[0] : null;
+      const lid = Array.isArray(g.location_id) ? g.location_id[0] : null;
+      const qty = Number(g.quantity) || 0;
+      if (!pid || !lid) continue;
+      const whId = locToWh.get(lid);
+      if (!whId) continue;
+      if (!stockByWh[pid]) stockByWh[pid] = {};
+      if (!stockByWh[pid][whId]) {
+        const meta = whMeta.get(whId) || { name: "?", code: "?" };
+        stockByWh[pid][whId] = { warehouseName: meta.name, warehouseCode: meta.code, qty: 0 };
+      }
+      stockByWh[pid][whId].qty += qty;
+    }
+
+    // 5. Guardar en kv
+    const payload = {
+      warehouses: warehouses.map(w => ({ id: w.id, name: w.name, code: w.code })),
+      stockByProduct: stockByWh,
+      updatedAt: new Date().toISOString(),
+      productCount: Object.keys(stockByWh).length,
+      elapsedMs: Date.now() - t0,
+    };
+    await pool.query(
+      `INSERT INTO kv (key, value, updated_at) VALUES ($1, $2::jsonb, $3)
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at`,
+      ["stockByWarehouse", JSON.stringify(payload), Date.now()]
+    );
+    res.json({
+      ok: true,
+      warehouses: warehouses.length,
+      warehouseList: warehouses.map(w => ({ id: w.id, name: w.name, code: w.code })),
+      products: payload.productCount,
+      quantRows: quantGroups.length,
+      elapsedMs: payload.elapsedMs,
+    });
+  } catch (e) {
+    console.error("[sync-stock-by-warehouse]", e);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+}));
+
+// GET /api/erp/products/stock-by-warehouse — devuelve el desglose completo cacheado
+// Query params: ?productIds=1,2,3 (opcional, filtra) o ?odooIds=1,2,3
+app.get("/api/erp/products/stock-by-warehouse", wrap(async (req, res) => {
+  const r = await pool.query("SELECT value, updated_at FROM kv WHERE key = 'stockByWarehouse'");
+  const payload = r.rows[0]?.value || null;
+  if (!payload) {
+    return res.json({ ok: true, cached: false, warehouses: [], stockByProduct: {} });
+  }
+  const filter = String(req.query.odooIds || req.query.productIds || "").trim();
+  let stockByProduct = payload.stockByProduct || {};
+  if (filter) {
+    const ids = new Set(filter.split(",").map(s => Number(s.trim())).filter(Boolean));
+    stockByProduct = Object.fromEntries(
+      Object.entries(stockByProduct).filter(([k]) => ids.has(Number(k)))
+    );
+  }
+  res.json({
+    ok: true,
+    cached: true,
+    updatedAt: payload.updatedAt,
+    warehouses: payload.warehouses || [],
+    stockByProduct,
+    productCount: Object.keys(stockByProduct).length,
+  });
+}));
+
 // GET /api/erp/products/odoo-image/:odooId — sirve la imagen del producto desde Odoo (on-demand)
 // Cache 24h en cliente. Reduce el payload del catálogo (imagenes lazy).
 const _odooImageCache = new Map(); // odooId -> { dataUrl, at }
