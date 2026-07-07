@@ -906,8 +906,9 @@ app.get("/api/erp/companies-debug", wrap(async (_req, res) => {
 // CCS=Central (Caracas), BTO=Barquisimeto, VAL=Valencia, MCY=Maracay, ATR=Atrium,
 // INV=Inversiones, TDA-B=Tienda Copikon, GP1-B=Galpón 1, GP2-B=Galpón 2,
 // EXH-C=Exhibición Caracas, ALQ-B=Alquiler.
-const PRIMARY_WAREHOUSE_CODES = ["CCS", "BTO", "VAL", "MCY", "ATR", "INV", "TDA-B", "GP1-B", "GP2-B", "EXH-C", "ALQ-B"];
-const CENTRAL_WAREHOUSE_CODE = "CCS";
+// BTO (Barquisimeto) es Central — se muestra primero.
+const PRIMARY_WAREHOUSE_CODES = ["BTO", "CCS", "VAL", "MCY", "ATR", "INV", "TDA-B", "GP1-B", "GP2-B", "EXH-C", "ALQ-B"];
+const CENTRAL_WAREHOUSE_CODE = "BTO";
 // Coordenadas aproximadas para calcular "más cercana" (lat, lng)
 const WAREHOUSE_COORDS = {
   "CCS":   { lat: 10.4806, lng: -66.9036, city: "Caracas" },
