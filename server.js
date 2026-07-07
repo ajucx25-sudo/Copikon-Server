@@ -902,8 +902,29 @@ app.get("/api/erp/companies-debug", wrap(async (_req, res) => {
   }
 }));
 
+// Sedes principales visibles por defecto en el UI de requerimientos.
+// CCS=Central (Caracas), BTO=Barquisimeto, VAL=Valencia, MCY=Maracay, ATR=Atrium,
+// INV=Inversiones, TDA-B=Tienda Copikon, GP1-B=Galpón 1, GP2-B=Galpón 2,
+// EXH-C=Exhibición Caracas, ALQ-B=Alquiler.
+const PRIMARY_WAREHOUSE_CODES = ["CCS", "BTO", "VAL", "MCY", "ATR", "INV", "TDA-B", "GP1-B", "GP2-B", "EXH-C", "ALQ-B"];
+const CENTRAL_WAREHOUSE_CODE = "CCS";
+// Coordenadas aproximadas para calcular "más cercana" (lat, lng)
+const WAREHOUSE_COORDS = {
+  "CCS":   { lat: 10.4806, lng: -66.9036, city: "Caracas" },
+  "BTO":   { lat:  9.9986, lng: -69.3223, city: "Barquisimeto" },
+  "VAL":   { lat: 10.1621, lng: -68.0078, city: "Valencia" },
+  "MCY":   { lat: 10.2469, lng: -67.5958, city: "Maracay" },
+  "ATR":   { lat: 10.4874, lng: -66.8781, city: "Caracas (Atrium)" },
+  "INV":   { lat: 10.4750, lng: -66.9000, city: "Caracas (Inversiones)" },
+  "TDA-B": { lat:  9.9986, lng: -69.3223, city: "Barquisimeto (Tienda)" },
+  "GP1-B": { lat: 10.0100, lng: -69.3300, city: "Barquisimeto (Galpón 1)" },
+  "GP2-B": { lat: 10.0100, lng: -69.3300, city: "Barquisimeto (Galpón 2)" },
+  "EXH-C": { lat: 10.4806, lng: -66.9036, city: "Caracas (Exhib.)" },
+  "ALQ-B": { lat: 10.0100, lng: -69.3300, city: "Barquisimeto (Alquiler)" },
+};
+
 // GET /api/erp/warehouses — lista bodegas activas de Copikon C.A. desde Odoo
-app.get("/api/erp/warehouses", wrap(async (_req, res) => {
+app.get("/api/erp/warehouses", wrap(async (req, res) => {
   if (!odoo.isConfigured()) {
     return res.status(503).json({ ok: false, error: "Odoo no configurado" });
   }
@@ -911,12 +932,35 @@ app.get("/api/erp/warehouses", wrap(async (_req, res) => {
     const companyId = await getCopikonCompanyId();
     const domain = [["active", "=", true]];
     if (companyId) domain.push(["company_id", "=", companyId]);
-    const warehouses = await odoo.searchRead(
+    const raw = await odoo.searchRead(
       "stock.warehouse", domain,
       ["id", "name", "code", "lot_stock_id", "partner_id", "company_id"],
       { order: "sequence asc, name asc" }
     );
-    res.json({ ok: true, companyId, warehouses });
+    // Enriquecer con isPrimary + coords
+    const warehouses = raw.map(w => {
+      const code = w.code || "";
+      const coords = WAREHOUSE_COORDS[code] || null;
+      return {
+        ...w,
+        isPrimary: PRIMARY_WAREHOUSE_CODES.includes(code),
+        isCentral: code === CENTRAL_WAREHOUSE_CODE,
+        coords,
+      };
+    });
+    const primary = warehouses.filter(w => w.isPrimary);
+    // Ordenar primary segun el orden declarado
+    primary.sort((a, b) => PRIMARY_WAREHOUSE_CODES.indexOf(a.code) - PRIMARY_WAREHOUSE_CODES.indexOf(b.code));
+    const onlyPrimary = String(req.query.primary || "").toLowerCase() === "true";
+    res.json({
+      ok: true,
+      companyId,
+      totalCount: warehouses.length,
+      primaryCount: primary.length,
+      centralCode: CENTRAL_WAREHOUSE_CODE,
+      warehouses: onlyPrimary ? primary : warehouses,
+      primary,
+    });
   } catch (e) {
     console.error("[warehouses]", e);
     res.status(500).json({ ok: false, error: e.message });
@@ -1022,15 +1066,29 @@ app.post("/api/erp/stock-by-warehouse/sync", wrap(async (_req, res) => {
 
 // GET /api/erp/stock-by-warehouse — devuelve el cache
 // Query params:
-//   ?odooIds=1,2,3  filtra por odoo product ids
-//   ?full=1         incluye stockByProduct completo (default: incluye)
+//   ?odooIds=1,2,3      filtra por odoo product ids
+//   ?primary=true       solo bodegas principales en la respuesta
+//   ?suggest=true       agrega suggestion { origin, reason } por producto
 app.get("/api/erp/stock-by-warehouse", wrap(async (req, res) => {
   const r = await pool.query("SELECT value, updated_at FROM kv WHERE key = 'stockByWarehouse'");
   const payload = r.rows[0]?.value || null;
   if (!payload) {
-    return res.json({ ok: true, cached: false, warehouses: [], stockByProduct: {} });
+    return res.json({ ok: true, cached: false, warehouses: [], primary: [], stockByProduct: {} });
   }
   const filter = String(req.query.odooIds || "").trim();
+  const onlyPrimary = String(req.query.primary || "").toLowerCase() === "true";
+  const withSuggest = String(req.query.suggest || "").toLowerCase() === "true";
+
+  // Enriquecer bodegas del cache con isPrimary/isCentral por CODE
+  const allWhs = (payload.warehouses || []).map(w => ({
+    ...w,
+    isPrimary: PRIMARY_WAREHOUSE_CODES.includes(w.code || ""),
+    isCentral: (w.code || "") === CENTRAL_WAREHOUSE_CODE,
+  }));
+  const primary = allWhs.filter(w => w.isPrimary)
+    .sort((a, b) => PRIMARY_WAREHOUSE_CODES.indexOf(a.code) - PRIMARY_WAREHOUSE_CODES.indexOf(b.code));
+  const primaryIds = new Set(primary.map(w => w.id));
+
   let stockByProduct = payload.stockByProduct || {};
   if (filter) {
     const ids = new Set(filter.split(",").map(s => Number(s.trim())).filter(Boolean));
@@ -1038,13 +1096,69 @@ app.get("/api/erp/stock-by-warehouse", wrap(async (req, res) => {
       Object.entries(stockByProduct).filter(([k]) => ids.has(Number(k)))
     );
   }
+
+  // Si solo se piden bodegas primarias, filtrar también el stock por producto
+  if (onlyPrimary) {
+    stockByProduct = Object.fromEntries(
+      Object.entries(stockByProduct).map(([pid, byWh]) => [
+        pid,
+        Object.fromEntries(Object.entries(byWh).filter(([whId]) => primaryIds.has(Number(whId))))
+      ])
+    );
+  }
+
+  // Sugerencia de origen: Central > mayor stock (primary only)
+  let suggestions = null;
+  if (withSuggest) {
+    suggestions = {};
+    for (const [pid, byWh] of Object.entries(stockByProduct)) {
+      // 1. Buscar en central (CCS)
+      const central = primary.find(w => w.isCentral);
+      if (central && byWh[central.id] && Number(byWh[central.id].qty) > 0) {
+        suggestions[pid] = {
+          origin: "warehouse",
+          warehouseId: central.id,
+          warehouseCode: central.code,
+          warehouseName: central.name,
+          qty: Number(byWh[central.id].qty),
+          reason: "central",
+        };
+        continue;
+      }
+      // 2. Sucursal con mayor stock (entre primaries)
+      const primaryEntries = Object.entries(byWh)
+        .filter(([whId]) => primaryIds.has(Number(whId)))
+        .map(([whId, s]) => ({ whId: Number(whId), qty: Number(s.qty) || 0, name: s.warehouseName, code: s.warehouseCode }))
+        .filter(e => e.qty > 0)
+        .sort((a, b) => b.qty - a.qty);
+      if (primaryEntries.length) {
+        const top = primaryEntries[0];
+        suggestions[pid] = {
+          origin: "warehouse",
+          warehouseId: top.whId,
+          warehouseCode: top.code,
+          warehouseName: top.name,
+          qty: top.qty,
+          reason: "max-stock",
+        };
+        continue;
+      }
+      // 3. Sin stock → Compras
+      suggestions[pid] = { origin: "purchase", reason: "no-stock" };
+    }
+  }
+
   res.json({
     ok: true,
     cached: true,
     updatedAt: payload.updatedAt,
-    warehouses: payload.warehouses || [],
+    warehouses: onlyPrimary ? primary : allWhs,
+    primary,
+    centralCode: CENTRAL_WAREHOUSE_CODE,
+    primaryCodes: PRIMARY_WAREHOUSE_CODES,
     stockByProduct,
     productCount: Object.keys(stockByProduct).length,
+    suggestions,
   });
 }));
 
