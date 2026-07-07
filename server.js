@@ -760,7 +760,8 @@ app.post("/api/erp/products/sync-odoo", wrap(async (req, res) => {
   if (!odoo.isConfigured()) {
     return res.status(503).json({ ok: false, error: "Odoo no configurado" });
   }
-  const limit = Math.min(Number(req.body?.limit) || 5000, 10000);
+  // Tope 30k para seguridad; el catálogo real tiene ~19.622
+  const limit = Math.min(Number(req.body?.limit) || 25000, 30000);
   const includeImages = req.body?.includeImages !== false;
   try {
     const meta = await syncOdooCatalog({ limit, includeImages });
