@@ -2628,6 +2628,61 @@ app.get("/api/admin/finanzas/companies", wrap(async (_req, res) => {
   res.json({ companies: rows });
 }));
 
+// GET /api/admin/finanzas/debug-branch — descubrir la dimensión "rama" para Generators
+// Odoo puede modelar ramas como: branch_id, journal_id.name, analytic_account, tag_ids, o department.
+// Este endpoint sondea todas para dar visibilidad y elegir el filtro correcto.
+app.get("/api/admin/finanzas/debug-branch", wrap(async (_req, res) => {
+  const out = {};
+
+  // 1) branch_id nativo en account.move / account.move.line
+  try {
+    const fields = await odoo.execute("account.move", "fields_get", [], {
+      context: { lang: "es_VE" },
+    });
+    out.account_move_branch_fields = Object.keys(fields).filter(f =>
+      /branch|rama|division|segment/i.test(f)
+    ).map(k => ({ name: k, type: fields[k].type, string: fields[k].string, relation: fields[k].relation }));
+  } catch (e) { out.account_move_branch_error = String(e.message || e); }
+
+  // 2) Analytic accounts
+  try {
+    const analytics = await odoo.searchRead("account.analytic.account", [], ["id", "name", "code", "company_id"], { limit: 100, order: "name asc" });
+    out.analytic_accounts = analytics.map(a => ({ id: a.id, code: a.code, name: a.name, company: a.company_id?.[1] }));
+  } catch (e) { out.analytic_error = String(e.message || e); }
+
+  // 3) Analytic tags
+  try {
+    const tags = await odoo.searchRead("account.analytic.tag", [], ["id", "name"], { limit: 100, order: "name asc" });
+    out.analytic_tags = tags;
+  } catch (e) { out.analytic_tags_error = String(e.message || e); }
+
+  // 4) Journals (por si Generators tiene su propio diario)
+  try {
+    const journals = await odoo.searchRead("account.journal", [], ["id", "name", "code", "type", "company_id"], { limit: 200, order: "name asc" });
+    out.journals = journals.filter(j => /generat|gener|N-|rama|copikon/i.test(j.name || "")).map(j => ({ id: j.id, code: j.code, name: j.name, type: j.type, company: j.company_id?.[1] }));
+    out.journals_total = journals.length;
+  } catch (e) { out.journals_error = String(e.message || e); }
+
+  // 5) Departments (por si es dimensión HR)
+  try {
+    const depts = await odoo.searchRead("hr.department", [], ["id", "name", "parent_id"], { limit: 100 });
+    out.departments = depts.filter(d => /generat|N-|rama/i.test(d.name || ""));
+  } catch (e) { out.departments_error = String(e.message || e); }
+
+  // 6) Sample de una factura reciente para ver todos sus campos
+  try {
+    const recentMoves = await odoo.searchRead("account.move", [["move_type", "in", ["out_invoice", "in_invoice"]], ["state", "=", "posted"]], [], { limit: 1, order: "id desc" });
+    if (recentMoves.length) {
+      out.sample_move_all_fields = Object.keys(recentMoves[0]).sort();
+      out.sample_move_branch_related = Object.fromEntries(
+        Object.entries(recentMoves[0]).filter(([k]) => /branch|analytic|journal|department|division|rama|tag/i.test(k))
+      );
+    }
+  } catch (e) { out.sample_move_error = String(e.message || e); }
+
+  res.json(out);
+}));
+
 // GET /api/admin/finanzas/pnl — Estado de Resultados
 // Query params: company_id, date_from, date_to
 app.get("/api/admin/finanzas/pnl", wrap(async (req, res) => {
