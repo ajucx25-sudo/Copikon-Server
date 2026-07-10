@@ -3324,11 +3324,301 @@ app.get("/api/admin/finanzas/ar-ap", wrap(async (req, res) => {
   arAging.by_branch = buildBranchBreakdown(arAging);
   apAging.by_branch = buildBranchBreakdown(apAging);
 
+  // Enriquecer rows con promesas de pago activas (si existen)
+  try {
+    const promises = await readCol("paymentPromises");
+    const byMoveId = new Map();
+    for (const p of promises) {
+      if (!p.move_id || p.status === "cancelled" || p.status === "paid") continue;
+      byMoveId.set(String(p.move_id), p);
+    }
+    const attachPromise = (rows) => rows.map(r => {
+      const p = byMoveId.get(String(r.move_id));
+      if (p) return { ...r, promise: p };
+      return r;
+    });
+    arAging.rows = attachPromise(arAging.rows);
+    apAging.rows = attachPromise(apAging.rows);
+  } catch (e) {
+    console.warn("[ar-ap] no se pudieron cargar promesas:", e.message);
+  }
+
   res.json({
     filters: { company_ids: companyIds, as_of },
     ar: arAging,
     ap: apAging,
   });
+}));
+
+// ─── Promesas de pago (CxC/CxP manuales sobre facturas de Odoo) ───
+// Modelo: PaymentPromise
+//   id, kind: 'ar'|'ap', move_id, move_name, partner_id, partner_name,
+//   branch_id, branch_name, company_id, invoice_amount, currency,
+//   mode: 'single' | 'installments',
+//   promise_date?: 'YYYY-MM-DD',  // si mode='single'
+//   promise_amount?: number,       // si mode='single'
+//   installments?: [{ id, date: 'YYYY-MM-DD', amount, status: 'pending'|'paid'|'overdue', paid_at?, paid_amount? }],
+//   status: 'pending'|'partially_paid'|'paid'|'overdue'|'cancelled',
+//   notes?, created_by, created_at, updated_at
+
+function nowMs() { return Date.now(); }
+function newId() { return `pp_${nowMs()}_${Math.random().toString(36).slice(2,8)}`; }
+function todayIsoUtc() { return new Date().toISOString().slice(0, 10); }
+
+function computePromiseStatus(p, todayIso) {
+  if (p.status === "cancelled") return "cancelled";
+  const today = todayIso || todayIsoUtc();
+  if (p.mode === "installments" && Array.isArray(p.installments)) {
+    const inst = p.installments;
+    const allPaid = inst.every(x => x.status === "paid");
+    if (allPaid) return "paid";
+    const anyPaid = inst.some(x => x.status === "paid");
+    const anyOverdue = inst.some(x => x.status !== "paid" && x.date && x.date < today);
+    if (anyOverdue) return "overdue";
+    if (anyPaid) return "partially_paid";
+    return "pending";
+  }
+  if (p.status === "paid") return "paid";
+  if (p.promise_date && p.promise_date < today) return "overdue";
+  return "pending";
+}
+
+// GET /api/admin/finanzas/payment-promises — lista todas (o filtra por kind/company/branch)
+app.get("/api/admin/finanzas/payment-promises", wrap(async (req, res) => {
+  const promises = await readCol("paymentPromises");
+  const kind = req.query.kind ? String(req.query.kind) : null;
+  const branchId = req.query.branch_id ? String(req.query.branch_id) : null;
+  const status = req.query.status ? String(req.query.status) : null;
+  const today = todayIsoUtc();
+  const enriched = promises.map(p => ({ ...p, status: computePromiseStatus(p, today) }));
+  const filtered = enriched.filter(p => {
+    if (kind && p.kind !== kind) return false;
+    if (branchId && String(p.branch_id ?? "") !== branchId) return false;
+    if (status && p.status !== status) return false;
+    return true;
+  });
+  res.json({ ok: true, count: filtered.length, promises: filtered });
+}));
+
+// GET /api/admin/finanzas/payment-promises/alerts — devuelve promesas con alertas activas
+app.get("/api/admin/finanzas/payment-promises/alerts", wrap(async (req, res) => {
+  const promises = await readCol("paymentPromises");
+  const today = new Date();
+  const todayIso = today.toISOString().slice(0, 10);
+  const daysDiff = (dateIso) => {
+    if (!dateIso) return null;
+    const d = new Date(dateIso + "T00:00:00Z");
+    return Math.round((d.getTime() - today.getTime()) / 86400000);
+  };
+  const alerts = [];
+  for (const p of promises) {
+    if (p.status === "cancelled" || p.status === "paid") continue;
+    const currentStatus = computePromiseStatus(p, todayIso);
+    if (currentStatus === "paid") continue;
+    // Recopilar todas las "fechas de compromiso" activas
+    const dates = [];
+    if (p.mode === "installments" && Array.isArray(p.installments)) {
+      for (const i of p.installments) {
+        if (i.status !== "paid" && i.date) dates.push({ date: i.date, amount: i.amount, installment_id: i.id });
+      }
+    } else if (p.promise_date) {
+      dates.push({ date: p.promise_date, amount: p.promise_amount ?? p.invoice_amount, installment_id: null });
+    }
+    for (const d of dates) {
+      const diff = daysDiff(d.date);
+      let level = null;
+      if (diff === 3) level = "preview_3d";
+      else if (diff === 0) level = "due_today";
+      else if (diff === -1) level = "overdue_1d";
+      else if (diff <= -7) level = "escalate_ceo";
+      else if (diff < 0) level = "overdue";
+      if (level) alerts.push({ promise_id: p.id, kind: p.kind, partner_name: p.partner_name, branch_name: p.branch_name, move_name: p.move_name, promise_date: d.date, amount: d.amount, installment_id: d.installment_id, days_diff: diff, level });
+    }
+  }
+  res.json({ ok: true, alerts, today: todayIso });
+}));
+
+// POST /api/admin/finanzas/payment-promises — crear
+app.post("/api/admin/finanzas/payment-promises", wrap(async (req, res) => {
+  const b = req.body || {};
+  if (!b.move_id || !b.kind || (b.kind !== "ar" && b.kind !== "ap")) {
+    return res.status(400).json({ ok: false, error: "move_id y kind (ar|ap) requeridos" });
+  }
+  const mode = b.mode === "installments" ? "installments" : "single";
+  if (mode === "single" && (!b.promise_date || !b.promise_amount)) {
+    return res.status(400).json({ ok: false, error: "promise_date y promise_amount requeridos para modo simple" });
+  }
+  if (mode === "installments" && (!Array.isArray(b.installments) || b.installments.length === 0)) {
+    return res.status(400).json({ ok: false, error: "installments[] requerido para modo cuotas" });
+  }
+  const promises = await readCol("paymentPromises");
+  // Si ya existe una activa para el mismo move_id, error
+  const existing = promises.find(p => String(p.move_id) === String(b.move_id) && p.status !== "cancelled" && p.status !== "paid");
+  if (existing) {
+    return res.status(409).json({ ok: false, error: "Ya existe una promesa activa para esta factura", existing_id: existing.id });
+  }
+  const now = nowMs();
+  const promise = {
+    id: newId(),
+    kind: b.kind,
+    move_id: b.move_id,
+    move_name: b.move_name || null,
+    partner_id: b.partner_id || null,
+    partner_name: b.partner_name || null,
+    branch_id: b.branch_id ?? null,
+    branch_name: b.branch_name || null,
+    company_id: b.company_id ?? null,
+    invoice_amount: Number(b.invoice_amount) || 0,
+    currency: b.currency || "USD",
+    mode,
+    promise_date: mode === "single" ? b.promise_date : null,
+    promise_amount: mode === "single" ? Number(b.promise_amount) : null,
+    installments: mode === "installments"
+      ? b.installments.map((i, idx) => ({
+          id: `i_${now}_${idx}`,
+          date: i.date,
+          amount: Number(i.amount) || 0,
+          status: "pending",
+        }))
+      : null,
+    status: "pending",
+    notes: b.notes || null,
+    created_by: b.created_by || null,
+    created_at: now,
+    updated_at: now,
+  };
+  promises.push(promise);
+  await writeCol("paymentPromises", promises);
+  res.json({ ok: true, promise });
+}));
+
+// PATCH /api/admin/finanzas/payment-promises/:id — actualizar (marcar pagada, cambiar fechas, cancelar)
+app.patch("/api/admin/finanzas/payment-promises/:id", wrap(async (req, res) => {
+  const id = req.params.id;
+  const promises = await readCol("paymentPromises");
+  const idx = promises.findIndex(p => p.id === id);
+  if (idx < 0) return res.status(404).json({ ok: false, error: "promesa no encontrada" });
+  const b = req.body || {};
+  const p = { ...promises[idx] };
+  if (b.status && ["pending","partially_paid","paid","cancelled"].includes(b.status)) p.status = b.status;
+  if (b.promise_date !== undefined) p.promise_date = b.promise_date;
+  if (b.promise_amount !== undefined) p.promise_amount = Number(b.promise_amount);
+  if (b.notes !== undefined) p.notes = b.notes;
+  if (b.mark_installment_paid) {
+    const iid = b.mark_installment_paid.installment_id;
+    if (Array.isArray(p.installments)) {
+      p.installments = p.installments.map(i => i.id === iid ? { ...i, status: "paid", paid_at: nowMs(), paid_amount: Number(b.mark_installment_paid.amount) || i.amount } : i);
+    }
+  }
+  if (b.mark_paid) {
+    p.status = "paid";
+    if (Array.isArray(p.installments)) p.installments = p.installments.map(i => ({ ...i, status: "paid", paid_at: i.paid_at || nowMs(), paid_amount: i.paid_amount || i.amount }));
+  }
+  p.updated_at = nowMs();
+  p.status = computePromiseStatus(p, todayIsoUtc());
+  promises[idx] = p;
+  await writeCol("paymentPromises", promises);
+  res.json({ ok: true, promise: p });
+}));
+
+// DELETE /api/admin/finanzas/payment-promises/:id
+app.delete("/api/admin/finanzas/payment-promises/:id", wrap(async (req, res) => {
+  const id = req.params.id;
+  const promises = await readCol("paymentPromises");
+  const filtered = promises.filter(p => p.id !== id);
+  if (filtered.length === promises.length) return res.status(404).json({ ok: false, error: "promesa no encontrada" });
+  await writeCol("paymentPromises", filtered);
+  res.json({ ok: true });
+}));
+
+// POST /api/admin/finanzas/payment-promises/scan-alerts — genera notificaciones in-app (llamado por cron)
+app.post("/api/admin/finanzas/payment-promises/scan-alerts", wrap(async (req, res) => {
+  const promises = await readCol("paymentPromises");
+  const today = new Date();
+  const todayIso = today.toISOString().slice(0, 10);
+  const daysDiff = (dateIso) => {
+    const d = new Date(dateIso + "T00:00:00Z");
+    return Math.round((d.getTime() - today.getTime()) / 86400000);
+  };
+  // Cargar usuarios para saber quién es CEO y quién Coordinador Admin
+  const users = await readCol("users");
+  const recipients = users.filter(u => {
+    const lvl = (u.level || "").toLowerCase();
+    const role = (u.role || u.cargo || "").toLowerCase();
+    if (lvl === "ceo") return true;
+    if (/coordinador.*administr|administraci.*coord|jefe.*administr/i.test(role)) return true;
+    return false;
+  }).map(u => u.username || u.email).filter(Boolean);
+  // Fallback: siempre incluir admin
+  if (!recipients.includes("admin")) recipients.push("admin");
+
+  const notifications = await readCol("notifications");
+  let created = 0;
+  const nowT = nowMs();
+
+  const emit = (p, dateInfo, level) => {
+    const kindLabel = p.kind === "ar" ? "Cobranza" : "Pago a proveedor";
+    const branchLabel = p.branch_name ? ` · ${p.branch_name}` : "";
+    const amountStr = new Intl.NumberFormat("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(dateInfo.amount);
+    let title, urgency;
+    switch (level) {
+      case "preview_3d":
+        title = `${kindLabel}: ${p.partner_name} vence en 3 días ($${amountStr})${branchLabel}`;
+        urgency = "info";
+        break;
+      case "due_today":
+        title = `${kindLabel}: ${p.partner_name} vence HOY ($${amountStr})${branchLabel}`;
+        urgency = "warning";
+        break;
+      case "overdue_1d":
+        title = `${kindLabel} VENCIDA 1 día: ${p.partner_name} ($${amountStr})${branchLabel}`;
+        urgency = "warning";
+        break;
+      case "escalate_ceo":
+        title = `⚠️ ESCALAMIENTO CEO: ${kindLabel} vencida +7 días: ${p.partner_name} ($${amountStr})${branchLabel}`;
+        urgency = "critical";
+        break;
+    }
+    const dedupeKey = `promise:${p.id}:${dateInfo.installment_id || "single"}:${level}:${todayIso}`;
+    if (notifications.some(n => n.dedupe_key === dedupeKey)) return;
+    for (const r of recipients) {
+      notifications.push({
+        id: `n_${nowT}_${Math.random().toString(36).slice(2,7)}`,
+        recipient: r,
+        title,
+        body: p.notes ? `Nota: ${p.notes}` : `Factura ${p.move_name || ""}`,
+        url: "/administracion?tab=cobranza-pagos",
+        urgency,
+        module: "administracion",
+        dedupe_key: dedupeKey,
+        read: false,
+        created_at: nowT,
+      });
+      created++;
+    }
+  };
+
+  for (const p of promises) {
+    if (p.status === "cancelled" || p.status === "paid") continue;
+    const dates = [];
+    if (p.mode === "installments" && Array.isArray(p.installments)) {
+      for (const i of p.installments) {
+        if (i.status !== "paid" && i.date) dates.push({ date: i.date, amount: i.amount, installment_id: i.id });
+      }
+    } else if (p.promise_date) {
+      dates.push({ date: p.promise_date, amount: p.promise_amount ?? p.invoice_amount, installment_id: null });
+    }
+    for (const d of dates) {
+      const diff = daysDiff(d.date);
+      if (diff === 3) emit(p, d, "preview_3d");
+      else if (diff === 0) emit(p, d, "due_today");
+      else if (diff === -1) emit(p, d, "overdue_1d");
+      else if (diff <= -7) emit(p, d, "escalate_ceo");
+    }
+  }
+
+  await writeCol("notifications", notifications);
+  res.json({ ok: true, notifications_created: created, recipients, promises_scanned: promises.length });
 }));
 
 // GET /api/admin/finanzas/ar-ap/diag/aged-html — Devuelve el HTML crudo del reporte Aged
