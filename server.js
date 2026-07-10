@@ -2910,6 +2910,7 @@ app.get("/api/admin/finanzas/ar-ap", wrap(async (req, res) => {
     "debit", "credit", "balance", "amount_residual", "amount_residual_currency",
     "currency_id", "company_id", "company_currency_id",
     "date", "date_maturity", "name", "ref",
+    "branch_id",
   ];
 
   const [arLines, apLines] = await Promise.all([
@@ -2927,12 +2928,12 @@ app.get("/api/admin/finanzas/ar-ap", wrap(async (req, res) => {
     ),
   ]);
 
-  // Enriquecer con move_type y payment_state en un solo call
+  // Enriquecer con move_type, payment_state y branch en un solo call
   const allMoveIds = Array.from(new Set([...arLines, ...apLines].map(l => l.move_id?.[0]).filter(Boolean)));
   const moveInfoArr = allMoveIds.length ? await odoo.searchRead(
     "account.move",
     [["id", "in", allMoveIds]],
-    ["id", "move_type", "payment_state", "invoice_date", "invoice_date_due", "name", "amount_total_signed", "currency_id"],
+    ["id", "move_type", "payment_state", "invoice_date", "invoice_date_due", "name", "amount_total_signed", "currency_id", "branch_id"],
     { context: ctx, limit: allMoveIds.length }
   ) : [];
   const moveInfo = new Map(moveInfoArr.map(m => [m.id, m]));
@@ -2991,6 +2992,8 @@ app.get("/api/admin/finanzas/ar-ap", wrap(async (req, res) => {
           date: l.date,
           move_type: moveType,
           reference: l.ref || l.name,
+          branch_id: (mi.branch_id?.[0]) || (l.branch_id?.[0]) || null,
+          branch_name: (mi.branch_id?.[1]) || (l.branch_id?.[1]) || null,
         });
       } else {
         // Deuda normal — aging por fecha de vencimiento
@@ -3026,6 +3029,8 @@ app.get("/api/admin/finanzas/ar-ap", wrap(async (req, res) => {
           amount_residual_original: l.amount_residual_currency || null,
           move_type: moveType,
           payment_state: paymentState,
+          branch_id: (mi.branch_id?.[0]) || (l.branch_id?.[0]) || null,
+          branch_name: (mi.branch_id?.[1]) || (l.branch_id?.[1]) || null,
         });
       }
     }
@@ -3273,6 +3278,46 @@ app.get("/api/admin/finanzas/ar-ap", wrap(async (req, res) => {
     apAging.anticipos_netos_sobrantes = odooReport.ap.anticipos_netos_sobrantes || 0;
     apAging.gl_balance = odooReport.ap.total;
   }
+
+  // ── Breakdown por rama (branch_id) ──
+  // Agrupamos los rows y advance_rows de AR/AP por branch_id para dar visibilidad
+  // consolidada + drill por rama en el frontend.
+  function buildBranchBreakdown(aging) {
+    const map = new Map();
+    const getBucket = (branchId, branchName) => {
+      const key = branchId ?? "__none__";
+      if (!map.has(key)) {
+        map.set(key, {
+          branch_id: branchId,
+          branch_name: branchName || (branchId ? `Rama ${branchId}` : "Sin rama"),
+          total: 0,
+          count: 0,
+          buckets: { current: 0, d1_30: 0, d31_60: 0, d61_90: 0, d90plus: 0 },
+          advances: 0,
+          advance_count: 0,
+        });
+      }
+      return map.get(key);
+    };
+    for (const r of aging.rows || []) {
+      const b = getBucket(r.branch_id, r.branch_name);
+      b.total += r.amount_residual || 0;
+      b.count += 1;
+      if (r.bucket && b.buckets[r.bucket] !== undefined) {
+        b.buckets[r.bucket] += r.amount_residual || 0;
+      }
+    }
+    for (const a of aging.advance_rows || []) {
+      // advance_rows no tienen branch en las lineas (se obtiene del move) — el enrich lo cubre
+      const b = getBucket(a.branch_id, a.branch_name);
+      b.advances += a.amount || 0;
+      b.advance_count += 1;
+    }
+    return Array.from(map.values()).sort((x, y) => Math.abs(y.total) - Math.abs(x.total));
+  }
+
+  arAging.by_branch = buildBranchBreakdown(arAging);
+  apAging.by_branch = buildBranchBreakdown(apAging);
 
   res.json({
     filters: { company_ids: companyIds, as_of },
