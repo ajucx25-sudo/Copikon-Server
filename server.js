@@ -2592,6 +2592,11 @@ app.post("/api/notifications/read-all", wrap(async (req, res) => {
 function parseCompanyIds(q) {
   const raw = q.company_id;
   if (!raw || raw === "0" || raw === "all" || raw === "consolidado") return null; // null = todas
+  // Acepta CSV: "1,12" → [1, 12]
+  if (typeof raw === "string" && raw.includes(",")) {
+    const ids = raw.split(",").map(s => parseInt(s.trim(), 10)).filter(n => Number.isFinite(n) && n > 0);
+    return ids.length ? ids : null;
+  }
   const id = parseInt(raw, 10);
   return Number.isFinite(id) && id > 0 ? [id] : null;
 }
