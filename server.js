@@ -2669,16 +2669,39 @@ app.get("/api/admin/finanzas/debug-branch", wrap(async (_req, res) => {
     out.departments = depts.filter(d => /generat|N-|rama/i.test(d.name || ""));
   } catch (e) { out.departments_error = String(e.message || e); }
 
-  // 6) Sample de una factura reciente para ver todos sus campos
+  // 6) Sample de una factura reciente con campos branch explícitos
   try {
-    const recentMoves = await odoo.searchRead("account.move", [["move_type", "in", ["out_invoice", "in_invoice"]], ["state", "=", "posted"]], [], { limit: 1, order: "id desc" });
-    if (recentMoves.length) {
-      out.sample_move_all_fields = Object.keys(recentMoves[0]).sort();
-      out.sample_move_branch_related = Object.fromEntries(
-        Object.entries(recentMoves[0]).filter(([k]) => /branch|analytic|journal|department|division|rama|tag/i.test(k))
-      );
-    }
+    const recentMoves = await odoo.searchRead(
+      "account.move",
+      [["move_type", "in", ["out_invoice", "in_invoice"]], ["state", "=", "posted"]],
+      ["id", "name", "branch_id", "branch_name", "journal_id", "company_id", "move_type"],
+      { limit: 3, order: "id desc" }
+    );
+    out.sample_moves = recentMoves;
   } catch (e) { out.sample_move_error = String(e.message || e); }
+
+  // 7) Listado de todas las ramas res.branch
+  try {
+    const branches = await odoo.searchRead("res.branch", [], ["id", "name", "company_id"], { limit: 100, order: "name asc" });
+    out.branches = branches;
+  } catch (e) { out.branches_error = String(e.message || e); }
+
+  // 8) Distribución de facturas abiertas por rama
+  try {
+    const grouped = await odoo.readGroup(
+      "account.move",
+      [["move_type", "in", ["out_invoice", "in_invoice"]], ["state", "=", "posted"], ["payment_state", "in", ["not_paid", "partial"]]],
+      ["branch_id", "branch_name", "move_type"],
+      ["branch_id", "move_type"],
+      { context: { lang: "es_VE" }, lazy: false }
+    );
+    out.branch_distribution = grouped.map(g => ({
+      branch_id: g.branch_id?.[0] || null,
+      branch_name: g.branch_id?.[1] || "(sin rama)",
+      move_type: g.move_type,
+      count: g.__count,
+    }));
+  } catch (e) { out.branch_distribution_error = String(e.message || e); }
 
   res.json(out);
 }));
