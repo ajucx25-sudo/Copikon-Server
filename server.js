@@ -5274,6 +5274,612 @@ app.post("/api/admin/tesoreria/automatch/export-odoo", wrap(async (req, res) => 
 }));
 
 
+// ============================================================================
+// v56 · FLOTA DELIVERY/TAXI (Aliados + Tabulador + Traslados + GPS + Facturación)
+// ============================================================================
+
+// Helper: token seguro para portal aliado
+function genPortalToken() {
+  return require("crypto").randomBytes(16).toString("hex");
+}
+
+// Semana ISO helpers (lunes-domingo)
+function getWeekStart(dateStr) {
+  const d = new Date(dateStr + "T00:00:00Z");
+  const day = d.getUTCDay(); // 0 dom, 1 lun
+  const diff = day === 0 ? -6 : 1 - day;
+  d.setUTCDate(d.getUTCDate() + diff);
+  return d.toISOString().slice(0, 10);
+}
+function getWeekEnd(dateStr) {
+  const start = new Date(getWeekStart(dateStr) + "T00:00:00Z");
+  start.setUTCDate(start.getUTCDate() + 6);
+  return start.toISOString().slice(0, 10);
+}
+
+// ── PATCH /api/logistica/carriers/:id — extender con RIF/cédula/portal-token ──
+app.patch("/api/logistica/carriers/:id", wrap(async (req, res) => {
+  const id = Number(req.params.id);
+  const b = req.body || {};
+  const carriers = await readCol("logisticaCarriers");
+  const idx = carriers.findIndex(c => c.id === id);
+  if (idx < 0) return res.status(404).json({ ok: false, error: "aliado no encontrado" });
+  const cur = carriers[idx];
+  const upd = { ...cur };
+  for (const k of ["name", "type", "group", "notes", "rating", "coverage", "contactName", "phone", "email", "rif", "cedula", "legal_name", "address", "bank_info", "is_active"]) {
+    if (b[k] !== undefined) upd[k] = b[k];
+  }
+  if (b.generate_portal_token && !upd.portal_token) upd.portal_token = genPortalToken();
+  if (b.revoke_portal_token) upd.portal_token = null;
+  upd.updated_at = Date.now();
+  carriers[idx] = upd;
+  await writeCol("logisticaCarriers", carriers);
+  res.json({ ok: true, carrier: upd });
+}));
+
+// ── POST /api/logistica/carriers — crear aliado con RIF/cédula ──
+app.post("/api/logistica/carriers", wrap(async (req, res) => {
+  const b = req.body || {};
+  if (!b.name || !String(b.name).trim()) return res.status(400).json({ ok: false, error: "name requerido" });
+  const carriers = await readCol("logisticaCarriers");
+  const nuevo = {
+    id: Date.now(),
+    name: String(b.name).trim(),
+    type: b.type || "delivery",
+    group: b.group || b.type || "delivery",
+    notes: b.notes || "",
+    rating: Number(b.rating || 0),
+    coverage: b.coverage || "",
+    contactName: b.contactName || "",
+    phone: b.phone || "",
+    email: b.email || "",
+    rif: b.rif || "",
+    cedula: b.cedula || "",
+    legal_name: b.legal_name || b.name,
+    address: b.address || "",
+    bank_info: b.bank_info || "",
+    is_active: b.is_active !== false,
+    portal_token: b.generate_portal_token ? genPortalToken() : null,
+    created_at: Date.now(),
+    updated_at: Date.now(),
+  };
+  carriers.push(nuevo);
+  await writeCol("logisticaCarriers", carriers);
+  res.json({ ok: true, carrier: nuevo });
+}));
+
+// ── DELETE /api/logistica/carriers/:id ──
+app.delete("/api/logistica/carriers/:id", wrap(async (req, res) => {
+  const id = Number(req.params.id);
+  const carriers = await readCol("logisticaCarriers");
+  const filtered = carriers.filter(c => c.id !== id);
+  await writeCol("logisticaCarriers", filtered);
+  res.json({ ok: true });
+}));
+
+// ── TABULADOR: rutas fijas ──
+// GET /api/logistica/tarifario/routes ── lista de rutas tabuladas globales o por aliado
+app.get("/api/logistica/tarifario/routes", wrap(async (_req, res) => {
+  const routes = await readCol("logisticaTarifarioRoutes");
+  res.json({ ok: true, routes });
+}));
+app.post("/api/logistica/tarifario/routes", wrap(async (req, res) => {
+  const b = req.body || {};
+  if (!b.origin || !b.destination || b.price == null) return res.status(400).json({ ok: false, error: "origin, destination, price requeridos" });
+  const routes = await readCol("logisticaTarifarioRoutes");
+  const nuevo = {
+    id: Date.now(),
+    carrier_id: b.carrier_id || null, // null = tarifa global
+    origin: String(b.origin).trim(),
+    destination: String(b.destination).trim(),
+    price: Number(b.price),
+    currency: b.currency || "USD",
+    est_km: Number(b.est_km || 0),
+    notes: b.notes || "",
+    is_active: b.is_active !== false,
+    created_at: Date.now(),
+  };
+  routes.push(nuevo);
+  await writeCol("logisticaTarifarioRoutes", routes);
+  res.json({ ok: true, route: nuevo });
+}));
+app.patch("/api/logistica/tarifario/routes/:id", wrap(async (req, res) => {
+  const id = Number(req.params.id);
+  const b = req.body || {};
+  const routes = await readCol("logisticaTarifarioRoutes");
+  const idx = routes.findIndex(r => r.id === id);
+  if (idx < 0) return res.status(404).json({ ok: false, error: "ruta no encontrada" });
+  routes[idx] = { ...routes[idx], ...b, id, updated_at: Date.now() };
+  await writeCol("logisticaTarifarioRoutes", routes);
+  res.json({ ok: true, route: routes[idx] });
+}));
+app.delete("/api/logistica/tarifario/routes/:id", wrap(async (req, res) => {
+  const routes = await readCol("logisticaTarifarioRoutes");
+  await writeCol("logisticaTarifarioRoutes", routes.filter(r => r.id !== Number(req.params.id)));
+  res.json({ ok: true });
+}));
+
+// ── TABULADOR: rangos km ──
+app.get("/api/logistica/tarifario/km-ranges", wrap(async (_req, res) => {
+  const ranges = await readCol("logisticaTarifarioKmRanges");
+  res.json({ ok: true, ranges });
+}));
+app.post("/api/logistica/tarifario/km-ranges", wrap(async (req, res) => {
+  const b = req.body || {};
+  if (b.min_km == null || b.max_km == null || b.price == null) return res.status(400).json({ ok: false, error: "min_km, max_km, price requeridos" });
+  const ranges = await readCol("logisticaTarifarioKmRanges");
+  const nuevo = {
+    id: Date.now(),
+    carrier_id: b.carrier_id || null,
+    min_km: Number(b.min_km),
+    max_km: Number(b.max_km),
+    price: Number(b.price),
+    currency: b.currency || "USD",
+    notes: b.notes || "",
+    is_active: b.is_active !== false,
+    created_at: Date.now(),
+  };
+  ranges.push(nuevo);
+  await writeCol("logisticaTarifarioKmRanges", ranges);
+  res.json({ ok: true, range: nuevo });
+}));
+app.patch("/api/logistica/tarifario/km-ranges/:id", wrap(async (req, res) => {
+  const id = Number(req.params.id);
+  const b = req.body || {};
+  const ranges = await readCol("logisticaTarifarioKmRanges");
+  const idx = ranges.findIndex(r => r.id === id);
+  if (idx < 0) return res.status(404).json({ ok: false, error: "rango no encontrado" });
+  ranges[idx] = { ...ranges[idx], ...b, id, updated_at: Date.now() };
+  await writeCol("logisticaTarifarioKmRanges", ranges);
+  res.json({ ok: true, range: ranges[idx] });
+}));
+app.delete("/api/logistica/tarifario/km-ranges/:id", wrap(async (req, res) => {
+  const ranges = await readCol("logisticaTarifarioKmRanges");
+  await writeCol("logisticaTarifarioKmRanges", ranges.filter(r => r.id !== Number(req.params.id)));
+  res.json({ ok: true });
+}));
+
+// ── TRASLADOS: CRUD ──
+// GET /api/logistica/traslados?carrier_id=&week_start=&status=
+app.get("/api/logistica/traslados", wrap(async (req, res) => {
+  const traslados = await readCol("logisticaTraslados");
+  const carrier_id = req.query.carrier_id ? Number(req.query.carrier_id) : null;
+  const week_start = req.query.week_start || null;
+  const status = req.query.status || null;
+  const filtered = traslados.filter(t => {
+    if (carrier_id && t.carrier_id !== carrier_id) return false;
+    if (week_start && t.week_start !== week_start) return false;
+    if (status && t.status !== status) return false;
+    return true;
+  }).sort((a, b) => (b.date || "").localeCompare(a.date || "") || (b.created_at - a.created_at));
+  res.json({ ok: true, count: filtered.length, traslados: filtered });
+}));
+
+app.post("/api/logistica/traslados", wrap(async (req, res) => {
+  const b = req.body || {};
+  if (!b.carrier_id || !b.date) return res.status(400).json({ ok: false, error: "carrier_id, date requeridos" });
+  const carriers = await readCol("logisticaCarriers");
+  const carrier = carriers.find(c => c.id === Number(b.carrier_id));
+  if (!carrier) return res.status(404).json({ ok: false, error: "aliado no encontrado" });
+
+  // Calcular monto según tipo de tarifa
+  let amount = Number(b.amount || 0);
+  let priceSource = b.price_source || "manual";
+  if (b.route_id) {
+    const routes = await readCol("logisticaTarifarioRoutes");
+    const r = routes.find(x => x.id === Number(b.route_id));
+    if (r) { amount = Number(r.price); priceSource = "route"; }
+  } else if (b.km != null && !b.amount) {
+    const ranges = await readCol("logisticaTarifarioKmRanges");
+    const km = Number(b.km);
+    const range = ranges.filter(x => (!x.carrier_id || x.carrier_id === Number(b.carrier_id)) && x.is_active !== false)
+                        .find(x => km >= Number(x.min_km) && km <= Number(x.max_km));
+    if (range) { amount = Number(range.price); priceSource = "km_range"; }
+  }
+
+  const nuevo = {
+    id: Date.now(),
+    carrier_id: Number(b.carrier_id),
+    carrier_name: carrier.name,
+    date: b.date,
+    week_start: getWeekStart(b.date),
+    week_end: getWeekEnd(b.date),
+    origin: b.origin || "",
+    destination: b.destination || "",
+    route_id: b.route_id ? Number(b.route_id) : null,
+    km: b.km != null ? Number(b.km) : null,
+    amount,
+    currency: b.currency || "USD",
+    price_source: priceSource,
+    notes: b.notes || "",
+    reference: b.reference || "",
+    status: "pending", // pending | in_progress | completed | signed_by_ally | approved | invoiced
+    gps_start: null,
+    gps_end: null,
+    started_at: null,
+    completed_at: null,
+    signed_by_ally_at: null,
+    approved_by_coordinator_at: null,
+    approved_by_user: null,
+    assigned_by: b.assigned_by || null, // null si el aliado lo cargó, o el nombre de coordinador si Copikon lo asignó
+    created_at: Date.now(),
+    updated_at: Date.now(),
+  };
+  const traslados = await readCol("logisticaTraslados");
+  traslados.push(nuevo);
+  await writeCol("logisticaTraslados", traslados);
+  res.json({ ok: true, traslado: nuevo });
+}));
+
+app.patch("/api/logistica/traslados/:id", wrap(async (req, res) => {
+  const id = Number(req.params.id);
+  const b = req.body || {};
+  const traslados = await readCol("logisticaTraslados");
+  const idx = traslados.findIndex(t => t.id === id);
+  if (idx < 0) return res.status(404).json({ ok: false, error: "traslado no encontrado" });
+  const cur = traslados[idx];
+
+  // Acciones especiales
+  if (b.action === "start_gps") {
+    cur.gps_start = { lat: Number(b.lat), lng: Number(b.lng), accuracy: b.accuracy || null, at: Date.now() };
+    cur.started_at = Date.now();
+    if (cur.status === "pending") cur.status = "in_progress";
+  } else if (b.action === "end_gps") {
+    cur.gps_end = { lat: Number(b.lat), lng: Number(b.lng), accuracy: b.accuracy || null, at: Date.now() };
+    cur.completed_at = Date.now();
+    cur.status = "completed";
+  } else if (b.action === "sign_ally") {
+    cur.signed_by_ally_at = Date.now();
+    cur.status = "signed_by_ally";
+  } else if (b.action === "approve") {
+    cur.approved_by_coordinator_at = Date.now();
+    cur.approved_by_user = b.user || null;
+    cur.status = "approved";
+  } else {
+    // Edición normal de campos
+    for (const k of ["date", "origin", "destination", "route_id", "km", "amount", "currency", "notes", "reference", "status"]) {
+      if (b[k] !== undefined) cur[k] = b[k];
+    }
+    if (b.date) { cur.week_start = getWeekStart(b.date); cur.week_end = getWeekEnd(b.date); }
+  }
+  cur.updated_at = Date.now();
+  traslados[idx] = cur;
+  await writeCol("logisticaTraslados", traslados);
+  res.json({ ok: true, traslado: cur });
+}));
+
+app.delete("/api/logistica/traslados/:id", wrap(async (req, res) => {
+  const traslados = await readCol("logisticaTraslados");
+  await writeCol("logisticaTraslados", traslados.filter(t => t.id !== Number(req.params.id)));
+  res.json({ ok: true });
+}));
+
+// ── RELACIÓN SEMANAL: cierre y aprobación ──
+// GET /api/logistica/relacion-semanal?carrier_id=&week_start=
+app.get("/api/logistica/relacion-semanal", wrap(async (req, res) => {
+  const carrier_id = Number(req.query.carrier_id);
+  const week_start = req.query.week_start;
+  if (!carrier_id || !week_start) return res.status(400).json({ ok: false, error: "carrier_id y week_start requeridos" });
+  const carriers = await readCol("logisticaCarriers");
+  const carrier = carriers.find(c => c.id === carrier_id);
+  const traslados = await readCol("logisticaTraslados");
+  const items = traslados.filter(t => t.carrier_id === carrier_id && t.week_start === week_start);
+  const total = items.reduce((s, t) => s + Number(t.amount || 0), 0);
+  const count = items.length;
+  const signedCount = items.filter(t => ["signed_by_ally", "approved", "invoiced"].includes(t.status)).length;
+  const approvedCount = items.filter(t => ["approved", "invoiced"].includes(t.status)).length;
+  const relaciones = await readCol("logisticaRelacionesSemanales");
+  const relacion = relaciones.find(r => r.carrier_id === carrier_id && r.week_start === week_start) || null;
+  res.json({ ok: true, carrier, week_start, week_end: getWeekEnd(week_start), items, count, total, signedCount, approvedCount, relacion });
+}));
+
+// POST /api/logistica/relacion-semanal/sign — aliado firma
+app.post("/api/logistica/relacion-semanal/sign", wrap(async (req, res) => {
+  const { carrier_id, week_start, signed_by } = req.body || {};
+  if (!carrier_id || !week_start) return res.status(400).json({ ok: false, error: "carrier_id y week_start requeridos" });
+  const relaciones = await readCol("logisticaRelacionesSemanales");
+  let idx = relaciones.findIndex(r => r.carrier_id === Number(carrier_id) && r.week_start === week_start);
+  const carriers = await readCol("logisticaCarriers");
+  const carrier = carriers.find(c => c.id === Number(carrier_id));
+  const traslados = await readCol("logisticaTraslados");
+  const items = traslados.filter(t => t.carrier_id === Number(carrier_id) && t.week_start === week_start);
+  const total = items.reduce((s, t) => s + Number(t.amount || 0), 0);
+  const rel = {
+    id: idx >= 0 ? relaciones[idx].id : Date.now(),
+    carrier_id: Number(carrier_id),
+    carrier_name: carrier?.name || "",
+    week_start,
+    week_end: getWeekEnd(week_start),
+    status: "signed_by_ally",
+    total_amount: total,
+    total_count: items.length,
+    signed_by_ally_at: Date.now(),
+    signed_by_ally_name: signed_by || carrier?.contactName || "",
+    approved_by_coordinator_at: null,
+    approved_by_user: null,
+    invoiced_at: null,
+    invoice_id: null,
+    updated_at: Date.now(),
+  };
+  // Marcar los traslados como firmados por aliado
+  for (const t of items) { if (t.status === "completed" || t.status === "pending" || t.status === "in_progress") t.status = "signed_by_ally"; t.signed_by_ally_at = Date.now(); }
+  await writeCol("logisticaTraslados", traslados);
+  if (idx >= 0) relaciones[idx] = rel; else relaciones.push(rel);
+  await writeCol("logisticaRelacionesSemanales", relaciones);
+
+  // Notificar al coordinador logística + CEO
+  try {
+    const employees = await readCol("employees");
+    const notifTargets = employees.filter(e => e.level === "ceo" || e.role === "coord_logistica" || e.role === "coordinador_logistica").map(e => e.id);
+    for (const uid of notifTargets) {
+      await pushNotification({ userId: uid, title: `Relación semanal firmada por aliado`, message: `${carrier?.name}: ${items.length} traslados, total ${total.toFixed(2)} USD (semana ${week_start})`, type: "info", link: `/cpk-logistica?tab=flota-delivery&carrier=${carrier_id}&week=${week_start}` });
+    }
+  } catch (e) { console.error("notif sign", e); }
+  res.json({ ok: true, relacion: rel });
+}));
+
+// POST /api/logistica/relacion-semanal/approve — coordinador aprueba y envía a admin
+app.post("/api/logistica/relacion-semanal/approve", wrap(async (req, res) => {
+  const { carrier_id, week_start, approved_by } = req.body || {};
+  if (!carrier_id || !week_start) return res.status(400).json({ ok: false, error: "carrier_id y week_start requeridos" });
+  const relaciones = await readCol("logisticaRelacionesSemanales");
+  const idx = relaciones.findIndex(r => r.carrier_id === Number(carrier_id) && r.week_start === week_start);
+  if (idx < 0) return res.status(404).json({ ok: false, error: "relación no existe — el aliado debe firmar primero" });
+  const rel = relaciones[idx];
+  if (rel.status === "invoiced") return res.status(400).json({ ok: false, error: "ya facturada" });
+
+  rel.status = "approved";
+  rel.approved_by_coordinator_at = Date.now();
+  rel.approved_by_user = approved_by || null;
+
+  const traslados = await readCol("logisticaTraslados");
+  const items = traslados.filter(t => t.carrier_id === Number(carrier_id) && t.week_start === week_start);
+  for (const t of items) { if (t.status !== "invoiced") { t.status = "approved"; t.approved_by_coordinator_at = Date.now(); t.approved_by_user = approved_by; } }
+  await writeCol("logisticaTraslados", traslados);
+
+  // Generar gasto en administración (CxP interno) — lo guardo como bill borrador
+  const carriers = await readCol("logisticaCarriers");
+  const carrier = carriers.find(c => c.id === Number(carrier_id));
+  const bills = await readCol("logisticaBills");
+  const bill = {
+    id: Date.now(),
+    kind: "ap",
+    source: "flota-delivery",
+    carrier_id: Number(carrier_id),
+    carrier_name: carrier?.name || "",
+    rif: carrier?.rif || "",
+    cedula: carrier?.cedula || "",
+    legal_name: carrier?.legal_name || carrier?.name || "",
+    week_start: rel.week_start,
+    week_end: rel.week_end,
+    total_amount: rel.total_amount,
+    total_count: rel.total_count,
+    currency: "USD",
+    status: "draft",
+    reference: `RELACION-${carrier_id}-${rel.week_start}`,
+    date: new Date().toISOString().slice(0, 10),
+    due_date: (() => { const d = new Date(); d.setUTCDate(d.getUTCDate() + 15); return d.toISOString().slice(0, 10); })(),
+    relacion_id: rel.id,
+    lines: items.map(t => ({ traslado_id: t.id, date: t.date, origin: t.origin, destination: t.destination, km: t.km, amount: t.amount, notes: t.notes })),
+    created_by: approved_by || null,
+    created_at: Date.now(),
+  };
+  bills.push(bill);
+  await writeCol("logisticaBills", bills);
+
+  rel.invoice_id = bill.id;
+  rel.invoiced_at = Date.now();
+  rel.status = "invoiced";
+  relaciones[idx] = rel;
+  await writeCol("logisticaRelacionesSemanales", relaciones);
+
+  for (const t of items) { t.status = "invoiced"; }
+  await writeCol("logisticaTraslados", traslados);
+
+  // Notificar administración (coordinador administración + tesorería + CEO)
+  try {
+    const employees = await readCol("employees");
+    const notifTargets = employees.filter(e => e.level === "ceo" || e.role === "coord_admin" || e.role === "coordinador_administracion" || e.role === "tesoreria").map(e => e.id);
+    for (const uid of notifTargets) {
+      await pushNotification({ userId: uid, title: `Nuevo gasto flota delivery/taxi`, message: `${carrier?.name}: ${bill.total_count} traslados, ${bill.total_amount.toFixed(2)} USD (semana ${rel.week_start} a ${rel.week_end})`, type: "info", link: `/administracion?tab=arap&kind=ap&reference=${bill.reference}` });
+    }
+  } catch (e) { console.error("notif approve", e); }
+
+  res.json({ ok: true, relacion: rel, bill });
+}));
+
+// GET /api/logistica/bills — gastos generados desde flota
+app.get("/api/logistica/bills", wrap(async (req, res) => {
+  const bills = await readCol("logisticaBills");
+  const carrier_id = req.query.carrier_id ? Number(req.query.carrier_id) : null;
+  const filtered = carrier_id ? bills.filter(b => b.carrier_id === carrier_id) : bills;
+  res.json({ ok: true, count: filtered.length, bills: filtered.sort((a, b) => b.created_at - a.created_at) });
+}));
+
+// ── PORTAL ALIADO: acceso sin login vía token ──
+// GET /api/portal/aliado/:token — datos del aliado + traslados de la semana actual
+app.get("/api/portal/aliado/:token", wrap(async (req, res) => {
+  const token = req.params.token;
+  if (!token) return res.status(400).json({ ok: false, error: "token requerido" });
+  const carriers = await readCol("logisticaCarriers");
+  const carrier = carriers.find(c => c.portal_token === token);
+  if (!carrier) return res.status(404).json({ ok: false, error: "token inválido" });
+
+  const today = new Date().toISOString().slice(0, 10);
+  const week_start = getWeekStart(today);
+  const week_end = getWeekEnd(today);
+  const traslados = await readCol("logisticaTraslados");
+  const items = traslados.filter(t => t.carrier_id === carrier.id && t.week_start === week_start).sort((a, b) => (a.date || "").localeCompare(b.date || ""));
+  const routes = await readCol("logisticaTarifarioRoutes");
+  const availableRoutes = routes.filter(r => !r.carrier_id || r.carrier_id === carrier.id).filter(r => r.is_active !== false);
+  const ranges = await readCol("logisticaTarifarioKmRanges");
+  const availableRanges = ranges.filter(r => !r.carrier_id || r.carrier_id === carrier.id).filter(r => r.is_active !== false);
+  const relaciones = await readCol("logisticaRelacionesSemanales");
+  const relacion = relaciones.find(r => r.carrier_id === carrier.id && r.week_start === week_start) || null;
+  const total = items.reduce((s, t) => s + Number(t.amount || 0), 0);
+  const publicCarrier = { id: carrier.id, name: carrier.name, type: carrier.type, contactName: carrier.contactName, rif: carrier.rif, cedula: carrier.cedula };
+  res.json({ ok: true, carrier: publicCarrier, week_start, week_end, today, traslados: items, total, count: items.length, routes: availableRoutes, ranges: availableRanges, relacion });
+}));
+
+// POST /api/portal/aliado/:token/traslado — aliado crea traslado propio
+app.post("/api/portal/aliado/:token/traslado", wrap(async (req, res) => {
+  const token = req.params.token;
+  const carriers = await readCol("logisticaCarriers");
+  const carrier = carriers.find(c => c.portal_token === token);
+  if (!carrier) return res.status(404).json({ ok: false, error: "token inválido" });
+  req.body = { ...req.body, carrier_id: carrier.id, assigned_by: null };
+  // reutiliza el endpoint principal creando manualmente
+  const b = req.body;
+  if (!b.date) b.date = new Date().toISOString().slice(0, 10);
+
+  let amount = Number(b.amount || 0);
+  let priceSource = "manual";
+  if (b.route_id) {
+    const routes = await readCol("logisticaTarifarioRoutes");
+    const r = routes.find(x => x.id === Number(b.route_id));
+    if (r) { amount = Number(r.price); priceSource = "route"; }
+  } else if (b.km != null && !b.amount) {
+    const ranges = await readCol("logisticaTarifarioKmRanges");
+    const km = Number(b.km);
+    const range = ranges.filter(x => (!x.carrier_id || x.carrier_id === carrier.id) && x.is_active !== false)
+                        .find(x => km >= Number(x.min_km) && km <= Number(x.max_km));
+    if (range) { amount = Number(range.price); priceSource = "km_range"; }
+  }
+
+  const nuevo = {
+    id: Date.now(),
+    carrier_id: carrier.id,
+    carrier_name: carrier.name,
+    date: b.date,
+    week_start: getWeekStart(b.date),
+    week_end: getWeekEnd(b.date),
+    origin: b.origin || "",
+    destination: b.destination || "",
+    route_id: b.route_id ? Number(b.route_id) : null,
+    km: b.km != null ? Number(b.km) : null,
+    amount,
+    currency: b.currency || "USD",
+    price_source: priceSource,
+    notes: b.notes || "",
+    reference: b.reference || "",
+    status: "pending",
+    gps_start: null,
+    gps_end: null,
+    started_at: null,
+    completed_at: null,
+    signed_by_ally_at: null,
+    approved_by_coordinator_at: null,
+    approved_by_user: null,
+    assigned_by: null,
+    created_at: Date.now(),
+    updated_at: Date.now(),
+    created_via: "portal_aliado",
+  };
+  const traslados = await readCol("logisticaTraslados");
+  traslados.push(nuevo);
+  await writeCol("logisticaTraslados", traslados);
+  res.json({ ok: true, traslado: nuevo });
+}));
+
+// POST /api/portal/aliado/:token/traslado/:id/gps — registrar inicio/fin GPS
+app.post("/api/portal/aliado/:token/traslado/:id/gps", wrap(async (req, res) => {
+  const token = req.params.token;
+  const carriers = await readCol("logisticaCarriers");
+  const carrier = carriers.find(c => c.portal_token === token);
+  if (!carrier) return res.status(404).json({ ok: false, error: "token inválido" });
+  const id = Number(req.params.id);
+  const b = req.body || {};
+  const traslados = await readCol("logisticaTraslados");
+  const idx = traslados.findIndex(t => t.id === id && t.carrier_id === carrier.id);
+  if (idx < 0) return res.status(404).json({ ok: false, error: "traslado no encontrado o no pertenece al aliado" });
+  const cur = traslados[idx];
+  if (b.moment === "start") {
+    cur.gps_start = { lat: Number(b.lat), lng: Number(b.lng), accuracy: b.accuracy || null, at: Date.now() };
+    cur.started_at = Date.now();
+    if (cur.status === "pending") cur.status = "in_progress";
+  } else if (b.moment === "end") {
+    cur.gps_end = { lat: Number(b.lat), lng: Number(b.lng), accuracy: b.accuracy || null, at: Date.now() };
+    cur.completed_at = Date.now();
+    cur.status = "completed";
+  } else {
+    return res.status(400).json({ ok: false, error: "moment debe ser 'start' o 'end'" });
+  }
+  cur.updated_at = Date.now();
+  traslados[idx] = cur;
+  await writeCol("logisticaTraslados", traslados);
+  res.json({ ok: true, traslado: cur });
+}));
+
+// POST /api/portal/aliado/:token/sign-week — aliado firma la semana actual
+app.post("/api/portal/aliado/:token/sign-week", wrap(async (req, res) => {
+  const token = req.params.token;
+  const carriers = await readCol("logisticaCarriers");
+  const carrier = carriers.find(c => c.portal_token === token);
+  if (!carrier) return res.status(404).json({ ok: false, error: "token inválido" });
+  const { week_start, signed_by } = req.body || {};
+  const ws = week_start || getWeekStart(new Date().toISOString().slice(0, 10));
+  // Reutilizar lógica sign
+  req.body = { carrier_id: carrier.id, week_start: ws, signed_by: signed_by || carrier.contactName || carrier.name };
+  // Ejecutar handler inline
+  const relaciones = await readCol("logisticaRelacionesSemanales");
+  let idx = relaciones.findIndex(r => r.carrier_id === carrier.id && r.week_start === ws);
+  const traslados = await readCol("logisticaTraslados");
+  const items = traslados.filter(t => t.carrier_id === carrier.id && t.week_start === ws);
+  const total = items.reduce((s, t) => s + Number(t.amount || 0), 0);
+  const rel = {
+    id: idx >= 0 ? relaciones[idx].id : Date.now(),
+    carrier_id: carrier.id,
+    carrier_name: carrier.name,
+    week_start: ws,
+    week_end: getWeekEnd(ws),
+    status: "signed_by_ally",
+    total_amount: total,
+    total_count: items.length,
+    signed_by_ally_at: Date.now(),
+    signed_by_ally_name: req.body.signed_by,
+    approved_by_coordinator_at: null,
+    approved_by_user: null,
+    invoiced_at: null,
+    invoice_id: null,
+    updated_at: Date.now(),
+  };
+  for (const t of items) { if (["pending", "in_progress", "completed"].includes(t.status)) { t.status = "signed_by_ally"; t.signed_by_ally_at = Date.now(); } }
+  await writeCol("logisticaTraslados", traslados);
+  if (idx >= 0) relaciones[idx] = rel; else relaciones.push(rel);
+  await writeCol("logisticaRelacionesSemanales", relaciones);
+  // notif
+  try {
+    const employees = await readCol("employees");
+    const notifTargets = employees.filter(e => e.level === "ceo" || e.role === "coord_logistica" || e.role === "coordinador_logistica").map(e => e.id);
+    for (const uid of notifTargets) {
+      await pushNotification({ userId: uid, title: `Relación semanal firmada por aliado`, message: `${carrier.name}: ${items.length} traslados, total ${total.toFixed(2)} USD (semana ${ws})`, type: "info", link: `/cpk-logistica?tab=flota-delivery&carrier=${carrier.id}&week=${ws}` });
+    }
+  } catch (e) { console.error(e); }
+  res.json({ ok: true, relacion: rel });
+}));
+
+// GET /api/logistica/gps/live — últimas posiciones de traslados en curso
+app.get("/api/logistica/gps/live", wrap(async (_req, res) => {
+  const traslados = await readCol("logisticaTraslados");
+  const carriers = await readCol("logisticaCarriers");
+  const cMap = new Map(carriers.map(c => [c.id, c]));
+  const active = traslados.filter(t => t.gps_start && (!t.gps_end || t.status === "in_progress"));
+  const points = active.map(t => ({
+    id: t.id,
+    carrier_id: t.carrier_id,
+    carrier_name: t.carrier_name,
+    carrier_type: cMap.get(t.carrier_id)?.type || "",
+    date: t.date,
+    origin: t.origin,
+    destination: t.destination,
+    status: t.status,
+    started_at: t.started_at,
+    gps_start: t.gps_start,
+    gps_end: t.gps_end,
+  }));
+  res.json({ ok: true, count: points.length, points });
+}));
+
 (async () => {
   try {
     await ensureSchema();
