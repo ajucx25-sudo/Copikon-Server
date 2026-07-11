@@ -5365,14 +5365,18 @@ app.get("/api/logistica/tarifario/routes", wrap(async (_req, res) => {
 }));
 app.post("/api/logistica/tarifario/routes", wrap(async (req, res) => {
   const b = req.body || {};
-  if (!b.origin || !b.destination || b.price == null) return res.status(400).json({ ok: false, error: "origin, destination, price requeridos" });
+  // Acepta amount o price indistintamente
+  const amount = b.amount != null ? Number(b.amount) : (b.price != null ? Number(b.price) : null);
+  if (amount == null || isNaN(amount)) return res.status(400).json({ ok: false, error: "amount (o price) requerido" });
   const routes = await readCol("logisticaTarifarioRoutes");
   const nuevo = {
-    id: Date.now(),
-    carrier_id: b.carrier_id || null, // null = tarifa global
-    origin: String(b.origin).trim(),
-    destination: String(b.destination).trim(),
-    price: Number(b.price),
+    id: b.id || Date.now(),
+    carrier_id: b.carrier_id || null,
+    name: b.name || `${b.origin || ""} \u2192 ${b.destination || ""}`.trim(),
+    origin: String(b.origin || "").trim(),
+    destination: String(b.destination || "").trim(),
+    amount,
+    price: amount, // compat
     currency: b.currency || "USD",
     est_km: Number(b.est_km || 0),
     notes: b.notes || "",
@@ -5389,7 +5393,11 @@ app.patch("/api/logistica/tarifario/routes/:id", wrap(async (req, res) => {
   const routes = await readCol("logisticaTarifarioRoutes");
   const idx = routes.findIndex(r => r.id === id);
   if (idx < 0) return res.status(404).json({ ok: false, error: "ruta no encontrada" });
-  routes[idx] = { ...routes[idx], ...b, id, updated_at: Date.now() };
+  const merged = { ...routes[idx], ...b, id, updated_at: Date.now() };
+  // Mantener amount/price sincronizados
+  if (b.amount != null) merged.price = Number(b.amount);
+  if (b.price != null && b.amount == null) merged.amount = Number(b.price);
+  routes[idx] = merged;
   await writeCol("logisticaTarifarioRoutes", routes);
   res.json({ ok: true, route: routes[idx] });
 }));
@@ -5406,14 +5414,19 @@ app.get("/api/logistica/tarifario/km-ranges", wrap(async (_req, res) => {
 }));
 app.post("/api/logistica/tarifario/km-ranges", wrap(async (req, res) => {
   const b = req.body || {};
-  if (b.min_km == null || b.max_km == null || b.price == null) return res.status(400).json({ ok: false, error: "min_km, max_km, price requeridos" });
+  const km_min = b.km_min != null ? Number(b.km_min) : (b.min_km != null ? Number(b.min_km) : null);
+  const km_max = b.km_max != null ? Number(b.km_max) : (b.max_km != null ? Number(b.max_km) : null);
+  const amount = b.amount != null ? Number(b.amount) : (b.price != null ? Number(b.price) : null);
+  if (km_min == null || km_max == null || amount == null || isNaN(km_min) || isNaN(km_max) || isNaN(amount)) {
+    return res.status(400).json({ ok: false, error: "km_min, km_max, amount requeridos" });
+  }
   const ranges = await readCol("logisticaTarifarioKmRanges");
   const nuevo = {
-    id: Date.now(),
+    id: b.id || Date.now(),
     carrier_id: b.carrier_id || null,
-    min_km: Number(b.min_km),
-    max_km: Number(b.max_km),
-    price: Number(b.price),
+    label: b.label || `${km_min}-${km_max} km`,
+    km_min, km_max, amount,
+    min_km: km_min, max_km: km_max, price: amount, // compat
     currency: b.currency || "USD",
     notes: b.notes || "",
     is_active: b.is_active !== false,
@@ -5429,7 +5442,11 @@ app.patch("/api/logistica/tarifario/km-ranges/:id", wrap(async (req, res) => {
   const ranges = await readCol("logisticaTarifarioKmRanges");
   const idx = ranges.findIndex(r => r.id === id);
   if (idx < 0) return res.status(404).json({ ok: false, error: "rango no encontrado" });
-  ranges[idx] = { ...ranges[idx], ...b, id, updated_at: Date.now() };
+  const merged = { ...ranges[idx], ...b, id, updated_at: Date.now() };
+  if (b.amount != null) merged.price = Number(b.amount);
+  if (b.km_min != null) merged.min_km = Number(b.km_min);
+  if (b.km_max != null) merged.max_km = Number(b.km_max);
+  ranges[idx] = merged;
   await writeCol("logisticaTarifarioKmRanges", ranges);
   res.json({ ok: true, range: ranges[idx] });
 }));
