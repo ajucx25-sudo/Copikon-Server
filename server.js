@@ -765,7 +765,11 @@ async function syncOdooCatalog({ limit = 25000, includeImages = false } = {}) {
     // - null = producto compartido por todas las companies
     // - id específico = solo esa company
     // Queremos: productos de Copikon C.A. + productos compartidos (null).
-    domain.push(["|", ["company_id", "=", copikonCompanyId], ["company_id", "=", false]]);
+    // El dominio Odoo es polaco-prefijo (RPN): el operador "|" aplica a los dos
+    // siguientes leaves. Deben ir como elementos separados, NO como sub-array.
+    domain.push("|");
+    domain.push(["company_id", "=", copikonCompanyId]);
+    domain.push(["company_id", "=", false]);
     console.log("[syncOdooCatalog] filtrando por company_id =", copikonCompanyId, "o compartidos");
   } else {
     console.warn("[syncOdooCatalog] getCopikonCompanyId() retornó null; sync sin filtro de company");
