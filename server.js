@@ -748,12 +748,28 @@ async function syncOdooCatalog({ limit = 25000, includeImages = false } = {}) {
   ];
   const usedOptionalFields = OPTIONAL_FIELDS.filter(f => availableFields.has(f));
   fields.push(...usedOptionalFields);
+  fields.push("company_id"); // para debug/log
   if (includeImages) fields.push("image_128");
 
+  // Restringir sync a la company Copikon C.A. (id=12). Odoo tiene un duplicado
+  // histórico id=1 "COPIKON VENEZUELA, C.A." con productos antiguos (nombres
+  // con "(copiar)") que causan colisiones de SKU al mostrar precios en la
+  // intranet. La fuente de verdad definitiva es Copikon C.A. (con Generators).
+  const copikonCompanyId = await getCopikonCompanyId();
   const domain = [
     ["sale_ok", "=", true],
     ["active", "=", true],
   ];
+  if (copikonCompanyId) {
+    // product.product en Odoo multi-company usa company_id nullable:
+    // - null = producto compartido por todas las companies
+    // - id específico = solo esa company
+    // Queremos: productos de Copikon C.A. + productos compartidos (null).
+    domain.push(["|", ["company_id", "=", copikonCompanyId], ["company_id", "=", false]]);
+    console.log("[syncOdooCatalog] filtrando por company_id =", copikonCompanyId, "o compartidos");
+  } else {
+    console.warn("[syncOdooCatalog] getCopikonCompanyId() retornó null; sync sin filtro de company");
+  }
 
   // Odoo aplica límite server-side de 10.000 en search_read; paginamos manualmente
   const pageSize = 2000;
@@ -793,6 +809,7 @@ async function syncOdooCatalog({ limit = 25000, includeImages = false } = {}) {
   }
 
   // Luego procesar los de Odoo (crear o actualizar)
+  const seenOdooIds = new Set();
   let created = 0;
   let updated = 0;
   for (const op of odooRows) {
@@ -804,7 +821,39 @@ async function syncOdooCatalog({ limit = 25000, includeImages = false } = {}) {
     } else {
       updated += 1;
     }
+    if (mapped.odooId) seenOdooIds.add(Number(mapped.odooId));
     merged.set(mapped.id, mapped);
+  }
+
+  // 3b. PURGA: eliminar productos con syncStatus="odoo" cuyo odooId ya no está
+  // en el resultado del sync. Esto es lo que borra los duplicados históricos
+  // de company_id=1 (COPIKON VENEZUELA, C.A.) que quedaron huérfanos al filtrar
+  // el sync a company=12 (COPIKON C.A.).
+  //
+  // SAFETY GUARD: si la purga borraría más del 30% del catálogo actual (o más
+  // que odooCount), abortamos la purga porque probablemente
+  // getCopikonCompanyId() esté devolviendo la company equivocada. Preferimos
+  // dejar duplicados temporales antes que vaciar el catálogo.
+  let purged = 0;
+  const orphans = manual.filter(p => p.syncStatus === "odoo" && p.odooId && !seenOdooIds.has(Number(p.odooId)));
+  const totalOdooExisting = manual.filter(p => p.syncStatus === "odoo").length;
+  const purgeRatio = totalOdooExisting > 0 ? orphans.length / totalOdooExisting : 0;
+  const purgeAllowed = orphans.length < 100 || (purgeRatio < 0.30 && odooRows.length > orphans.length);
+
+  if (purgeAllowed) {
+    for (const p of orphans) {
+      merged.delete(p.id);
+      purged += 1;
+    }
+  } else {
+    console.warn(
+      "[syncOdooCatalog] PURGA ABORTADA por safety guard.",
+      "orphans=", orphans.length,
+      "totalOdooExisting=", totalOdooExisting,
+      "ratio=", purgeRatio.toFixed(2),
+      "odooCount=", odooRows.length,
+      "→ Se conservan los productos huérfanos."
+    );
   }
 
   const finalArr = Array.from(merged.values()).sort((a, b) => Number(a.id) - Number(b.id));
@@ -819,6 +868,8 @@ async function syncOdooCatalog({ limit = 25000, includeImages = false } = {}) {
     total: finalArr.length,
     created,
     updated,
+    purged,
+    companyId: copikonCompanyId,
     manualPreserved: finalArr.length - created - updated,
   };
   await pool.query(
@@ -904,12 +955,19 @@ app.get("/api/erp/products/odoo-sync-status", wrap(async (_req, res) => {
 // Rutas fuera de /api/erp/products/* para no chocar con CRUD /:id.
 // ============================================================
 
-// Copikon Venezuela, C.A. — RIF J-29465456-8. Se prueba en múltiples formatos.
+// Copikon C.A. — RIF J-29465456-8. Se prueba en múltiples formatos.
+// IMPORTANTE: existen dos companies en Odoo con el mismo RIF:
+//   id=1  "COPIKON VENEZUELA, C.A." (vieja, mantenida solo para histórico)
+//   id=12 "COPIKON C.A."           (NUEVA, actual, la que contiene la rama Generators)
+// El sistema debe usar SIEMPRE la id=12 (COPIKON C.A. sin "VENEZUELA").
 const COPIKON_RIF_FORMATS = ["J294654568", "J-29465456-8", "J29465456-8", "J-294654568"];
-// Nombres válidos (case-insensitive). El primero que aparezca en res.company gana.
-const COPIKON_NAME_INCLUDES = ["COPIKON VENEZUELA", "COPIKON C.A", "COPIKON CA", "COPIKON, C.A"];
+// Orden de prioridad: primero "COPIKON C.A." (nueva), luego el fallback viejo.
+const COPIKON_NAME_INCLUDES = ["COPIKON C.A", "COPIKON CA", "COPIKON, C.A", "COPIKON VENEZUELA"];
 // Nombres a EXCLUIR aunque contengan "COPIKON" (otras compañías del grupo)
 const COPIKON_NAME_EXCLUDES = ["LOGAN", "JJEL", "MANGO", "2BC", "CJR", "COPIKON JR", "GENERATOR", "CELLTEK"];
+// Override explícito por variable de entorno (último recurso). Si se define,
+// gana sobre cualquier heurística.
+const COPIKON_COMPANY_ID_OVERRIDE = process.env.COPIKON_COMPANY_ID ? Number(process.env.COPIKON_COMPANY_ID) : null;
 
 // Cache del companyId de Copikon C.A. (evita lookups repetidos)
 let _copikonCompanyId = null;
@@ -917,7 +975,16 @@ async function getCopikonCompanyId() {
   if (_copikonCompanyId) return _copikonCompanyId;
   const debug = { tried: [] };
 
-  // Estrategia 1: buscar por VAT en varios formatos
+  // Override explícito por env (último recurso operativo).
+  if (COPIKON_COMPANY_ID_OVERRIDE) {
+    _copikonCompanyId = COPIKON_COMPANY_ID_OVERRIDE;
+    console.log("[getCopikonCompanyId] hit via COPIKON_COMPANY_ID env override →", _copikonCompanyId);
+    return _copikonCompanyId;
+  }
+
+  // Estrategia 1: buscar por VAT en varios formatos. Si hay más de una company
+  // con el mismo RIF (caso real: id=1 vieja y id=12 nueva), preferimos la que
+  // NO contenga "VENEZUELA" en el nombre (esa es la vieja).
   for (const rif of COPIKON_RIF_FORMATS) {
     const partners = await odoo.searchRead(
       "res.partner", [["vat", "=", rif]],
@@ -928,11 +995,15 @@ async function getCopikonCompanyId() {
       const partnerIds = partners.map(p => p.id);
       const companies = await odoo.searchRead(
         "res.company", [["partner_id", "in", partnerIds]],
-        ["id", "name"], { limit: 5 }
+        ["id", "name"], { limit: 5, order: "id desc" }
       );
       if (companies.length) {
-        _copikonCompanyId = companies[0].id;
-        console.log("[getCopikonCompanyId] hit via VAT", rif, "→", companies[0]);
+        // Prioridad 1: cualquier company cuyo nombre NO contenga "VENEZUELA"
+        // (la vieja se llama "COPIKON VENEZUELA, C.A.", la nueva "COPIKON C.A.").
+        const preferred = companies.find(c => !/venezuela/i.test(c.name || ""));
+        const chosen = preferred || companies[0];
+        _copikonCompanyId = chosen.id;
+        console.log("[getCopikonCompanyId] hit via VAT", rif, "→", chosen, "(candidatos:", companies.map(c => `${c.id}:${c.name}`).join(" | "), ")");
         return _copikonCompanyId;
       }
     }
