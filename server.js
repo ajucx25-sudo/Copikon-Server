@@ -637,6 +637,22 @@ function mapOdooProduct(op, existingByOdooId = new Map(), existingBySku = new Ma
   base.barcode = toStrOrEmpty(op.barcode) || base.barcode || "";
   base.salePrice = op.list_price != null ? String(op.list_price) : (base.salePrice || "");
   base.costPrice = op.standard_price != null ? String(op.standard_price) : (base.costPrice || "");
+
+  // Landed cost (costo total = estándar + fletes + impuestos). Toma el primero disponible.
+  const landedRaw = op.landed_cost ?? op.x_studio_costo_landed ?? op.x_studio_landed_cost ?? op.x_landed_cost;
+  if (landedRaw != null && landedRaw !== false) {
+    base.landedCost = String(landedRaw);
+  } else if (!base.landedCost) {
+    // Fallback: mismo standard_price (asumimos que ya trae landed si el módulo está activo)
+    base.landedCost = base.costPrice || "";
+  }
+
+  // Precio mínimo de venta (piso comercial). Toma el primero disponible.
+  const minRaw = op.x_studio_precio_minimo ?? op.x_studio_precio_m_nimo ?? op.x_precio_minimo ?? op.x_min_price ?? op.x_studio_min_price ?? op.min_sale_price;
+  if (minRaw != null && minRaw !== false) {
+    base.minPrice = String(minRaw);
+  }
+
   base.stock = typeof op.qty_available === "number" ? op.qty_available : (base.stock || 0);
   base.status = op.active ? "activo" : "archivado";
   base.syncStatus = "odoo";
@@ -659,10 +675,28 @@ function mapOdooProduct(op, existingByOdooId = new Map(), existingBySku = new Ma
   return base;
 }
 
+// Cache de metadata de campos disponibles en Odoo (se refresca al arrancar y cada sync)
+let _odooProductFieldsCache = null;
+async function getOdooProductAvailableFields() {
+  if (_odooProductFieldsCache) return _odooProductFieldsCache;
+  try {
+    const meta = await odoo.execute("product.product", "fields_get", [], { attributes: ["type"] });
+    _odooProductFieldsCache = new Set(Object.keys(meta || {}));
+    return _odooProductFieldsCache;
+  } catch (e) {
+    console.warn("[odoo] fields_get fall\u00f3, usando fallback conservador:", e.message);
+    _odooProductFieldsCache = new Set();
+    return _odooProductFieldsCache;
+  }
+}
+
 async function syncOdooCatalog({ limit = 25000, includeImages = false } = {}) {
   if (!odoo.isConfigured()) {
     throw new Error("Odoo no configurado en el servidor");
   }
+
+  // Detectar qué campos existen en Odoo para incluir landed_cost y mínimo si están disponibles
+  const availableFields = await getOdooProductAvailableFields();
 
   // 1. Traer variantes vendibles activas de Odoo
   //    Campos mínimos + imagen 128px para picker (baja resolución = pesa poco)
@@ -673,6 +707,21 @@ async function syncOdooCatalog({ limit = 25000, includeImages = false } = {}) {
     "product_tmpl_id",
     "description_sale", "description",
   ];
+  // Campos opcionales (se agregan solo si existen en la instancia Odoo)
+  const OPTIONAL_FIELDS = [
+    "landed_cost",                 // Costo landed estándar
+    "x_studio_costo_landed",       // Custom Studio
+    "x_studio_landed_cost",        // Custom Studio EN
+    "x_landed_cost",
+    "x_studio_precio_minimo",      // Precio mínimo custom Studio
+    "x_studio_precio_m_nimo",
+    "x_precio_minimo",
+    "x_min_price",
+    "x_studio_min_price",
+    "min_sale_price",
+  ];
+  const usedOptionalFields = OPTIONAL_FIELDS.filter(f => availableFields.has(f));
+  fields.push(...usedOptionalFields);
   if (includeImages) fields.push("image_128");
 
   const domain = [
@@ -768,6 +817,34 @@ app.post("/api/erp/products/sync-odoo", wrap(async (req, res) => {
     res.json({ ok: true, ...meta });
   } catch (e) {
     console.error("[odoo-sync]", e);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+}));
+
+// GET /api/erp/products/odoo-fields-inspect — DEBUG: lista campos disponibles en product.product
+// Útil para descubrir si existe landed_cost, precio mínimo custom (x_studio_*), etc.
+app.get("/api/erp/products/odoo-fields-inspect", wrap(async (_req, res) => {
+  if (!odoo.isConfigured()) {
+    return res.status(503).json({ ok: false, error: "Odoo no configurado" });
+  }
+  try {
+    // fields_get devuelve TODOS los campos con su tipo y label
+    const fields = await odoo.execute("product.product", "fields_get", [], { attributes: ["string", "type", "help"] });
+    // Filtrar los que suenen a costo, precio, min
+    const relevant = {};
+    for (const [k, v] of Object.entries(fields)) {
+      const kl = k.toLowerCase();
+      const sl = String(v.string || "").toLowerCase();
+      if (
+        kl.includes("cost") || kl.includes("landed") || kl.includes("price") ||
+        kl.includes("minim") || kl.startsWith("x_studio") || kl.startsWith("x_") ||
+        sl.includes("costo") || sl.includes("landed") || sl.includes("m\u00ednim") || sl.includes("precio")
+      ) {
+        relevant[k] = { string: v.string, type: v.type, help: v.help };
+      }
+    }
+    res.json({ ok: true, count: Object.keys(relevant).length, fields: relevant });
+  } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
 }));
