@@ -640,19 +640,41 @@ function mapOdooProduct(op, existingByOdooId = new Map(), existingBySku = new Ma
   base.salePrice = op.list_price != null ? String(op.list_price) : (base.salePrice || "");
   base.costPrice = op.standard_price != null ? String(op.standard_price) : (base.costPrice || "");
 
-  // Landed cost (costo total = estándar + fletes + impuestos). Toma el primero disponible.
-  const landedRaw = op.landed_cost ?? op.x_studio_costo_landed ?? op.x_studio_landed_cost ?? op.x_landed_cost;
-  if (landedRaw != null && landedRaw !== false) {
+  // Landed cost (costo aterrizado = estándar + fletes + impuestos). Campo custom Studio.
+  const landedRaw = op.x_studio_costo_landed;
+  if (landedRaw != null && landedRaw !== false && Number(landedRaw) > 0) {
     base.landedCost = String(landedRaw);
-  } else if (!base.landedCost) {
-    // Fallback: mismo standard_price (asumimos que ya trae landed si el módulo está activo)
+  } else if (!base.landedCost || Number(base.landedCost) === 0) {
+    // Fallback: si no hay landed cargado, usar el standard_price
     base.landedCost = base.costPrice || "";
   }
 
-  // Precio mínimo de venta (piso comercial). Toma el primero disponible.
-  const minRaw = op.x_studio_precio_minimo ?? op.x_studio_precio_m_nimo ?? op.x_precio_minimo ?? op.x_min_price ?? op.x_studio_min_price ?? op.min_sale_price;
-  if (minRaw != null && minRaw !== false) {
+  // Precio mínimo de venta (piso comercial). Campo custom Studio.
+  const minRaw = op.x_studio_precio_mnimo_de_venta;
+  if (minRaw != null && minRaw !== false && Number(minRaw) > 0) {
     base.minPrice = String(minRaw);
+  }
+
+  // Marca: preferir el char x_studio_marca; fallback al selection x_studio_marca_1.
+  const brandRaw = toStrOrEmpty(op.x_studio_marca);
+  if (brandRaw) {
+    base.brand = brandRaw;
+  } else if (Array.isArray(op.x_studio_marca_1) && op.x_studio_marca_1.length >= 2) {
+    // selection viene como [key, label] o como string directo
+    base.brand = String(op.x_studio_marca_1[1] || op.x_studio_marca_1[0] || base.brand || "");
+  } else if (typeof op.x_studio_marca_1 === "string" && op.x_studio_marca_1) {
+    base.brand = op.x_studio_marca_1;
+  }
+
+  // Modelo
+  const modelRaw = toStrOrEmpty(op.x_studio_modelo);
+  if (modelRaw) base.model = modelRaw;
+
+  // Garantía (selection Odoo)
+  if (Array.isArray(op.x_studio_garantia) && op.x_studio_garantia.length >= 2) {
+    base.warranty = String(op.x_studio_garantia[1] || op.x_studio_garantia[0] || "");
+  } else if (typeof op.x_studio_garantia === "string" && op.x_studio_garantia) {
+    base.warranty = op.x_studio_garantia;
   }
 
   base.stock = typeof op.qty_available === "number" ? op.qty_available : (base.stock || 0);
@@ -709,18 +731,20 @@ async function syncOdooCatalog({ limit = 25000, includeImages = false } = {}) {
     "product_tmpl_id",
     "description_sale", "description",
   ];
-  // Campos opcionales (se agregan solo si existen en la instancia Odoo)
+  // Campos opcionales (se agregan solo si existen en la instancia Odoo).
+  // Confirmados por fields_get en la instancia Copikon (v15 con Studio):
+  //   x_studio_costo_landed         monetary  → landedCost
+  //   x_studio_precio_mnimo_de_venta monetary → minPrice
+  //   x_studio_marca (char) / x_studio_marca_1 (selection) → brand
+  //   x_studio_modelo (char) → model
+  //   x_studio_garantia (selection) → warranty
   const OPTIONAL_FIELDS = [
-    "landed_cost",                 // Costo landed estándar
-    "x_studio_costo_landed",       // Custom Studio
-    "x_studio_landed_cost",        // Custom Studio EN
-    "x_landed_cost",
-    "x_studio_precio_minimo",      // Precio mínimo custom Studio
-    "x_studio_precio_m_nimo",
-    "x_precio_minimo",
-    "x_min_price",
-    "x_studio_min_price",
-    "min_sale_price",
+    "x_studio_costo_landed",
+    "x_studio_precio_mnimo_de_venta",
+    "x_studio_marca",
+    "x_studio_marca_1",
+    "x_studio_modelo",
+    "x_studio_garantia",
   ];
   const usedOptionalFields = OPTIONAL_FIELDS.filter(f => availableFields.has(f));
   fields.push(...usedOptionalFields);
