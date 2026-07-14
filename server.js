@@ -433,7 +433,9 @@ for (const [route, key] of Object.entries(ROUTES)) {
   }
 
   if (route !== "/api/sales-partners") {
-    app.get(`${route}/:id`, wrap(async (req, res) => {
+    // Regex :id(\d+) para que solo capture IDs numéricos y no colisione con subpaths como
+    // /api/erp/products/sync-odoo, /api/erp/products/odoo-fields-inspect, etc.
+    app.get(`${route}/:id(\\d+)`, wrap(async (req, res) => {
       const id = Number(req.params.id);
       const items = await readCol(key);
       const item = items.find((x) => Number(x.id) === id);
