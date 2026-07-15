@@ -1358,6 +1358,7 @@ app.get("/api/erp/invoices/:invoiceId/pdf", wrap(async (req, res) => {
 // ============================================================
 const GENERATORS_BRANCH_ID = 41;
 const GENERATORS_COMPANY_ID = 12;
+const USD_CURRENCY_ID = 2; // res.currency USD en Odoo Copikon
 
 // GET /api/erp/generators/finanzas/resumen?from=YYYY-MM-DD&to=YYYY-MM-DD
 // Consolida en una sola llamada:
@@ -1380,6 +1381,10 @@ app.get("/api/erp/generators/finanzas/resumen", wrap(async (req, res) => {
 
   const branchFilter = ["branch_id", "=", GENERATORS_BRANCH_ID];
   const companyFilter = ["company_id", "=", GENERATORS_COMPANY_ID];
+  const usdFilter = ["currency_id", "=", USD_CURRENCY_ID];
+  // Permite en el futuro cambiar la moneda del reporte vía query ?currency=USD|VES|all
+  const currencyParam = String(req.query.currency || "USD").toUpperCase();
+  const useUsdOnly = currencyParam === "USD";
 
   // ── 1) CxC y CxP a la fecha ─────────────────────────────────
   const arDomain = [
@@ -1389,6 +1394,7 @@ app.get("/api/erp/generators/finanzas/resumen", wrap(async (req, res) => {
     ["account_id.user_type_id.type", "=", "receivable"],
     companyFilter,
     branchFilter,
+    ...(useUsdOnly ? [usdFilter] : []),
   ];
   const apDomain = [
     ["parent_state", "=", "posted"],
@@ -1397,6 +1403,7 @@ app.get("/api/erp/generators/finanzas/resumen", wrap(async (req, res) => {
     ["account_id.user_type_id.type", "=", "payable"],
     companyFilter,
     branchFilter,
+    ...(useUsdOnly ? [usdFilter] : []),
   ];
 
   const [arLines, apLines] = await Promise.all([
@@ -1441,6 +1448,7 @@ app.get("/api/erp/generators/finanzas/resumen", wrap(async (req, res) => {
     ["invoice_date", "<=", to],
     companyFilter,
     branchFilter,
+    ...(useUsdOnly ? [usdFilter] : []),
   ];
   const moves = await odoo.searchRead("account.move",
     [...moveDomain, ["move_type", "in", ["out_invoice", "out_refund", "in_invoice", "in_refund"]]],
@@ -1474,6 +1482,7 @@ app.get("/api/erp/generators/finanzas/resumen", wrap(async (req, res) => {
         ["date", "<=", to],
         companyFilter,
         branchFilter,
+        ...(useUsdOnly ? [usdFilter] : []),
       ],
       ["id", "name", "partner_id", "payment_type", "amount", "date", "ref",
        "journal_id", "currency_id", "partner_type", "state"],
@@ -1502,6 +1511,7 @@ app.get("/api/erp/generators/finanzas/resumen", wrap(async (req, res) => {
     branch_id: GENERATORS_BRANCH_ID,
     branch_name: "N-COPIKON GENERATOR",
     company_id: GENERATORS_COMPANY_ID,
+    currency: useUsdOnly ? "USD" : "all",
     period: { from, to, as_of: asOf },
     cxc: {
       total: cxc_total,
