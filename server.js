@@ -124,7 +124,7 @@ const STATIC_KEYS = ["departments", "announcements", "jobDescriptions", "process
 const app = express();
 app.use(compression({ level: 6, threshold: 1024 })); // gzip — reduce respuestas JSON ~70%
 app.use(cors({ origin: true, credentials: true }));
-app.use(express.json({ limit: "60mb" }));
+app.use(express.json({ limit: "150mb" }));
 
 const wrap = (fn) => (req, res) =>
   Promise.resolve(fn(req, res)).catch((err) => {
@@ -1795,6 +1795,117 @@ app.delete("/api/admin/technical-providers/:id/revoke-access", wrap(async (req, 
   const [removed] = employees.splice(idx, 1);
   await writeCol("employees", employees);
   res.json({ ok: true, removedUserId: removed.id });
+}));
+
+// ───── Producto · Media (ficha técnica, manual, video) ────────────────────
+// Endpoints genéricos para subir archivos que quedan asociados a los campos
+// datasheetUrl / manualUrl / videoUrl del producto. Se guardan en kv como
+// `product-media:<fileId>` con { filename, mimeType, dataBase64, size, kind, uploadedAt }.
+// El endpoint de upload devuelve la URL `/api/product-media/<fileId>/download`
+// que el frontend guarda en el campo correspondiente.
+
+function newProductMediaId() {
+  return `pm-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+async function readProductMedia(fileId) {
+  const r = await pool.query("SELECT value FROM kv WHERE key = $1", [`product-media:${fileId}`]);
+  if (!r.rows[0]) return null;
+  const v = r.rows[0].value;
+  if (!v || typeof v !== "object") return null;
+  return {
+    id: fileId,
+    filename: v.filename || "documento",
+    mimeType: v.mimeType || "application/octet-stream",
+    dataBase64: typeof v.dataBase64 === "string" ? v.dataBase64 : "",
+    size: Number(v.size) || 0,
+    kind: v.kind || "file",
+    uploadedAt: v.uploadedAt || null,
+  };
+}
+
+async function writeProductMedia(fileId, data) {
+  await pool.query(
+    `INSERT INTO kv (key, value, updated_at) VALUES ($1, $2::jsonb, $3)
+     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at`,
+    [`product-media:${fileId}`, JSON.stringify(data), Date.now()]
+  );
+}
+
+async function deleteProductMedia(fileId) {
+  await pool.query("DELETE FROM kv WHERE key = $1", [`product-media:${fileId}`]);
+}
+
+// POST /api/product-media/upload — sube un archivo (base64) y devuelve la URL
+const PRODUCT_MEDIA_KINDS = {
+  datasheet: { defaultName: "ficha-tecnica.pdf", defaultMime: "application/pdf", maxBytes: 30 * 1024 * 1024 },
+  manual:    { defaultName: "manual.pdf",         defaultMime: "application/pdf", maxBytes: 50 * 1024 * 1024 },
+  video:     { defaultName: "video.mp4",          defaultMime: "video/mp4",       maxBytes: 100 * 1024 * 1024 }, // 100 MB — body limit del server es 150 MB
+};
+
+app.post("/api/product-media/upload", wrap(async (req, res) => {
+  const { kind, filename, mimeType, dataBase64 } = req.body || {};
+  const kindDef = PRODUCT_MEDIA_KINDS[String(kind || "").toLowerCase()];
+  if (!kindDef) return res.status(400).json({ message: "kind inválido (datasheet | manual | video)" });
+  if (!dataBase64 || typeof dataBase64 !== "string") {
+    return res.status(400).json({ message: "dataBase64 requerido" });
+  }
+  const cleaned = dataBase64.replace(/\s/g, "");
+  const size = Math.floor((cleaned.length * 3) / 4) - (cleaned.endsWith("==") ? 2 : cleaned.endsWith("=") ? 1 : 0);
+  if (size > kindDef.maxBytes) {
+    return res.status(413).json({ message: `archivo excede ${Math.round(kindDef.maxBytes / 1024 / 1024)} MB` });
+  }
+  const fileId = newProductMediaId();
+  const data = {
+    filename: String(filename || kindDef.defaultName),
+    mimeType: String(mimeType || kindDef.defaultMime),
+    dataBase64: cleaned,
+    size,
+    kind: String(kind).toLowerCase(),
+    uploadedAt: new Date().toISOString(),
+  };
+  await writeProductMedia(fileId, data);
+  const url = `/api/product-media/${fileId}/download`;
+  res.json({ ok: true, fileId, url, filename: data.filename, size, mimeType: data.mimeType, kind: data.kind });
+}));
+
+// GET /api/product-media/:fileId/download — descarga el archivo inline
+app.get("/api/product-media/:fileId/download", wrap(async (req, res) => {
+  const fileId = String(req.params.fileId || "");
+  const file = await readProductMedia(fileId);
+  if (!file) return res.status(404).json({ message: "archivo no encontrado" });
+  const buf = Buffer.from(file.dataBase64, "base64");
+  res.setHeader("Content-Type", file.mimeType);
+  res.setHeader("Content-Disposition", `inline; filename="${encodeURIComponent(file.filename)}"`);
+  res.setHeader("Content-Length", buf.length);
+  res.setHeader("Cache-Control", "public, max-age=86400");
+  res.send(buf);
+}));
+
+// GET /api/product-media/:fileId — metadata sin blob
+app.get("/api/product-media/:fileId", wrap(async (req, res) => {
+  const fileId = String(req.params.fileId || "");
+  const file = await readProductMedia(fileId);
+  if (!file) return res.status(404).json({ message: "archivo no encontrado" });
+  res.json({
+    ok: true,
+    fileId,
+    filename: file.filename,
+    mimeType: file.mimeType,
+    size: file.size,
+    kind: file.kind,
+    uploadedAt: file.uploadedAt,
+    url: `/api/product-media/${fileId}/download`,
+  });
+}));
+
+// DELETE /api/product-media/:fileId — borra el archivo
+app.delete("/api/product-media/:fileId", wrap(async (req, res) => {
+  const fileId = String(req.params.fileId || "");
+  const file = await readProductMedia(fileId);
+  if (!file) return res.status(404).json({ message: "archivo no encontrado" });
+  await deleteProductMedia(fileId);
+  res.json({ ok: true });
 }));
 
 // ───── Marketing · Materiales Corporativos (v2 — storage por archivo) ─────
