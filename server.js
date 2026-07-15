@@ -1805,6 +1805,75 @@ app.delete("/api/project-tasks/:id/attachments/:attId", wrap(async (req, res) =>
   res.json({ ok: true });
 }));
 
+// POST /api/admin/migrate-task-attachments — mueve adjuntos legacy (dataUrl inline)
+// a filas separadas task-attachment:<id> para desinflar la fila projectTasks.
+app.post("/api/admin/migrate-task-attachments", wrap(async (req, res) => {
+  const items = await readCol("projectTasks");
+  let migratedCount = 0;
+  let bytesFreed = 0;
+  let taskCount = 0;
+  const errors = [];
+
+  for (let i = 0; i < items.length; i++) {
+    const t = items[i];
+    const atts = parseAttachments(t.attachments);
+    if (!atts.length) continue;
+    let changedInTask = false;
+    const nextAtts = [];
+    for (const att of atts) {
+      // Solo migrar los que tienen dataUrl inline y NO blobId
+      if (att && att.dataUrl && !att.blobId && typeof att.dataUrl === "string") {
+        const m = att.dataUrl.match(/^data:([^;]+);base64,(.+)$/);
+        if (m) {
+          const mime = m[1];
+          const b64 = m[2];
+          const blobId = att.id || `att_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+          try {
+            await writeTaskAttachmentBlob(blobId, {
+              filename: att.filename || "archivo",
+              mimeType: mime,
+              dataBase64: b64,
+              size: Math.floor((b64.length * 3) / 4),
+              uploadedAt: att.uploadedAt || new Date().toISOString(),
+            });
+            const migrated = { ...att, blobId, mimeType: att.mimeType || mime, size: att.size || Math.floor((b64.length * 3) / 4) };
+            delete migrated.dataUrl;
+            delete migrated.storagePath;
+            nextAtts.push(migrated);
+            migratedCount++;
+            bytesFreed += att.dataUrl.length;
+            changedInTask = true;
+            continue;
+          } catch (e) {
+            errors.push({ taskId: t.id, attId: att.id, error: String(e?.message || e) });
+            nextAtts.push(att); // conservar sin migrar en caso de error
+            continue;
+          }
+        }
+      }
+      // Adjuntos con storagePath (formato viejo distinto) o ya migrados
+      nextAtts.push(att);
+    }
+    if (changedInTask) {
+      items[i] = { ...t, attachments: nextAtts };
+      taskCount++;
+    }
+  }
+
+  if (migratedCount > 0) {
+    await writeCol("projectTasks", items);
+  }
+
+  res.json({
+    ok: true,
+    migratedAttachments: migratedCount,
+    tasksTouched: taskCount,
+    approxBytesFreed: bytesFreed,
+    approxMBFreed: (bytesFreed / 1024 / 1024).toFixed(2),
+    errors,
+  });
+}));
+
 // PATCH /api/admin/users/:id — credenciales/permisos
 app.patch("/api/admin/users/:id", wrap(async (req, res) => {
   const id = Number(req.params.id);
