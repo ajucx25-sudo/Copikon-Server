@@ -981,10 +981,16 @@ async function findOrCreatePartner(client, companyId) {
   const email = (client.email || "").trim().toLowerCase();
   const name = (client.name || client.contactName || "").trim();
 
+  // Filtro multi-company: aceptamos partners "compartidos" (company_id = false)
+  // o los que pertenecen específicamente a la company objetivo. Esto evita
+  // el error "no tienes permiso para acceder a res.partner" que ocurre cuando
+  // sale.order en company=12 apunta a un partner de company=1.
+  const companyFilter = ["|", ["company_id", "=", false], ["company_id", "=", companyId]];
+
   // 1) Búsqueda por VAT/RIF
   if (rif) {
     const found = await odoo.searchRead(
-      "res.partner", [["vat", "=", rif]], ["id", "name"], { limit: 1 }
+      "res.partner", [...companyFilter, ["vat", "=", rif]], ["id", "name", "company_id"], { limit: 1 }
     );
     if (found[0]) return { partnerId: found[0].id, matched: "vat", partnerName: found[0].name };
   }
@@ -992,7 +998,7 @@ async function findOrCreatePartner(client, companyId) {
   // 2) Búsqueda por email
   if (email) {
     const found = await odoo.searchRead(
-      "res.partner", [["email", "=ilike", email]], ["id", "name"], { limit: 1 }
+      "res.partner", [...companyFilter, ["email", "=ilike", email]], ["id", "name", "company_id"], { limit: 1 }
     );
     if (found[0]) return { partnerId: found[0].id, matched: "email", partnerName: found[0].name };
   }
@@ -1000,16 +1006,19 @@ async function findOrCreatePartner(client, companyId) {
   // 3) Búsqueda por nombre exacto (case-insensitive)
   if (name) {
     const found = await odoo.searchRead(
-      "res.partner", [["name", "=ilike", name]], ["id", "name"], { limit: 1 }
+      "res.partner", [...companyFilter, ["name", "=ilike", name]], ["id", "name", "company_id"], { limit: 1 }
     );
     if (found[0]) return { partnerId: found[0].id, matched: "name", partnerName: found[0].name };
   }
 
-  // 4) Crear nuevo
+  // 4) Crear nuevo con company_id = false (partner compartido entre companies).
+  // Este es el patrón recomendado por Odoo para clientes multi-company — evita
+  // conflictos si más adelante Copikon Venezuela y Copikon C.A. le facturan al
+  // mismo cliente.
   if (!name) throw new Error("Cliente sin nombre — no se puede crear en Odoo");
   const partnerVals = {
     name,
-    company_id: companyId,
+    company_id: false, // partner compartido entre companies
     customer_rank: 1,
     is_company: true,
   };
@@ -1196,6 +1205,35 @@ app.post("/api/erp/sale-orders/from-lead", wrap(async (req, res) => {
     lines: orderLines.length,
     unresolvedItems: unresolvedItems.length,
   });
+}));
+
+// GET /api/erp/odoo/partner-probe?name=X&rif=Y&email=Z — buscar partners similares
+app.get("/api/erp/odoo/partner-probe", wrap(async (req, res) => {
+  if (!odoo.isConfigured()) return res.status(503).json({ ok: false, error: "Odoo no configurado" });
+  const { name, rif, email } = req.query;
+  const results = {};
+  if (rif) {
+    try {
+      results.byVat = await odoo.execute("res.partner", "search_read",
+        [[["vat", "=", rif]]],
+        { fields: ["id", "name", "vat", "company_id", "email", "active"], limit: 5 });
+    } catch (e) { results.byVatError = String(e.message || e); }
+  }
+  if (email) {
+    try {
+      results.byEmail = await odoo.execute("res.partner", "search_read",
+        [[["email", "=ilike", email]]],
+        { fields: ["id", "name", "vat", "company_id", "email", "active"], limit: 5 });
+    } catch (e) { results.byEmailError = String(e.message || e); }
+  }
+  if (name) {
+    try {
+      results.byName = await odoo.execute("res.partner", "search_read",
+        [[["name", "=ilike", name]]],
+        { fields: ["id", "name", "vat", "company_id", "email", "active"], limit: 10 });
+    } catch (e) { results.byNameError = String(e.message || e); }
+  }
+  res.json({ ok: true, query: { name, rif, email }, results });
 }));
 
 // GET /api/erp/odoo/permission-probe — diagnóstico de permisos Odoo
