@@ -1668,6 +1668,30 @@ function parseAttachments(v) {
   return [];
 }
 
+// Almacenamiento de blobs de adjuntos de tareas en filas kv separadas.
+// Clave: `task-attachment:<fileId>` — así la tarea guarda solo metadatos +
+// referencia (fileId) y NO se carga el blob al listar tareas.
+async function readTaskAttachmentBlob(fileId) {
+  const r = await pool.query("SELECT value FROM kv WHERE key = $1", [`task-attachment:${fileId}`]);
+  if (!r.rows[0]) return null;
+  const v = r.rows[0].value;
+  if (!v || typeof v !== "object") return null;
+  return v;
+}
+async function writeTaskAttachmentBlob(fileId, data) {
+  await pool.query(
+    `INSERT INTO kv (key, value, updated_at) VALUES ($1, $2::jsonb, $3)
+     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at`,
+    [`task-attachment:${fileId}`, JSON.stringify(data), Date.now()]
+  );
+}
+async function deleteTaskAttachmentBlob(fileId) {
+  await pool.query("DELETE FROM kv WHERE key = $1", [`task-attachment:${fileId}`]);
+}
+
+// Límite por adjunto de tarea (Postgres puede soportar filas grandes, pero el body-parser limita a 150 MB)
+const TASK_ATTACHMENT_MAX_BYTES = 100 * 1024 * 1024; // 100 MB por archivo
+
 // POST /api/project-tasks/:id/attachments — agregar adjunto
 app.post("/api/project-tasks/:id/attachments", wrap(async (req, res) => {
   const taskId = Number(req.params.id);
@@ -1676,25 +1700,52 @@ app.post("/api/project-tasks/:id/attachments", wrap(async (req, res) => {
   if (idx < 0) return res.status(404).json({ message: "task not found" });
   const body = req.body || {};
   const mime = body.mimeType || "application/octet-stream";
-  const dataUrl = body.dataBase64 ? `data:${mime};base64,${body.dataBase64}` : (body.dataUrl || "");
-  const size = body.size ?? (body.dataBase64 ? Math.floor((body.dataBase64.length * 3) / 4) : 0);
+  const rawB64 = typeof body.dataBase64 === "string" ? body.dataBase64.replace(/\s/g, "") : "";
+
+  // Validar tamaño antes de escribir
+  const size = body.size ?? (rawB64 ? Math.floor((rawB64.length * 3) / 4) : 0);
+  if (size > TASK_ATTACHMENT_MAX_BYTES) {
+    return res.status(413).json({ message: `archivo excede ${Math.round(TASK_ATTACHMENT_MAX_BYTES/1024/1024)} MB` });
+  }
+
+  const attId = `att_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
   const newAttachment = {
-    id: `att_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+    id: attId,
     filename: body.filename || "archivo",
     mimeType: mime,
     size,
-    dataUrl,
     uploadedAt: new Date().toISOString(),
     uploadedBy: body.uploadedBy ?? null,
     uploadedByName: body.uploadedByName ?? null,
   };
+
+  // Guardar el blob en su propia fila kv (fuera de projectTasks) para no
+  // inflar la fila de la tarea y evitar timeouts/rechazo del UPDATE.
+  if (rawB64) {
+    try {
+      await writeTaskAttachmentBlob(attId, {
+        filename: newAttachment.filename,
+        mimeType: mime,
+        dataBase64: rawB64,
+        size,
+        uploadedAt: newAttachment.uploadedAt,
+      });
+      newAttachment.blobId = attId; // marcador: el blob vive en task-attachment:<attId>
+    } catch (e) {
+      return res.status(500).json({ message: "no se pudo guardar el archivo", error: e?.message || String(e) });
+    }
+  } else if (body.dataUrl) {
+    // Cliente viejo: dataUrl inline (legacy). Aceptado pero se almacena en la fila de la tarea.
+    newAttachment.dataUrl = body.dataUrl;
+  }
+
   const current = parseAttachments(items[idx].attachments);
   items[idx] = { ...items[idx], attachments: [...current, newAttachment] };
   await writeCol("projectTasks", items);
   res.status(201).json(newAttachment);
 }));
 
-// GET /api/project-tasks/:id/attachments/:attId — descargar (devuelve dataUrl)
+// GET /api/project-tasks/:id/attachments/:attId — descargar
 app.get("/api/project-tasks/:id/attachments/:attId", wrap(async (req, res) => {
   const taskId = Number(req.params.id);
   const attId = req.params.attId;
@@ -1704,17 +1755,34 @@ app.get("/api/project-tasks/:id/attachments/:attId", wrap(async (req, res) => {
   const atts = parseAttachments(task.attachments);
   const att = atts.find((a) => a.id === attId);
   if (!att) return res.status(404).json({ message: "attachment not found" });
-  // Si tiene dataUrl, devolver el binario directamente
+
+  const download = req.query.download === "1";
+
+  // 1) Nuevo esquema: blob en fila kv separada
+  if (att.blobId) {
+    const blob = await readTaskAttachmentBlob(att.blobId);
+    if (blob && blob.dataBase64) {
+      const buf = Buffer.from(blob.dataBase64, "base64");
+      res.setHeader("Content-Type", blob.mimeType || att.mimeType || "application/octet-stream");
+      if (download) res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(att.filename || blob.filename || "archivo")}"`);
+      else res.setHeader("Content-Disposition", `inline; filename="${encodeURIComponent(att.filename || blob.filename || "archivo")}"`);
+      res.setHeader("Content-Length", buf.length);
+      return res.end(buf);
+    }
+  }
+
+  // 2) Legacy: dataUrl inline en la propia tarea
   if (att.dataUrl && typeof att.dataUrl === "string") {
     const m = att.dataUrl.match(/^data:([^;]+);base64,(.+)$/);
     if (m) {
       const buf = Buffer.from(m[2], "base64");
-      const download = req.query.download === "1";
       res.setHeader("Content-Type", m[1]);
       if (download) res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(att.filename || "archivo")}"`);
       return res.end(buf);
     }
   }
+
+  // 3) Solo metadata
   res.json(att);
 }));
 
@@ -1726,9 +1794,14 @@ app.delete("/api/project-tasks/:id/attachments/:attId", wrap(async (req, res) =>
   const idx = items.findIndex((t) => Number(t.id) === taskId);
   if (idx < 0) return res.status(404).json({ message: "task not found" });
   const current = parseAttachments(items[idx].attachments);
+  const target = current.find((a) => a.id === attId);
   const next = current.filter((a) => a.id !== attId);
   items[idx] = { ...items[idx], attachments: next };
   await writeCol("projectTasks", items);
+  // Best-effort: borrar también el blob asociado si existía
+  if (target?.blobId) {
+    try { await deleteTaskAttachmentBlob(target.blobId); } catch (e) { console.warn("[task-attachment] no se pudo borrar blob", e?.message || e); }
+  }
   res.json({ ok: true });
 }));
 
