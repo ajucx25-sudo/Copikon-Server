@@ -1206,11 +1206,14 @@ app.post("/api/erp/sale-orders/from-lead", wrap(async (req, res) => {
 }));
 
 // GET /api/erp/sale-orders/from-lead/:leadId — inspeccionar estado actual
+// Devuelve: sale.order actual, sus facturas (account.move) y estados de cada una,
+// y además persiste el estado devuelto en el lead (odooSaleOrderState, invoices).
 app.get("/api/erp/sale-orders/from-lead/:leadId", wrap(async (req, res) => {
   const leadId = Number(req.params.leadId);
   const leads = await readCol("erpLeads");
-  const lead = leads.find(l => Number(l.id) === leadId);
-  if (!lead) return res.status(404).json({ ok: false, error: "Lead no encontrado" });
+  const idx = leads.findIndex(l => Number(l.id) === leadId);
+  if (idx < 0) return res.status(404).json({ ok: false, error: "Lead no encontrado" });
+  const lead = leads[idx];
   if (!lead.odooSaleOrderId) {
     return res.json({ ok: true, exists: false, leadId });
   }
@@ -1219,20 +1222,342 @@ app.get("/api/erp/sale-orders/from-lead/:leadId", wrap(async (req, res) => {
   }
   const orders = await odoo.searchRead(
     "sale.order", [["id", "=", Number(lead.odooSaleOrderId)]],
-    ["id", "name", "state", "amount_total", "partner_id", "date_order", "commitment_date", "origin"],
+    [
+      "id", "name", "state", "amount_total", "amount_untaxed", "amount_tax",
+      "partner_id", "date_order", "commitment_date", "origin",
+      "invoice_status", "invoice_ids", "currency_id", "company_id",
+    ],
     { limit: 1 }
   );
+  const order = orders[0] || null;
+
+  let invoices = [];
+  if (order && Array.isArray(order.invoice_ids) && order.invoice_ids.length) {
+    invoices = await odoo.searchRead(
+      "account.move", [["id", "in", order.invoice_ids]],
+      [
+        "id", "name", "state", "move_type", "payment_state",
+        "invoice_date", "invoice_date_due", "partner_id",
+        "amount_total", "amount_untaxed", "amount_tax", "amount_residual",
+        "currency_id", "company_id", "branch_id", "ref",
+      ],
+      { order: "invoice_date desc", limit: 50 }
+    );
+  }
+
+  // Deducir etapa unificada del ciclo Odoo para el frontend
+  //   presupuesto | presupuesto_enviado | orden_venta | facturada | pagada | cancelada
+  let stage = "presupuesto";
+  const s = order?.state;
+  if (s === "cancel") stage = "cancelada";
+  else if (s === "sent") stage = "presupuesto_enviado";
+  else if (s === "sale" || s === "done") {
+    stage = "orden_venta";
+    // Si hay factura posted → facturada; si además pagada → pagada
+    const posted = invoices.filter(i => i.state === "posted" && i.move_type === "out_invoice");
+    if (posted.length) {
+      const allPaid = posted.every(i => i.payment_state === "paid" || i.payment_state === "in_payment" || i.payment_state === "reversed");
+      stage = allPaid ? "pagada" : "facturada";
+    }
+  }
+
+  // Persistir el estado en el lead para que la vista funcione offline
+  const patch = {
+    odooSaleOrderState: order?.state ?? lead.odooSaleOrderState ?? null,
+    odooSaleOrderStage: stage,
+    odooSaleOrderInvoiceStatus: order?.invoice_status ?? null,
+    odooSaleOrderAmountTotal: order?.amount_total ?? null,
+    odooInvoiceIds: invoices.map(i => i.id),
+    odooInvoiceNames: invoices.map(i => i.name),
+    odooSaleOrderSyncedAt: new Date().toISOString(),
+  };
+  leads[idx] = { ...lead, ...patch };
+  await writeCol("erpLeads", leads);
+
   res.json({
     ok: true,
-    exists: orders.length > 0,
-    order: orders[0] || null,
+    exists: !!order,
+    order,
+    invoices,
+    stage,
     lead: {
+      id: lead.id,
       odooSaleOrderId: lead.odooSaleOrderId,
       odooSaleOrderName: lead.odooSaleOrderName,
-      odooSaleOrderState: lead.odooSaleOrderState,
-      odooSaleOrderSyncedAt: lead.odooSaleOrderSyncedAt,
+      odooSaleOrderState: patch.odooSaleOrderState,
+      odooSaleOrderStage: patch.odooSaleOrderStage,
+      odooSaleOrderInvoiceStatus: patch.odooSaleOrderInvoiceStatus,
+      odooSaleOrderAmountTotal: patch.odooSaleOrderAmountTotal,
+      odooInvoiceIds: patch.odooInvoiceIds,
+      odooInvoiceNames: patch.odooInvoiceNames,
+      odooSaleOrderSyncedAt: patch.odooSaleOrderSyncedAt,
     },
   });
+}));
+
+// GET /api/erp/invoices/:invoiceId/pdf — descarga el PDF oficial de la factura Odoo.
+// Usa el reporte estándar 'account.report_invoice' (v15). El binario se transmite
+// directamente al cliente para permitir preview (inline) o descarga (download=1).
+app.get("/api/erp/invoices/:invoiceId/pdf", wrap(async (req, res) => {
+  const invoiceId = Number(req.params.invoiceId);
+  if (!invoiceId) return res.status(400).json({ ok: false, error: "invoiceId requerido" });
+  if (!odoo.isConfigured()) return res.status(503).json({ ok: false, error: "Odoo no configurado" });
+
+  // Leer el nombre y estado para incluirlos en el filename
+  const rows = await odoo.searchRead(
+    "account.move", [["id", "=", invoiceId]],
+    ["id", "name", "state", "move_type", "partner_id"], { limit: 1 }
+  );
+  if (!rows.length) return res.status(404).json({ ok: false, error: "Factura no encontrada" });
+  const inv = rows[0];
+
+  // v15 estable: llamar report_download para renderizar el reporte account.report_invoice
+  // El endpoint XML-RPC estable es ir.actions.report -> _render_qweb_pdf.
+  let pdfBase64 = null;
+  const reportRefsToTry = ["account.account_invoices", "account.report_invoice", "account.report_invoice_document"];
+  let lastErr = null;
+  for (const ref of reportRefsToTry) {
+    try {
+      const result = await odoo.execute(
+        "ir.actions.report",
+        "_render_qweb_pdf",
+        [ref, [invoiceId]],
+        {}
+      );
+      // v15 devuelve [pdf_bytes_base64, 'pdf'] a través del bus binary
+      if (Array.isArray(result) && result[0]) {
+        pdfBase64 = result[0];
+        break;
+      }
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+
+  if (!pdfBase64) {
+    return res.status(500).json({
+      ok: false,
+      error: "No se pudo generar el PDF de la factura",
+      detail: String(lastErr?.message || lastErr || ""),
+    });
+  }
+
+  const buf = Buffer.from(pdfBase64, "base64");
+  const download = req.query.download === "1";
+  const safeName = String(inv.name || `factura-${invoiceId}`).replace(/[^\w\-\.]/g, "_") + ".pdf";
+  res.setHeader("Content-Type", "application/pdf");
+  res.setHeader("Content-Length", buf.length);
+  res.setHeader("Content-Disposition", `${download ? "attachment" : "inline"}; filename="${safeName}"`);
+  res.setHeader("Cache-Control", "private, max-age=60");
+  res.end(buf);
+}));
+
+// ============================================================
+// ADMINISTRACIÓN GENERATORS — datos financieros filtrados por rama
+// Rama N-COPIKON GENERATOR = branch_id 41 en company_id 12 (COPIKON C.A.)
+// ============================================================
+const GENERATORS_BRANCH_ID = 41;
+const GENERATORS_COMPANY_ID = 12;
+
+// GET /api/erp/generators/finanzas/resumen?from=YYYY-MM-DD&to=YYYY-MM-DD
+// Consolida en una sola llamada:
+//   - CxC (receivable no reconciliadas)
+//   - CxP (payable no reconciliadas)
+//   - Ventas facturadas del rango (out_invoice posted)
+//   - Compras/gastos facturadas del rango (in_invoice + in_refund posted)
+//   - Pagos in/out del rango (account.payment)
+//   - Rentabilidad: ingresos - costos - gastos (aproximada vía amount_untaxed_signed)
+app.get("/api/erp/generators/finanzas/resumen", wrap(async (req, res) => {
+  if (!odoo.isConfigured()) return res.status(503).json({ ok: false, error: "Odoo no configurado" });
+
+  // Rango por defecto: mes en curso
+  const now = new Date();
+  const defFrom = new Date(now.getFullYear(), now.getMonth(), 1).toISOString().slice(0, 10);
+  const defTo = now.toISOString().slice(0, 10);
+  const from = String(req.query.from || defFrom);
+  const to = String(req.query.to || defTo);
+  const asOf = String(req.query.as_of || to);
+
+  const branchFilter = ["branch_id", "=", GENERATORS_BRANCH_ID];
+  const companyFilter = ["company_id", "=", GENERATORS_COMPANY_ID];
+
+  // ── 1) CxC y CxP a la fecha ─────────────────────────────────
+  const arDomain = [
+    ["parent_state", "=", "posted"],
+    ["full_reconcile_id", "=", false],
+    ["date", "<=", asOf],
+    ["account_id.user_type_id.type", "=", "receivable"],
+    companyFilter,
+    branchFilter,
+  ];
+  const apDomain = [
+    ["parent_state", "=", "posted"],
+    ["full_reconcile_id", "=", false],
+    ["date", "<=", asOf],
+    ["account_id.user_type_id.type", "=", "payable"],
+    companyFilter,
+    branchFilter,
+  ];
+
+  const [arLines, apLines] = await Promise.all([
+    odoo.searchRead("account.move.line", arDomain,
+      ["id", "move_id", "move_name", "partner_id", "date", "date_maturity", "amount_residual", "balance", "currency_id", "name"],
+      { limit: 5000, order: "date_maturity asc" }),
+    odoo.searchRead("account.move.line", apDomain,
+      ["id", "move_id", "move_name", "partner_id", "date", "date_maturity", "amount_residual", "balance", "currency_id", "name"],
+      { limit: 5000, order: "date_maturity asc" }),
+  ]);
+
+  // Suma de amount_residual: en AR positivo = nos deben; en AP negativo = debemos
+  const cxc_total = arLines.reduce((s, l) => s + Math.max(0, (l.amount_residual || 0)), 0);
+  const cxp_total = apLines.reduce((s, l) => s + Math.max(0, -(l.amount_residual || 0)), 0);
+
+  // Aging simple
+  function ageBuckets(lines, sign) {
+    const today = new Date(asOf); today.setHours(0,0,0,0);
+    const b = { al_dia: 0, d0_30: 0, d31_60: 0, d61_90: 0, dmas90: 0 };
+    for (const l of lines) {
+      const amount = sign > 0 ? Math.max(0, (l.amount_residual || 0)) : Math.max(0, -(l.amount_residual || 0));
+      if (amount <= 0.01) continue;
+      const due = l.date_maturity ? new Date(l.date_maturity) : null;
+      if (!due) { b.al_dia += amount; continue; }
+      due.setHours(0,0,0,0);
+      const days = Math.floor((today - due) / 86400000);
+      if (days <= 0) b.al_dia += amount;
+      else if (days <= 30) b.d0_30 += amount;
+      else if (days <= 60) b.d31_60 += amount;
+      else if (days <= 90) b.d61_90 += amount;
+      else b.dmas90 += amount;
+    }
+    return b;
+  }
+  const cxc_aging = ageBuckets(arLines, 1);
+  const cxp_aging = ageBuckets(apLines, -1);
+
+  // ── 2) Movimientos del rango (ventas / compras / notas) ─────
+  const moveDomain = [
+    ["state", "=", "posted"],
+    ["invoice_date", ">=", from],
+    ["invoice_date", "<=", to],
+    companyFilter,
+    branchFilter,
+  ];
+  const moves = await odoo.searchRead("account.move",
+    [...moveDomain, ["move_type", "in", ["out_invoice", "out_refund", "in_invoice", "in_refund"]]],
+    ["id", "name", "move_type", "payment_state", "invoice_date", "invoice_date_due",
+     "partner_id", "amount_total", "amount_untaxed", "amount_tax", "amount_residual",
+     "amount_total_signed", "amount_untaxed_signed", "currency_id", "invoice_origin"],
+    { limit: 5000, order: "invoice_date desc" }
+  );
+
+  let ventas_facturado = 0, ventas_neto = 0;
+  let compras_facturado = 0, compras_neto = 0;
+  const salesInvoices = [];
+  const purchaseInvoices = [];
+  for (const m of moves) {
+    const total = m.amount_total || 0;
+    const neto = m.amount_untaxed || 0;
+    if (m.move_type === "out_invoice") { ventas_facturado += total; ventas_neto += neto; salesInvoices.push(m); }
+    else if (m.move_type === "out_refund") { ventas_facturado -= total; ventas_neto -= neto; salesInvoices.push(m); }
+    else if (m.move_type === "in_invoice") { compras_facturado += total; compras_neto += neto; purchaseInvoices.push(m); }
+    else if (m.move_type === "in_refund") { compras_facturado -= total; compras_neto -= neto; purchaseInvoices.push(m); }
+  }
+
+  // ── 3) Pagos del rango (cobros y pagos) ──────────────────────
+  // account.payment es la fuente de flujo de caja real efectivo
+  let payments = [];
+  try {
+    payments = await odoo.searchRead("account.payment",
+      [
+        ["state", "in", ["posted", "paid", "in_process"]],
+        ["date", ">=", from],
+        ["date", "<=", to],
+        companyFilter,
+        branchFilter,
+      ],
+      ["id", "name", "partner_id", "payment_type", "amount", "date", "ref",
+       "journal_id", "currency_id", "partner_type", "state"],
+      { limit: 5000, order: "date desc" }
+    );
+  } catch (e) {
+    // Si la instancia no expone branch_id en account.payment, hacer fallback sin branch
+    // filtrando luego por partner o journal (por ahora devolvemos vacío)
+    payments = [];
+  }
+
+  let cobros = 0, pagos = 0;
+  for (const p of payments) {
+    if (p.payment_type === "inbound") cobros += p.amount || 0;
+    else if (p.payment_type === "outbound") pagos += p.amount || 0;
+  }
+
+  // ── 4) Rentabilidad aproximada del rango ─────────────────────
+  // ingresos = ventas_neto ; egresos = compras_neto (esto NO separa costo vs gasto
+  // porque en Odoo v15 sin analytic el desglose real requiere el P&L).
+  const rentabilidad_bruta = ventas_neto - compras_neto;
+  const margen_pct = ventas_neto > 0 ? (rentabilidad_bruta / ventas_neto) * 100 : 0;
+
+  res.json({
+    ok: true,
+    branch_id: GENERATORS_BRANCH_ID,
+    branch_name: "N-COPIKON GENERATOR",
+    company_id: GENERATORS_COMPANY_ID,
+    period: { from, to, as_of: asOf },
+    cxc: {
+      total: cxc_total,
+      aging: cxc_aging,
+      lines: arLines.slice(0, 500),
+    },
+    cxp: {
+      total: cxp_total,
+      aging: cxp_aging,
+      lines: apLines.slice(0, 500),
+    },
+    ventas: {
+      facturado: ventas_facturado,
+      neto: ventas_neto,
+      count: salesInvoices.length,
+      invoices: salesInvoices.slice(0, 200),
+    },
+    compras_gastos: {
+      facturado: compras_facturado,
+      neto: compras_neto,
+      count: purchaseInvoices.length,
+      invoices: purchaseInvoices.slice(0, 200),
+    },
+    flujo_caja: {
+      cobros,
+      pagos,
+      neto: cobros - pagos,
+      count: payments.length,
+      payments: payments.slice(0, 500),
+    },
+    rentabilidad: {
+      ingresos_neto: ventas_neto,
+      costos_gastos_neto: compras_neto,
+      utilidad_bruta: rentabilidad_bruta,
+      margen_pct,
+    },
+    generatedAt: new Date().toISOString(),
+  });
+}));
+
+// GET /api/erp/invoices/:invoiceId — metadata de la factura (para refresh sin PDF)
+app.get("/api/erp/invoices/:invoiceId", wrap(async (req, res) => {
+  const invoiceId = Number(req.params.invoiceId);
+  if (!invoiceId) return res.status(400).json({ ok: false, error: "invoiceId requerido" });
+  if (!odoo.isConfigured()) return res.status(503).json({ ok: false, error: "Odoo no configurado" });
+  const rows = await odoo.searchRead(
+    "account.move", [["id", "=", invoiceId]],
+    [
+      "id", "name", "state", "move_type", "payment_state",
+      "invoice_date", "invoice_date_due", "partner_id",
+      "amount_total", "amount_untaxed", "amount_tax", "amount_residual",
+      "currency_id", "company_id", "branch_id", "ref", "invoice_origin",
+    ], { limit: 1 }
+  );
+  if (!rows.length) return res.status(404).json({ ok: false, error: "Factura no encontrada" });
+  res.json({ ok: true, invoice: rows[0] });
 }));
 
 // ============================================================
