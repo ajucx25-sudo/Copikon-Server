@@ -1198,6 +1198,37 @@ app.post("/api/erp/sale-orders/from-lead", wrap(async (req, res) => {
   });
 }));
 
+// GET /api/erp/odoo/permission-probe — diagnóstico de permisos Odoo
+app.get("/api/erp/odoo/permission-probe", wrap(async (req, res) => {
+  if (!odoo.isConfigured()) return res.status(503).json({ ok: false, error: "Odoo no configurado" });
+  const report = {};
+  try {
+    const users = await odoo.execute("res.users", "search_read",
+      [[["login", "=", process.env.ODOO_LOGIN]]],
+      { fields: ["id", "name", "login", "company_id", "company_ids"], limit: 1 });
+    report.user = users?.[0] || null;
+  } catch (e) { report.userError = String(e.message || e); }
+  for (const [model, ops] of [
+    ["res.partner", ["read", "create", "write"]],
+    ["sale.order", ["read", "create", "write"]],
+    ["sale.order.line", ["read", "create", "write"]],
+    ["product.product", ["read"]],
+  ]) {
+    report[model] = {};
+    for (const op of ops) {
+      try {
+        const ok = await odoo.execute(model, "check_access_rights", [op], { raise_exception: false });
+        report[model][op] = ok;
+      } catch (e) { report[model][op] = `ERROR: ${e.message || e}`; }
+    }
+  }
+  try {
+    const c = await odoo.execute("res.partner", "search_count", [[]]);
+    report.partnerCount = c;
+  } catch (e) { report.partnerCountError = String(e.message || e); }
+  res.json({ ok: true, report });
+}));
+
 // GET /api/erp/sale-orders/from-lead/:leadId — inspeccionar estado actual
 app.get("/api/erp/sale-orders/from-lead/:leadId", wrap(async (req, res) => {
   const leadId = Number(req.params.leadId);
