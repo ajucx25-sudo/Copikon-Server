@@ -954,6 +954,281 @@ app.get("/api/erp/products/odoo-sync-status", wrap(async (_req, res) => {
 }));
 
 // ============================================================
+// SALE ORDER SYNC — Copikon Generators
+// Cuando un lead se aprueba en la etapa de negociación, se crea la
+// orden de venta correspondiente en Odoo con sus líneas de producto.
+// ============================================================
+
+// Normaliza un RIF venezolano al formato canónico J-XXXXXXXX-X (o G-, V-, E-, P-)
+function normalizeRif(rif) {
+  if (!rif) return null;
+  const clean = String(rif).replace(/[^0-9A-Za-z]/g, "").toUpperCase();
+  if (clean.length < 8) return null;
+  const letter = /^[JGVEP]/.test(clean) ? clean[0] : "J";
+  const digits = clean.replace(/^[JGVEP]/, "").replace(/[^0-9]/g, "");
+  if (digits.length < 7) return null;
+  // Formato: L-XXXXXXXXX-X (usar los últimos 10 dígitos si sobran)
+  const body = digits.slice(0, digits.length - 1);
+  const check = digits.slice(-1);
+  return `${letter}-${body}-${check}`;
+}
+
+// Busca o crea un res.partner en Odoo a partir del cliente local.
+// Estrategia: 1) buscar por VAT/RIF, 2) por email, 3) por nombre exacto,
+// 4) crear nuevo. Devuelve el partner_id (int).
+async function findOrCreatePartner(client, companyId) {
+  const rif = normalizeRif(client.rif || client.vat);
+  const email = (client.email || "").trim().toLowerCase();
+  const name = (client.name || client.contactName || "").trim();
+
+  // 1) Búsqueda por VAT/RIF
+  if (rif) {
+    const found = await odoo.searchRead(
+      "res.partner", [["vat", "=", rif]], ["id", "name"], { limit: 1 }
+    );
+    if (found[0]) return { partnerId: found[0].id, matched: "vat", partnerName: found[0].name };
+  }
+
+  // 2) Búsqueda por email
+  if (email) {
+    const found = await odoo.searchRead(
+      "res.partner", [["email", "=ilike", email]], ["id", "name"], { limit: 1 }
+    );
+    if (found[0]) return { partnerId: found[0].id, matched: "email", partnerName: found[0].name };
+  }
+
+  // 3) Búsqueda por nombre exacto (case-insensitive)
+  if (name) {
+    const found = await odoo.searchRead(
+      "res.partner", [["name", "=ilike", name]], ["id", "name"], { limit: 1 }
+    );
+    if (found[0]) return { partnerId: found[0].id, matched: "name", partnerName: found[0].name };
+  }
+
+  // 4) Crear nuevo
+  if (!name) throw new Error("Cliente sin nombre — no se puede crear en Odoo");
+  const partnerVals = {
+    name,
+    company_id: companyId,
+    customer_rank: 1,
+    is_company: true,
+  };
+  if (rif) partnerVals.vat = rif;
+  if (email) partnerVals.email = email;
+  if (client.phone) partnerVals.phone = String(client.phone).slice(0, 32);
+  const partnerId = await odoo.execute("res.partner", "create", [partnerVals]);
+  return { partnerId, matched: "created", partnerName: name };
+}
+
+// POST /api/erp/sale-orders/from-lead — crea sale.order en Odoo a partir de
+// un lead aprobado de Copikon Generators.
+// Body: { leadId: number, confirmOrder?: boolean }
+app.post("/api/erp/sale-orders/from-lead", wrap(async (req, res) => {
+  const { leadId, confirmOrder = false } = req.body || {};
+  if (!leadId) return res.status(400).json({ ok: false, error: "leadId requerido" });
+  if (!odoo.isConfigured()) {
+    return res.status(503).json({ ok: false, error: "Odoo no configurado" });
+  }
+
+  const leads = await readCol("erpLeads");
+  const lead = leads.find(l => Number(l.id) === Number(leadId));
+  if (!lead) return res.status(404).json({ ok: false, error: "Lead no encontrado" });
+
+  // Idempotencia: si ya tiene orden creada, devolver la existente
+  if (lead.odooSaleOrderId) {
+    const existing = await odoo.searchRead(
+      "sale.order", [["id", "=", Number(lead.odooSaleOrderId)]],
+      ["id", "name", "state", "amount_total", "partner_id"],
+      { limit: 1 }
+    );
+    if (existing[0]) {
+      return res.json({
+        ok: true, already: true,
+        odooSaleOrderId: existing[0].id,
+        odooSaleOrderName: existing[0].name,
+        state: existing[0].state,
+        amount_total: existing[0].amount_total,
+      });
+    }
+  }
+
+  // Resolver cliente
+  const clientId = lead.convertedClientId;
+  if (!clientId) return res.status(400).json({ ok: false, error: "Lead sin cliente vinculado" });
+  const clients = await readCol("erpClients");
+  const client = clients.find(c => Number(c.id) === Number(clientId));
+  if (!client) return res.status(404).json({ ok: false, error: `Cliente #${clientId} no existe` });
+
+  // Copikon Generators pertenece a company_id=12 (COPIKON C.A.)
+  const COMPANY_ID = 12;
+
+  // 1) Buscar/crear partner en Odoo
+  const partnerResult = await findOrCreatePartner(client, COMPANY_ID);
+
+  // 2) Parsear items del lead
+  let rawItems = lead.quoteItems;
+  if (typeof rawItems === "string") {
+    try { rawItems = JSON.parse(rawItems); } catch { rawItems = []; }
+  }
+  if (!Array.isArray(rawItems)) rawItems = [];
+  if (rawItems.length === 0) {
+    return res.status(400).json({ ok: false, error: "Lead sin items de cotización" });
+  }
+
+  // 3) Resolver productos Copikon → Odoo
+  const products = await readCol("erpProducts");
+  const productById = new Map(products.map(p => [Number(p.id), p]));
+  const productByCode = new Map();
+  for (const p of products) {
+    const k = String(p.code || p.sku || "").trim().toUpperCase();
+    if (k) productByCode.set(k, p);
+  }
+
+  const orderLines = [];
+  const unresolvedItems = [];
+  for (const it of rawItems) {
+    const qty = Number(it.qty || it.cantidad || it.quantity || 1);
+    const priceUnit = Number(it.precio || it.price || it.priceUnit || 0);
+    const pid = Number(it.productId || it.product_id || 0);
+    const code = String(it.productCode || it.code || "").trim().toUpperCase();
+    let prod = pid ? productById.get(pid) : null;
+    if (!prod && code) prod = productByCode.get(code);
+    const odooProductId = prod?.odooId ? Number(prod.odooId) : null;
+    if (!odooProductId) {
+      // Línea sin producto Odoo: la agrego como línea de descripción (name-only)
+      unresolvedItems.push({
+        name: it.concepto || it.productName || prod?.name || `Item sin código`,
+        qty, priceUnit,
+      });
+      orderLines.push([0, 0, {
+        name: it.concepto || it.productName || prod?.name || "Item",
+        product_uom_qty: qty,
+        price_unit: priceUnit,
+        display_type: false,
+      }]);
+      continue;
+    }
+    const lineVals = {
+      product_id: odooProductId,
+      product_uom_qty: qty,
+      price_unit: priceUnit,
+    };
+    // Si viene un concepto/descripción custom distinto al nombre del producto
+    if (it.concepto && String(it.concepto).trim() && it.concepto !== prod?.name) {
+      lineVals.name = String(it.concepto).trim();
+    }
+    orderLines.push([0, 0, lineVals]);
+  }
+
+  // 4) Construir sale.order
+  const orderVals = {
+    partner_id: partnerResult.partnerId,
+    company_id: COMPANY_ID,
+    order_line: orderLines,
+    origin: `Copikon Generators · Lead #${leadId}${lead.contractNumber ? ` · Contrato ${lead.contractNumber}` : ""}`,
+  };
+  if (lead.contractNumber) {
+    orderVals.client_order_ref = String(lead.contractNumber);
+  }
+  if (lead.deliveryDate) {
+    orderVals.commitment_date = String(lead.deliveryDate).slice(0, 19).replace("T", " ");
+  }
+
+  let saleOrderId, saleOrderName, saleOrderState = "draft";
+  try {
+    saleOrderId = await odoo.execute("sale.order", "create", [orderVals]);
+    const readBack = await odoo.searchRead(
+      "sale.order", [["id", "=", saleOrderId]],
+      ["id", "name", "state", "amount_total"], { limit: 1 }
+    );
+    if (readBack[0]) {
+      saleOrderName = readBack[0].name;
+      saleOrderState = readBack[0].state;
+    }
+  } catch (e) {
+    console.error("[sale-order-from-lead] create failed", e);
+    return res.status(500).json({ ok: false, error: `Error al crear sale.order: ${e.message}` });
+  }
+
+  // 5) Confirmar la orden si el frontend lo pide (opcional)
+  let confirmed = false;
+  if (confirmOrder) {
+    try {
+      await odoo.execute("sale.order", "action_confirm", [[saleOrderId]]);
+      confirmed = true;
+      const readBack2 = await odoo.searchRead(
+        "sale.order", [["id", "=", saleOrderId]], ["state"], { limit: 1 }
+      );
+      if (readBack2[0]) saleOrderState = readBack2[0].state;
+    } catch (e) {
+      console.warn("[sale-order-from-lead] confirm failed, keeping draft", e.message);
+    }
+  }
+
+  // 6) Guardar de vuelta en el lead (idempotencia futura)
+  const updatedLeads = leads.map(l => {
+    if (Number(l.id) === Number(leadId)) {
+      return {
+        ...l,
+        odooSaleOrderId: saleOrderId,
+        odooSaleOrderName: saleOrderName,
+        odooSaleOrderState: saleOrderState,
+        odooSaleOrderSyncedAt: new Date().toISOString(),
+        odooPartnerId: partnerResult.partnerId,
+      };
+    }
+    return l;
+  });
+  await writeCol("erpLeads", updatedLeads);
+
+  const readBackFinal = await odoo.searchRead(
+    "sale.order", [["id", "=", saleOrderId]], ["amount_total"], { limit: 1 }
+  );
+
+  res.json({
+    ok: true,
+    odooSaleOrderId: saleOrderId,
+    odooSaleOrderName: saleOrderName,
+    state: saleOrderState,
+    confirmed,
+    amount_total: readBackFinal[0]?.amount_total || 0,
+    partner: partnerResult,
+    lines: orderLines.length,
+    unresolvedItems: unresolvedItems.length,
+  });
+}));
+
+// GET /api/erp/sale-orders/from-lead/:leadId — inspeccionar estado actual
+app.get("/api/erp/sale-orders/from-lead/:leadId", wrap(async (req, res) => {
+  const leadId = Number(req.params.leadId);
+  const leads = await readCol("erpLeads");
+  const lead = leads.find(l => Number(l.id) === leadId);
+  if (!lead) return res.status(404).json({ ok: false, error: "Lead no encontrado" });
+  if (!lead.odooSaleOrderId) {
+    return res.json({ ok: true, exists: false, leadId });
+  }
+  if (!odoo.isConfigured()) {
+    return res.status(503).json({ ok: false, error: "Odoo no configurado" });
+  }
+  const orders = await odoo.searchRead(
+    "sale.order", [["id", "=", Number(lead.odooSaleOrderId)]],
+    ["id", "name", "state", "amount_total", "partner_id", "date_order", "commitment_date", "origin"],
+    { limit: 1 }
+  );
+  res.json({
+    ok: true,
+    exists: orders.length > 0,
+    order: orders[0] || null,
+    lead: {
+      odooSaleOrderId: lead.odooSaleOrderId,
+      odooSaleOrderName: lead.odooSaleOrderName,
+      odooSaleOrderState: lead.odooSaleOrderState,
+      odooSaleOrderSyncedAt: lead.odooSaleOrderSyncedAt,
+    },
+  });
+}));
+
+// ============================================================
 // STOCK POR BODEGA / SUCURSAL — Requerimientos especiales v2
 // Filtrado a compañía Copikon Venezuela, C.A. (J-29465456-8)
 // Rutas fuera de /api/erp/products/* para no chocar con CRUD /:id.
