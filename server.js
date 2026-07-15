@@ -1011,14 +1011,12 @@ async function findOrCreatePartner(client, companyId) {
     if (found[0]) return { partnerId: found[0].id, matched: "name", partnerName: found[0].name };
   }
 
-  // 4) Crear nuevo con company_id = false (partner compartido entre companies).
-  // Este es el patrón recomendado por Odoo para clientes multi-company — evita
-  // conflictos si más adelante Copikon Venezuela y Copikon C.A. le facturan al
-  // mismo cliente.
+  // 4) Crear nuevo. Se crea en la company objetivo (12) porque en esta
+  // instancia de Odoo company_id es obligatorio en res.partner.
   if (!name) throw new Error("Cliente sin nombre — no se puede crear en Odoo");
   const partnerVals = {
     name,
-    company_id: false, // partner compartido entre companies
+    company_id: companyId,
     customer_rank: 1,
     is_company: true,
   };
