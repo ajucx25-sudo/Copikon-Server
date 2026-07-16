@@ -682,11 +682,21 @@ function mapOdooProduct(op, existingByOdooId = new Map(), existingBySku = new Ma
   base.syncStatus = "odoo";
   base.lastSyncAt = new Date().toISOString();
 
-  // Imagen: si viene inline la usa; sino apunta al endpoint on-demand.
-  // El endpoint sirve la imagen de Odoo solo cuando el picker la pide (lazy).
+  // Imagen: PRESERVA la imagen manual del usuario (data URL o http subido).
+  // Solo sobreescribe si viene inline de Odoo, o si el producto no tenía ninguna
+  // imagen previa (en cuyo caso apunta al endpoint on-demand de Odoo).
+  //
+  // Se considera "imagen manual" cualquier data URL (data:image/...) o URL http/https
+  // — el usuario la subió desde el módulo Inventario y NO debe perderse en el sync.
+  const existingImg = String(base.imageUrl || "");
+  const isManualImage = existingImg.startsWith("data:image/") || /^https?:\/\//i.test(existingImg);
   if (op.image_128) {
+    // Si Odoo trae imagen inline, la usa (fuente autoritativa cuando existe en ERP)
     base.imageUrl = odooBinaryToDataUrl(op.image_128);
+  } else if (isManualImage) {
+    // PRESERVAR imagen manual subida por el usuario — no pisarla con el proxy
   } else if (op.id) {
+    // Sin imagen manual ni imagen inline: proxy on-demand a Odoo
     base.imageUrl = `/api/erp/products/odoo-image/${op.id}`;
   } else if (!base.imageUrl) {
     base.imageUrl = "";
