@@ -941,11 +941,23 @@ app.get("/api/erp/products/odoo-brand-count", wrap(async (req, res) => {
       odoo.count("product.product", domainSel).catch(() => -1),
       odoo.count("product.product", domainName).catch(() => -1),
     ]);
-    // Samples por marca char
-    const sample = await odoo.searchRead("product.product", domainChar,
+    // Samples: primero prueba x_studio_marca_1 (selection), luego char, luego name
+    let sample = await odoo.searchRead("product.product", domainSel,
       ["id", "default_code", "name", "x_studio_marca", "x_studio_marca_1", "company_id", "categ_id", "active", "sale_ok"],
       { limit: 10 }
     ).catch(() => []);
+    if (!sample.length) {
+      sample = await odoo.searchRead("product.product", domainChar,
+        ["id", "default_code", "name", "x_studio_marca", "x_studio_marca_1", "company_id", "categ_id", "active", "sale_ok"],
+        { limit: 10 }
+      ).catch(() => []);
+    }
+    if (!sample.length) {
+      sample = await odoo.searchRead("product.product", domainName,
+        ["id", "default_code", "name", "x_studio_marca", "x_studio_marca_1", "company_id", "categ_id", "active", "sale_ok"],
+        { limit: 10 }
+      ).catch(() => []);
+    }
     // Distribución de marcas
     const brandsField = await odoo.execute("product.product", "read_group",
       [[["sale_ok", "=", true], ["active", "=", true]], ["x_studio_marca"], ["x_studio_marca"]],
