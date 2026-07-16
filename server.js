@@ -751,29 +751,18 @@ async function syncOdooCatalog({ limit = 25000, includeImages = false } = {}) {
   fields.push("company_id"); // para debug/log
   if (includeImages) fields.push("image_128");
 
-  // Restringir sync a la company Copikon C.A. (id=12). Odoo tiene un duplicado
-  // histórico id=1 "COPIKON VENEZUELA, C.A." con productos antiguos (nombres
-  // con "(copiar)") que causan colisiones de SKU al mostrar precios en la
-  // intranet. La fuente de verdad definitiva es Copikon C.A. (con Generators).
+  // v56-21: Traer TODOS los productos vendibles activos, sin filtrar por company.
+  // Odoo tiene dos companies históricas: id=1 (COPIKON VENEZUELA, C.A. antiguo)
+  // e id=12 (COPIKON C.A. actual con Generators). Filtrar solo por id=12 dejaba
+  // fuera ~10.700 productos válidos (incluidos casi todos los BAIFA de Generators),
+  // reduciendo el catálogo de ~19.600 a ~8.900. Ahora traemos todos y deduplicamos
+  // más abajo por default_code (SKU) prefiriendo el de company 12 cuando hay choque.
   const copikonCompanyId = await getCopikonCompanyId();
   const domain = [
     ["sale_ok", "=", true],
     ["active", "=", true],
   ];
-  if (copikonCompanyId) {
-    // product.product en Odoo multi-company usa company_id nullable:
-    // - null = producto compartido por todas las companies
-    // - id específico = solo esa company
-    // Queremos: productos de Copikon C.A. + productos compartidos (null).
-    // El dominio Odoo es polaco-prefijo (RPN): el operador "|" aplica a los dos
-    // siguientes leaves. Deben ir como elementos separados, NO como sub-array.
-    domain.push("|");
-    domain.push(["company_id", "=", copikonCompanyId]);
-    domain.push(["company_id", "=", false]);
-    console.log("[syncOdooCatalog] filtrando por company_id =", copikonCompanyId, "o compartidos");
-  } else {
-    console.warn("[syncOdooCatalog] getCopikonCompanyId() retornó null; sync sin filtro de company");
-  }
+  console.log("[syncOdooCatalog] sync sin filtro de company (multi-company). companyId preferida =", copikonCompanyId);
 
   // Odoo aplica límite server-side de 10.000 en search_read; paginamos manualmente
   const pageSize = 2000;
@@ -791,6 +780,31 @@ async function syncOdooCatalog({ limit = 25000, includeImages = false } = {}) {
     if (page.length < remaining) break; // última página
     offset += page.length;
   }
+
+  // 1b. Deduplicar por default_code (SKU): cuando el mismo SKU aparece en
+  //     company 12 y en company 1, preferimos el de company 12 (Copikon C.A.).
+  //     Los que no tienen default_code no se deduplican (cada uno queda con su
+  //     propio odooId).
+  const bySku = new Map();
+  const noSku = [];
+  let dedupedOut = 0;
+  for (const op of odooRows) {
+    const sku = op.default_code ? String(op.default_code).trim().toUpperCase() : "";
+    if (!sku) { noSku.push(op); continue; }
+    const prev = bySku.get(sku);
+    if (!prev) { bySku.set(sku, op); continue; }
+    // Ambos tienen el mismo SKU: elegir preferido
+    const prevCid = Array.isArray(prev.company_id) ? prev.company_id[0] : prev.company_id;
+    const opCid   = Array.isArray(op.company_id) ? op.company_id[0] : op.company_id;
+    const prevPref = prevCid === copikonCompanyId ? 2 : (prevCid ? 1 : 0);
+    const opPref   = opCid === copikonCompanyId ? 2 : (opCid ? 1 : 0);
+    if (opPref > prevPref || (opPref === prevPref && Number(op.id) > Number(prev.id))) {
+      bySku.set(sku, op);
+    }
+    dedupedOut += 1;
+  }
+  const dedupedRows = [...bySku.values(), ...noSku];
+  console.log(`[syncOdooCatalog] dedup por SKU: ${odooRows.length} → ${dedupedRows.length} (removidos ${dedupedOut} duplicados de company alt)`);
 
   // 2. Cargar productos manuales existentes
   const manual = await readCol("erpProducts");
@@ -816,7 +830,7 @@ async function syncOdooCatalog({ limit = 25000, includeImages = false } = {}) {
   const seenOdooIds = new Set();
   let created = 0;
   let updated = 0;
-  for (const op of odooRows) {
+  for (const op of dedupedRows) {
     const mapped = mapOdooProduct(op, existingByOdooId, existingBySku);
     if (!mapped.id) {
       maxId += 1;
@@ -869,6 +883,7 @@ async function syncOdooCatalog({ limit = 25000, includeImages = false } = {}) {
   const meta = {
     lastSyncAt: new Date().toISOString(),
     odooCount: odooRows.length,
+    odooDeduped: dedupedRows.length,
     total: finalArr.length,
     created,
     updated,
