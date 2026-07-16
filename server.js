@@ -917,6 +917,44 @@ app.post("/api/erp/products/sync-odoo", wrap(async (req, res) => {
   }
 }));
 
+// GET /api/erp/products/odoo-brand-count?q=BAIFA — DEBUG: cuántos productos vendibles hay en Odoo con esa marca
+app.get("/api/erp/products/odoo-brand-count", wrap(async (req, res) => {
+  if (!odoo.isConfigured()) return res.status(503).json({ ok: false, error: "Odoo no configurado" });
+  const q = String(req.query.q || "BAIFA").trim();
+  try {
+    // Buscar por x_studio_marca (char) e y_studio_marca_1 (selection)
+    const domainChar = [
+      ["sale_ok", "=", true], ["active", "=", true],
+      ["x_studio_marca", "=ilike", `%${q}%`]
+    ];
+    const domainSel = [
+      ["sale_ok", "=", true], ["active", "=", true],
+      ["x_studio_marca_1", "=ilike", `%${q}%`]
+    ];
+    // También por nombre y categoría
+    const domainName = [
+      ["sale_ok", "=", true], ["active", "=", true],
+      ["name", "ilike", q]
+    ];
+    const [byChar, bySel, byName] = await Promise.all([
+      odoo.count("product.product", domainChar).catch(() => -1),
+      odoo.count("product.product", domainSel).catch(() => -1),
+      odoo.count("product.product", domainName).catch(() => -1),
+    ]);
+    // Samples por marca char
+    const sample = await odoo.searchRead("product.product", domainChar,
+      ["id", "default_code", "name", "x_studio_marca", "x_studio_marca_1", "company_id", "categ_id", "active", "sale_ok"],
+      { limit: 10 }
+    ).catch(() => []);
+    // Distribución de marcas
+    const brandsField = await odoo.execute("product.product", "read_group",
+      [[["sale_ok", "=", true], ["active", "=", true]], ["x_studio_marca"], ["x_studio_marca"]],
+      { lazy: false, limit: 200 }
+    ).catch(() => []);
+    res.json({ ok: true, q, counts: { byMarcaChar: byChar, byMarcaSel: bySel, byName: byName }, sample, marcaDistribution: brandsField.slice(0, 30) });
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+}));
+
 // GET /api/erp/products/odoo-fields-inspect — DEBUG: lista campos disponibles en product.product
 // Útil para descubrir si existe landed_cost, precio mínimo custom (x_studio_*), etc.
 app.get("/api/erp/products/odoo-fields-inspect", wrap(async (_req, res) => {
