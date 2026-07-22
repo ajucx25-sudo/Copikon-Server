@@ -3552,6 +3552,13 @@ const BITACORA_AREAS = {
     managerDeptId: null,
     reportLinkBase: "/administracion?module=bitacora",
   },
+  operaciones: {
+    modulePrefix: "ops-",
+    label: "Área de Operaciones",
+    // Logística, Almacén Central, Infraestructura y Mantenimiento.
+    managerDeptId: null,
+    reportLinkBase: "/operaciones?module=bitacora",
+  },
 };
 
 // Backward-compat: algún codigo puede referirse al prefijo Generators por const
