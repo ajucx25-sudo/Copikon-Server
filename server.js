@@ -1102,6 +1102,26 @@ async function findOrCreatePartner(client, companyId) {
   return { partnerId, matched: "created", partnerName: name };
 }
 
+// GET /api/erp/odoo/sale-order/:id — debug: lee un sale.order arbitrario incluyendo user_id/team_id
+app.get("/api/erp/odoo/sale-order/:id", wrap(async (req, res) => {
+  if (!odoo.isConfigured()) {
+    return res.status(503).json({ ok: false, error: "Odoo no configurado" });
+  }
+  const id = Number(req.params.id);
+  if (!id) return res.status(400).json({ ok: false, error: "id requerido" });
+  try {
+    const orders = await odoo.searchRead(
+      "sale.order", [["id", "=", id]],
+      ["id", "name", "state", "user_id", "team_id", "partner_id", "company_id",
+       "date_order", "create_uid", "origin", "amount_total"],
+      { limit: 1 }
+    );
+    res.json({ ok: true, order: orders[0] || null });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+}));
+
 // GET /api/erp/odoo/users — lista res.users de Odoo Venezuela (company 12 acepta la lista global,
 // pero filtramos active=true y usuarios internos que puedan actuar como salesperson).
 // Uso: pantalla admin "Mapeo Vendedores Odoo" para vincular empleados Copikon ↔ usuarios Odoo.
@@ -1388,6 +1408,7 @@ app.get("/api/erp/sale-orders/from-lead/:leadId", wrap(async (req, res) => {
       "id", "name", "state", "amount_total", "amount_untaxed", "amount_tax",
       "partner_id", "date_order", "commitment_date", "origin",
       "invoice_status", "invoice_ids", "currency_id", "company_id",
+      "user_id", "team_id",
     ],
     { limit: 1 }
   );
