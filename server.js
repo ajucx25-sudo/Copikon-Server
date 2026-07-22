@@ -1102,6 +1102,64 @@ async function findOrCreatePartner(client, companyId) {
   return { partnerId, matched: "created", partnerName: name };
 }
 
+// GET /api/erp/odoo/users — lista res.users de Odoo Venezuela (company 12 acepta la lista global,
+// pero filtramos active=true y usuarios internos que puedan actuar como salesperson).
+// Uso: pantalla admin "Mapeo Vendedores Odoo" para vincular empleados Copikon ↔ usuarios Odoo.
+app.get("/api/erp/odoo/users", wrap(async (_req, res) => {
+  if (!odoo.isConfigured()) {
+    return res.status(503).json({ ok: false, error: "Odoo no configurado" });
+  }
+  try {
+    // share=false excluye portal/public users; active=true excluye inactivos
+    const users = await odoo.searchRead(
+      "res.users",
+      [["active", "=", true], ["share", "=", false]],
+      ["id", "name", "login", "email", "company_id", "company_ids"],
+      { limit: 500, order: "name asc" }
+    );
+    const mapped = users.map(u => ({
+      id: u.id,
+      name: u.name,
+      login: u.login,
+      email: u.email || u.login || "",
+      companyId: Array.isArray(u.company_id) ? u.company_id[0] : u.company_id,
+      companyName: Array.isArray(u.company_id) ? u.company_id[1] : "",
+    }));
+    res.json({ ok: true, users: mapped, count: mapped.length });
+  } catch (e) {
+    console.error("[odoo/users] failed", e);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+}));
+
+// Helper: resolver odoo user_id para un empleado Copikon
+// 1) Si empleado tiene odooUserId explícito -> lo usa
+// 2) Fallback: busca en Odoo un res.users cuyo login o email coincida con el email del empleado
+// 3) Si no hay match -> null (Odoo usará el usuario que autentica la sesión)
+async function resolveOdooUserIdForEmployee(employee) {
+  if (!employee) return null;
+  if (employee.odooUserId && Number(employee.odooUserId) > 0) {
+    return Number(employee.odooUserId);
+  }
+  const email = String(employee.email || "").trim().toLowerCase();
+  if (!email) return null;
+  try {
+    const users = await odoo.searchRead(
+      "res.users",
+      ["|", ["login", "=ilike", email], ["email", "=ilike", email]],
+      ["id", "name", "login", "email"],
+      { limit: 1 }
+    );
+    if (users[0]) {
+      console.log(`[resolveOdooUserId] employee=${employee.id} email=${email} → odoo user_id=${users[0].id} (${users[0].name})`);
+      return users[0].id;
+    }
+  } catch (e) {
+    console.warn(`[resolveOdooUserId] lookup fail for ${email}:`, e.message);
+  }
+  return null;
+}
+
 // POST /api/erp/sale-orders/from-lead — crea sale.order en Odoo a partir de
 // un lead aprobado de Copikon Generators.
 // Body: { leadId: number, confirmOrder?: boolean }
@@ -1202,6 +1260,27 @@ app.post("/api/erp/sale-orders/from-lead", wrap(async (req, res) => {
     orderLines.push([0, 0, lineVals]);
   }
 
+  // 3.5) Resolver vendedor Odoo desde el assigneeId del lead
+  //   • Si el empleado tiene odooUserId explícito -> lo usa
+  //   • Sino, fallback: busca por email/login en Odoo
+  //   • Sino, Odoo asigna el usuario que autentica (por defecto)
+  let salespersonOdooUserId = null;
+  let salespersonSource = "default";
+  if (lead.assigneeId) {
+    try {
+      const employees = await readCol("employees");
+      const assignee = employees.find(e => Number(e.id) === Number(lead.assigneeId));
+      if (assignee) {
+        salespersonOdooUserId = await resolveOdooUserIdForEmployee(assignee);
+        if (salespersonOdooUserId) {
+          salespersonSource = assignee.odooUserId ? "mapped" : "email-fallback";
+        }
+      }
+    } catch (e) {
+      console.warn("[sale-order-from-lead] resolve salesperson fail", e.message);
+    }
+  }
+
   // 4) Construir sale.order
   const orderVals = {
     partner_id: partnerResult.partnerId,
@@ -1209,6 +1288,9 @@ app.post("/api/erp/sale-orders/from-lead", wrap(async (req, res) => {
     order_line: orderLines,
     origin: `Copikon Generators · Lead #${leadId}${lead.contractNumber ? ` · Contrato ${lead.contractNumber}` : ""}`,
   };
+  if (salespersonOdooUserId) {
+    orderVals.user_id = salespersonOdooUserId;
+  }
   if (lead.contractNumber) {
     orderVals.client_order_ref = String(lead.contractNumber);
   }
@@ -1277,6 +1359,11 @@ app.post("/api/erp/sale-orders/from-lead", wrap(async (req, res) => {
     partner: partnerResult,
     lines: orderLines.length,
     unresolvedItems: unresolvedItems.length,
+    salesperson: {
+      odooUserId: salespersonOdooUserId,
+      source: salespersonSource, // "mapped" | "email-fallback" | "default"
+      copikonEmployeeId: lead.assigneeId || null,
+    },
   });
 }));
 
