@@ -910,6 +910,46 @@ async function syncOdooCatalog({ limit = 25000, includeImages = false } = {}) {
   return meta;
 }
 
+// POST /api/erp/products/bulk-update-manual-prices
+// Actualiza precios manuales (priceExpress/Direct/Allies y sus %). Match por SKU o por id.
+// Body: { rows: [{ sku|id, priceExpress?, priceExpressPct?, priceDirect?, priceDirectPct?, priceAllies?, priceAlliesPct? }, ...] }
+// Solo escribe los campos manuales — no toca precio de venta, mínimo, costo landed, stock, etc.
+app.post("/api/erp/products/bulk-update-manual-prices", wrap(async (req, res) => {
+  const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
+  if (!rows.length) return res.status(400).json({ ok: false, error: "rows vacío" });
+
+  const MANUAL_FIELDS = ["priceExpress", "priceExpressPct", "priceDirect", "priceDirectPct", "priceAllies", "priceAlliesPct"];
+  const items = await readCol("erpProducts");
+  const bySku = new Map();
+  const byId = new Map();
+  for (const it of items) {
+    if (it.sku) bySku.set(String(it.sku).trim().toUpperCase(), it);
+    if (it.id != null) byId.set(Number(it.id), it);
+  }
+
+  let matched = 0, missing = 0, updated = 0;
+  const missingSkus = [];
+  for (const row of rows) {
+    const sku = (row.sku || "").toString().trim().toUpperCase();
+    const id = row.id != null ? Number(row.id) : null;
+    const target = (id && byId.get(id)) || (sku && bySku.get(sku)) || null;
+    if (!target) { missing += 1; if (sku && missingSkus.length < 20) missingSkus.push(sku); continue; }
+    matched += 1;
+    let touched = false;
+    for (const f of MANUAL_FIELDS) {
+      if (row[f] !== undefined) {
+        // Solo actualiza si es un número válido o cadena vacía (para borrar).
+        const v = row[f];
+        if (v === "" || v === null) { target[f] = ""; touched = true; }
+        else if (!isNaN(Number(v))) { target[f] = String(v); touched = true; }
+      }
+    }
+    if (touched) updated += 1;
+  }
+  await writeCol("erpProducts", items);
+  res.json({ ok: true, received: rows.length, matched, updated, missing, missingSkusSample: missingSkus });
+}));
+
 // POST /api/erp/products/sync-odoo — dispara sincronización manual
 app.post("/api/erp/products/sync-odoo", wrap(async (req, res) => {
   if (!odoo.isConfigured()) {
