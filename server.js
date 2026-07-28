@@ -2083,6 +2083,248 @@ app.post("/api/erp/stock-by-warehouse/sync", wrap(async (_req, res) => {
   }
 }));
 
+// ═══════════════════════════════════════════════════════════════════════════
+// COMPRAS ODOO (RFQ + PO) — Copikon C.A. company_id=12
+// ═══════════════════════════════════════════════════════════════════════════
+// Estados en purchase.order.state:
+//   draft      = RFQ borrador
+//   sent       = RFQ enviada al proveedor
+//   to approve = requiere aprobación
+//   purchase   = PO confirmada (compromiso de compra)
+//   done       = PO cerrada / recibida completa
+//   cancel     = cancelada
+//
+// Sincroniza compras + calcula stock en tránsito (qty pendiente por recibir)
+// agrupado por product_id. Guarda en kv.purchasesInTransit para el frontend.
+
+const PURCHASE_ACTIVE_STATES = ["draft", "sent", "to approve", "purchase"];
+// 'done' y 'cancel' se excluyen: done ya sumó al stock físico, cancel no cuenta.
+
+async function fetchOdooPurchases(companyId) {
+  const domain = [
+    ["state", "in", PURCHASE_ACTIVE_STATES],
+  ];
+  if (companyId) domain.push(["company_id", "=", companyId]);
+
+  const orders = await odoo.searchRead(
+    "purchase.order",
+    domain,
+    [
+      "id", "name", "state", "partner_id", "date_order", "date_planned",
+      "amount_total", "currency_id", "picking_type_id", "company_id",
+      "user_id", "origin", "notes",
+    ],
+    { order: "date_order desc", limit: 5000 }
+  );
+  if (!orders.length) return { orders: [], lines: [] };
+
+  const orderIds = orders.map(o => o.id);
+  const lines = await odoo.searchRead(
+    "purchase.order.line",
+    [["order_id", "in", orderIds]],
+    [
+      "id", "order_id", "product_id", "name", "product_qty", "qty_received",
+      "qty_invoiced", "price_unit", "price_subtotal", "date_planned",
+      "product_uom", "currency_id",
+    ],
+    { limit: 100000 }
+  );
+
+  // Bodega destino de cada orden (via picking_type_id.warehouse_id)
+  const pickingTypeIds = Array.from(new Set(
+    orders.map(o => Array.isArray(o.picking_type_id) ? o.picking_type_id[0] : null).filter(Boolean)
+  ));
+  const pickingTypes = pickingTypeIds.length ? await odoo.searchRead(
+    "stock.picking.type",
+    [["id", "in", pickingTypeIds]],
+    ["id", "name", "warehouse_id"],
+  ) : [];
+  const pickingTypeToWh = new Map();
+  for (const pt of pickingTypes) {
+    const whId = Array.isArray(pt.warehouse_id) ? pt.warehouse_id[0] : null;
+    const whName = Array.isArray(pt.warehouse_id) ? pt.warehouse_id[1] : null;
+    pickingTypeToWh.set(pt.id, { warehouseId: whId, warehouseName: whName });
+  }
+
+  const enrichedOrders = orders.map(o => {
+    const ptId = Array.isArray(o.picking_type_id) ? o.picking_type_id[0] : null;
+    const wh = ptId ? pickingTypeToWh.get(ptId) : null;
+    return {
+      id: o.id,
+      name: o.name,
+      state: o.state,
+      supplierId: Array.isArray(o.partner_id) ? o.partner_id[0] : null,
+      supplierName: Array.isArray(o.partner_id) ? o.partner_id[1] : null,
+      dateOrder: o.date_order,
+      datePlanned: o.date_planned,
+      amountTotal: o.amount_total,
+      currency: Array.isArray(o.currency_id) ? o.currency_id[1] : null,
+      warehouseId: wh?.warehouseId || null,
+      warehouseName: wh?.warehouseName || null,
+      buyerName: Array.isArray(o.user_id) ? o.user_id[1] : null,
+      origin: o.origin || null,
+      notes: o.notes || null,
+    };
+  });
+
+  const enrichedLines = lines.map(l => ({
+    id: l.id,
+    orderId: Array.isArray(l.order_id) ? l.order_id[0] : null,
+    orderName: Array.isArray(l.order_id) ? l.order_id[1] : null,
+    productId: Array.isArray(l.product_id) ? l.product_id[0] : null,
+    productName: Array.isArray(l.product_id) ? l.product_id[1] : null,
+    description: l.name,
+    qtyOrdered: Number(l.product_qty) || 0,
+    qtyReceived: Number(l.qty_received) || 0,
+    qtyPending: Math.max(0, (Number(l.product_qty) || 0) - (Number(l.qty_received) || 0)),
+    qtyInvoiced: Number(l.qty_invoiced) || 0,
+    priceUnit: Number(l.price_unit) || 0,
+    priceSubtotal: Number(l.price_subtotal) || 0,
+    datePlanned: l.date_planned,
+    uom: Array.isArray(l.product_uom) ? l.product_uom[1] : null,
+  }));
+
+  return { orders: enrichedOrders, lines: enrichedLines };
+}
+
+// POST /api/erp/purchases/sync-odoo — sincroniza RFQ+PO desde Odoo
+app.post("/api/erp/purchases/sync-odoo", wrap(async (_req, res) => {
+  if (!odoo.isConfigured()) {
+    return res.status(503).json({ ok: false, error: "Odoo no configurado" });
+  }
+  try {
+    const t0 = Date.now();
+    const companyId = await getCopikonCompanyId();
+    const { orders, lines } = await fetchOdooPurchases(companyId);
+
+    // Agregar por producto: qtyPending total + lista de órdenes que lo traen
+    const orderById = new Map(orders.map(o => [o.id, o]));
+    const inTransitByProduct = {};
+    for (const l of lines) {
+      if (!l.productId || l.qtyPending <= 0) continue;
+      const o = orderById.get(l.orderId);
+      if (!o) continue;
+      // Solo estados activos suman a en tránsito (draft/sent/to approve/purchase)
+      if (!PURCHASE_ACTIVE_STATES.includes(o.state)) continue;
+
+      if (!inTransitByProduct[l.productId]) {
+        inTransitByProduct[l.productId] = {
+          productId: l.productId,
+          productName: l.productName,
+          qtyPending: 0,
+          valueUsd: 0,
+          orders: [],
+        };
+      }
+      const entry = inTransitByProduct[l.productId];
+      entry.qtyPending += l.qtyPending;
+      entry.valueUsd += l.qtyPending * l.priceUnit;
+      entry.orders.push({
+        orderId: o.id,
+        orderName: o.name,
+        state: o.state,
+        supplierName: o.supplierName,
+        datePlanned: l.datePlanned || o.datePlanned,
+        qtyPending: l.qtyPending,
+        priceUnit: l.priceUnit,
+        warehouseName: o.warehouseName,
+      });
+    }
+
+    const payload = {
+      companyId,
+      orders,
+      lines,
+      inTransitByProduct,
+      updatedAt: new Date().toISOString(),
+      orderCount: orders.length,
+      lineCount: lines.length,
+      productCount: Object.keys(inTransitByProduct).length,
+      elapsedMs: Date.now() - t0,
+    };
+    await pool.query(
+      `INSERT INTO kv (key, value, updated_at) VALUES ($1, $2::jsonb, $3)
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at`,
+      ["purchasesInTransit", JSON.stringify(payload), Date.now()]
+    );
+    res.json({
+      ok: true,
+      companyId,
+      orderCount: payload.orderCount,
+      lineCount: payload.lineCount,
+      productCount: payload.productCount,
+      elapsedMs: payload.elapsedMs,
+      breakdownByState: orders.reduce((acc, o) => {
+        acc[o.state] = (acc[o.state] || 0) + 1;
+        return acc;
+      }, {}),
+    });
+  } catch (e) {
+    console.error("[sync-purchases-odoo]", e);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+}));
+
+// GET /api/erp/purchases — lista de RFQ + PO cacheadas
+// Query params:
+//   ?state=draft,sent,purchase   filtrar por estados (default: todos)
+//   ?productOdooIds=1,2,3        filtrar solo órdenes que contengan estos productos
+app.get("/api/erp/purchases", wrap(async (req, res) => {
+  const r = await pool.query("SELECT value, updated_at FROM kv WHERE key = 'purchasesInTransit'");
+  const payload = r.rows[0]?.value || null;
+  if (!payload) {
+    return res.json({ ok: true, cached: false, orders: [], lines: [], updatedAt: null });
+  }
+  const stateFilter = String(req.query.state || "").split(",").map(s => s.trim()).filter(Boolean);
+  const productFilter = String(req.query.productOdooIds || "").split(",").map(s => Number(s.trim())).filter(Boolean);
+
+  let orders = payload.orders || [];
+  let lines = payload.lines || [];
+
+  if (stateFilter.length) {
+    orders = orders.filter(o => stateFilter.includes(o.state));
+    const orderIds = new Set(orders.map(o => o.id));
+    lines = lines.filter(l => orderIds.has(l.orderId));
+  }
+  if (productFilter.length) {
+    const pset = new Set(productFilter);
+    lines = lines.filter(l => pset.has(l.productId));
+    const orderIds = new Set(lines.map(l => l.orderId));
+    orders = orders.filter(o => orderIds.has(o.id));
+  }
+
+  res.json({
+    ok: true,
+    cached: true,
+    orders,
+    lines,
+    orderCount: orders.length,
+    lineCount: lines.length,
+    updatedAt: payload.updatedAt,
+    breakdownByState: orders.reduce((acc, o) => {
+      acc[o.state] = (acc[o.state] || 0) + 1;
+      return acc;
+    }, {}),
+  });
+}));
+
+// GET /api/erp/purchases/in-transit-stock — mapa producto → cantidad pendiente
+// Uso: sumar al KPI Valor Inventario y a la columna 'En tránsito' del listado.
+app.get("/api/erp/purchases/in-transit-stock", wrap(async (_req, res) => {
+  const r = await pool.query("SELECT value, updated_at FROM kv WHERE key = 'purchasesInTransit'");
+  const payload = r.rows[0]?.value || null;
+  if (!payload) {
+    return res.json({ ok: true, cached: false, inTransitByProduct: {}, updatedAt: null });
+  }
+  res.json({
+    ok: true,
+    cached: true,
+    inTransitByProduct: payload.inTransitByProduct || {},
+    productCount: Object.keys(payload.inTransitByProduct || {}).length,
+    updatedAt: payload.updatedAt,
+  });
+}));
+
 // GET /api/erp/stock-by-warehouse — devuelve el cache
 // Query params:
 //   ?odooIds=1,2,3      filtra por odoo product ids
