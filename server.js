@@ -84,6 +84,7 @@ const ROUTES = {
   "/api/erp/maintenance-contracts": "erpMaintenanceContracts",
   "/api/erp/client-equipment": "erpClientEquipment",
   "/api/erp/external-equipment": "erpExternalEquipment",
+  "/api/erp/rental-equipment": "erpRentalEquipment",
   "/api/erp/supplier-bills": "erpSupplierBills",
   "/api/erp/operating-expenses": "erpOperatingExpenses",
   "/api/erp/suppliers": "erpSuppliers",
