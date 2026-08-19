@@ -85,6 +85,9 @@ const ROUTES = {
   // Contratos de servicio Generators v2 (multi-equipo mixto: venta+externo+alquiler)
   "/api/erp/service-contracts": "erpServiceContracts",
   "/api/erp/service-package-templates": "erpServicePackageTemplates",
+  // Certificación de técnicos externos (plantillas de checklist + certificaciones aplicadas)
+  "/api/technical-certification-templates": "technicalCertificationTemplates",
+  "/api/technical-certifications": "technicalCertifications",
   "/api/erp/client-equipment": "erpClientEquipment",
   "/api/erp/external-equipment": "erpExternalEquipment",
   "/api/erp/rental-equipment": "erpRentalEquipment",
