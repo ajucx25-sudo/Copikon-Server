@@ -82,6 +82,9 @@ const ROUTES = {
   "/api/erp/maintenance-orders": "erpMaintenanceOrders",
   "/api/erp/maintenance-plans": "erpMaintenancePlans",
   "/api/erp/maintenance-contracts": "erpMaintenanceContracts",
+  // Contratos de servicio Generators v2 (multi-equipo mixto: venta+externo+alquiler)
+  "/api/erp/service-contracts": "erpServiceContracts",
+  "/api/erp/service-package-templates": "erpServicePackageTemplates",
   "/api/erp/client-equipment": "erpClientEquipment",
   "/api/erp/external-equipment": "erpExternalEquipment",
   "/api/erp/rental-equipment": "erpRentalEquipment",
