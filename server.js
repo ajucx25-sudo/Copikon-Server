@@ -88,6 +88,10 @@ const ROUTES = {
   // Certificación de técnicos externos (plantillas de checklist + certificaciones aplicadas)
   "/api/technical-certification-templates": "technicalCertificationTemplates",
   "/api/technical-certifications": "technicalCertifications",
+  // Embajadores de marca BAIFA (empresas y personas naturales que representan Copikon Generators)
+  "/api/brand-ambassadors": "brandAmbassadors",
+  "/api/brand-ambassador-certification-templates": "brandAmbassadorCertificationTemplates",
+  "/api/brand-ambassador-certifications": "brandAmbassadorCertifications",
   "/api/erp/client-equipment": "erpClientEquipment",
   "/api/erp/external-equipment": "erpExternalEquipment",
   "/api/erp/rental-equipment": "erpRentalEquipment",
