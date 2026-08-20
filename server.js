@@ -130,6 +130,9 @@ const ROUTES = {
   // Notificaciones in-app y reportes semanales de bitácora
   "/api/notifications": "notifications",
   "/api/bitacora-reports": "bitacoraReports",
+  // Lista de precios BAIFA (Generators) - CRUD + endpoint público para website
+  "/api/generators/price-list-items": "generatorsPriceListItems",
+  "/api/generators/price-list-settings": "generatorsPriceListSettings",
 };
 
 const STATIC_KEYS = ["departments", "announcements", "jobDescriptions", "processMaps", "courses"];
@@ -7428,6 +7431,84 @@ app.get("/api/logistica/gps/live", wrap(async (_req, res) => {
     gps_end: t.gps_end,
   }));
   res.json({ ok: true, count: points.length, points });
+}));
+
+// ============================================================
+// LISTA DE PRECIOS BAIFA — endpoint público para website
+// ============================================================
+// Devuelve sólo los items marcados como published=true, ordenados por sortOrder/kvaNumeric.
+// Se pensó para ser consumido desde el sitio web público de BAIFA.
+app.get("/api/public/baifa/price-list", wrap(async (_req, res) => {
+  try {
+    res.set("Cache-Control", "public, max-age=300"); // 5 min cache CDN-friendly
+    const items = await readCol("generatorsPriceListItems");
+    const settings = (await readSingleton("generatorsPriceListSettings")) || {};
+    const published = (Array.isArray(items) ? items : [])
+      .filter((it) => it && it.published === true)
+      .map((it) => ({
+        id: it.id,
+        kva: it.kva || "",
+        kvaNumeric: Number(it.kvaNumeric) || 0,
+        phases: it.phases || "",
+        model: it.model || "",
+        description: it.description || "",
+        dimensions: it.dimensions || "",
+        weight: it.weight || "",
+        engine: it.engine || "",
+        generator: it.generator || "",
+        fuelConsumption: it.fuelConsumption || "",
+        tankLiters: it.tankLiters || "",
+        voltage: it.voltage || "",
+        atsAmp: it.atsAmp || "",
+        priceImmediate: Number(it.priceImmediate) || 0,
+        priceDirect: Number(it.priceDirect) || 0,
+        priceInstalled: Number(it.priceInstalled) || 0,
+        currency: it.currency || "USD",
+        stockImmediate: Number(it.stockImmediate) || 0,
+        stockTransit: Number(it.stockTransit) || 0,
+        stockProduction: Number(it.stockProduction) || 0,
+        arrivalDate: it.arrivalDate || null,
+        available: (Number(it.stockImmediate) || 0) > 0,
+        imageUrl: it.imageUrl || null,
+        sortOrder: Number(it.sortOrder) || 0,
+        updatedAt: it.updatedAt || null,
+      }))
+      .sort((a, b) => {
+        if (a.sortOrder !== b.sortOrder) return a.sortOrder - b.sortOrder;
+        return a.kvaNumeric - b.kvaNumeric;
+      });
+    res.json({
+      ok: true,
+      brand: "BAIFA",
+      distributor: {
+        name: settings.distributorName || "Copikon Generators",
+        phone: settings.contactPhone || "",
+        email: settings.contactEmail || "",
+        website: settings.website || "",
+        address: settings.address || "",
+      },
+      validFrom: settings.validFrom || null,
+      validUntil: settings.validUntil || null,
+      notes: settings.notes || "",
+      count: published.length,
+      items: published,
+      generatedAt: new Date().toISOString(),
+    });
+  } catch (err) {
+    console.error("[public price-list] error:", err);
+    res.status(500).json({ ok: false, error: String(err && err.message || err) });
+  }
+}));
+
+// Endpoint para importar los items del Excel de referencia (una sola vez, o resetear)
+app.post("/api/generators/price-list-items/reset", wrap(async (req, res) => {
+  try {
+    const seed = Array.isArray(req.body?.items) ? req.body.items : [];
+    await writeCol("generatorsPriceListItems", seed);
+    res.json({ ok: true, count: seed.length });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: String(err && err.message || err) });
+  }
 }));
 
 (async () => {
