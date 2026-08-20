@@ -131,8 +131,8 @@ const ROUTES = {
   "/api/notifications": "notifications",
   "/api/bitacora-reports": "bitacoraReports",
   // Lista de precios BAIFA (Generators) - CRUD + endpoint público para website
+  // (settings es un singleton, se maneja con handlers explícitos más abajo)
   "/api/generators/price-list-items": "generatorsPriceListItems",
-  "/api/generators/price-list-settings": "generatorsPriceListSettings",
 };
 
 const STATIC_KEYS = ["departments", "announcements", "jobDescriptions", "processMaps", "courses"];
@@ -7498,6 +7498,17 @@ app.get("/api/public/baifa/price-list", wrap(async (_req, res) => {
     console.error("[public price-list] error:", err);
     res.status(500).json({ ok: false, error: String(err && err.message || err) });
   }
+}));
+
+// Settings de la lista de precios BAIFA (singleton)
+app.get("/api/generators/price-list-settings", wrap(async (_req, res) => {
+  const settings = (await readSingleton("generatorsPriceListSettings")) || {};
+  res.json(settings);
+}));
+app.put("/api/generators/price-list-settings", wrap(async (req, res) => {
+  const body = req.body || {};
+  await writeSingleton("generatorsPriceListSettings", body);
+  res.json({ ok: true, ...body });
 }));
 
 // Endpoint para importar los items del Excel de referencia (una sola vez, o resetear)
