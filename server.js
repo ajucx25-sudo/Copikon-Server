@@ -7466,13 +7466,11 @@ app.get("/api/public/baifa/price-list", wrap(async (_req, res) => {
         currency: it.currency || "USD",
         stockImmediate: Number(it.stockImmediate) || 0,
         stockTransit: Number(it.stockTransit) || 0,
-        stockExpress: Number(it.stockExpress) || 0,
         stockProduction: Number(it.stockProduction) || 0,
         arrivalDate: it.arrivalDate || null,
         availability: {
           immediate: Number(it.stockImmediate) || 0,
           maritime: Number(it.stockTransit) || 0,
-          express: Number(it.stockExpress) || 0,
           production: Number(it.stockProduction) || 0,
           nextArrival: it.arrivalDate || null,
         },
