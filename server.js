@@ -2045,24 +2045,31 @@ app.post("/api/erp/stock-by-warehouse/sync", wrap(async (_req, res) => {
       { lazy: false, limit: 200000 }
     );
 
-    // locId -> whId
+    // Set de warehouse IDs pertenecientes a Copikon C.A. (para filtrar quants
+    // cuya ubicación apunte a warehouses de OTRAS companies via inherit).
+    const validWhIds = new Set(warehouses.map(w => w.id));
+
+    // locId -> whId (solo si el warehouse está en el set de Copikon C.A.)
     const locToWh = new Map();
     for (const loc of allInternal) {
       const whId = Array.isArray(loc.warehouse_id) ? loc.warehouse_id[0] : null;
-      if (whId) locToWh.set(loc.id, whId);
+      if (whId && validWhIds.has(whId)) locToWh.set(loc.id, whId);
     }
     const whMeta = new Map();
     for (const w of warehouses) whMeta.set(w.id, { name: w.name, code: w.code });
 
     // { productId: { whId: { warehouseName, warehouseCode, qty } } }
     const stockByWh = {};
+    let droppedInvalidWh = 0;
     for (const g of quantGroups) {
       const pid = Array.isArray(g.product_id) ? g.product_id[0] : null;
       const lid = Array.isArray(g.location_id) ? g.location_id[0] : null;
       const qty = Number(g.quantity) || 0;
       if (!pid || !lid) continue;
       const whId = locToWh.get(lid);
-      if (!whId) continue;
+      // Descartar quants cuyo warehouse esté fuera de Copikon C.A. (whId invalido
+      // o warehouse no top-level) para evitar contaminar el KPI de disponibilidad.
+      if (!whId || !validWhIds.has(whId)) { droppedInvalidWh += 1; continue; }
       if (!stockByWh[pid]) stockByWh[pid] = {};
       if (!stockByWh[pid][whId]) {
         const meta = whMeta.get(whId) || { name: "?", code: "?" };
@@ -2091,6 +2098,7 @@ app.post("/api/erp/stock-by-warehouse/sync", wrap(async (_req, res) => {
       warehouseList: payload.warehouses,
       products: payload.productCount,
       quantRows: quantGroups.length,
+      droppedInvalidWh,
       elapsedMs: payload.elapsedMs,
     });
   } catch (e) {
