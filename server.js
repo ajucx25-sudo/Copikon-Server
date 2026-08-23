@@ -7536,6 +7536,371 @@ app.post("/api/generators/price-list-items/reset", wrap(async (req, res) => {
   }
 }));
 
+// ─────────────────────────────────────────────────────────────────────────────
+// ATC (Atención al Cliente Corporativo) — ChatBot + Tickets + Escalamiento
+// Storage keys en kv: atcSessions, atcTickets
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Mapa de unidades de negocio → info del bot
+const ATC_UNITS = {
+  copikon: {
+    key: "copikon",
+    name: "Copikon Venezuela",
+    greeting: "Bienvenido a Copikon Venezuela. Somos su aliado tecnológico integral.",
+    tagline: "Distribución de tecnología, cómputo, seguridad y equipos industriales.",
+  },
+  generators: {
+    key: "generators",
+    name: "Copikon Generators",
+    greeting: "Bienvenido a Copikon Generators. Somos especialistas en plantas eléctricas Baifa.",
+    tagline: "Venta, instalación, mantenimiento y alquiler de generadores.",
+  },
+  logan: {
+    key: "logan",
+    name: "Logan Unlimited",
+    greeting: "Bienvenido a Logan Unlimited. Somos su solución en tecnología visual y CCTV.",
+    tagline: "Pantallas LED, CCTV Dahua y proyectos audiovisuales.",
+  },
+  unplus: {
+    key: "unplus",
+    name: "Unplus+",
+    greeting: "Bienvenido a Unplus+.",
+    tagline: "Unidad de negocio Copikon.",
+  },
+  cpk: {
+    key: "cpk",
+    name: "CPK Logística",
+    greeting: "Bienvenido a CPK Logística. Movemos su carga a nivel nacional.",
+    tagline: "Logística nacional, flota interna y aliados de entrega.",
+  },
+  cargo2bc: {
+    key: "cargo2bc",
+    name: "2BC Cargo",
+    greeting: "Bienvenido a 2BC Cargo. Especialistas en carga internacional.",
+    tagline: "Importaciones y logística internacional.",
+  },
+  copikonusa: {
+    key: "copikonusa",
+    name: "Copikon USA",
+    greeting: "Welcome to Copikon USA / Bienvenido a Copikon USA.",
+    tagline: "E-commerce y compras internacionales.",
+  },
+};
+
+// Menú guío de opciones inicial por unidad
+function buildAtcMenu(unitKey) {
+  const unit = ATC_UNITS[unitKey];
+  if (!unit) return null;
+  return {
+    unit,
+    options: [
+      { id: "catalog", label: "Consultar catálogo y precios", icon: "package" },
+      { id: "order_status", label: "Estatus de mi cotización o pedido", icon: "clipboard-list" },
+      { id: "schedule", label: "Programar visita técnica o cotización", icon: "calendar" },
+      { id: "preventa", label: "Información pre-venta", icon: "info" },
+      { id: "human", label: "Hablar con un asesor humano", icon: "headphones" },
+    ],
+  };
+}
+
+// POST /api/atc/session/start — crea o retoma una sesión de chat
+app.post("/api/atc/session/start", wrap(async (req, res) => {
+  const { unitKey, customerName = null, customerPhone = null, customerEmail = null } = req.body || {};
+  if (!unitKey || !ATC_UNITS[unitKey]) {
+    return res.status(400).json({ ok: false, error: "unitKey requerido y válido" });
+  }
+  const sessions = await readCol("atcSessions");
+  const nextId = sessions.reduce((m, it) => Math.max(m, Number(it?.id) || 0), 0) + 1;
+  const now = Date.now();
+  const menu = buildAtcMenu(unitKey);
+  const session = {
+    id: nextId,
+    unitKey,
+    unitName: menu.unit.name,
+    customerName,
+    customerPhone,
+    customerEmail,
+    status: "active",
+    createdAt: now,
+    updatedAt: now,
+    messages: [
+      {
+        role: "bot",
+        at: now,
+        text: menu.unit.greeting + " " + menu.unit.tagline + " ¿En qué puedo ayudarle hoy?",
+        options: menu.options,
+      },
+    ],
+  };
+  sessions.push(session);
+  const trimmed = sessions.length > 500 ? sessions.slice(-500) : sessions;
+  await writeCol("atcSessions", trimmed);
+  res.json({ ok: true, session });
+}));
+
+// GET /api/atc/sessions — lista de sesiones (bandeja para agentes)
+app.get("/api/atc/sessions", wrap(async (req, res) => {
+  const sessions = await readCol("atcSessions");
+  const unitKey = req.query.unitKey || null;
+  const status = req.query.status || null;
+  let filtered = sessions;
+  if (unitKey) filtered = filtered.filter(s => s.unitKey === unitKey);
+  if (status) filtered = filtered.filter(s => s.status === status);
+  res.json({ ok: true, count: filtered.length, sessions: filtered.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0)) });
+}));
+
+// GET /api/atc/session/:id — detalle de una sesión
+app.get("/api/atc/session/:id", wrap(async (req, res) => {
+  const sessions = await readCol("atcSessions");
+  const session = sessions.find(s => Number(s.id) === Number(req.params.id));
+  if (!session) return res.status(404).json({ ok: false, error: "sesión no encontrada" });
+  res.json({ ok: true, session });
+}));
+
+// Simple respondedor de menú guío (SIN IA por ahora)
+function resolveAtcAction(unitKey, actionId, payload = {}) {
+  const unit = ATC_UNITS[unitKey];
+  if (!unit) return { text: "Unidad no válida.", options: [] };
+
+  switch (actionId) {
+    case "catalog":
+      return {
+        text: `Perfecto. Para consultar catálogo y precios de ${unit.name}, indíqueme qué producto busca. Puede escribir un nombre, marca o SKU. Ejemplo: "planta eléctrica 20 kva", "cámara Dahua", "pantalla LED".`,
+        expects: "catalog_query",
+        options: [
+          { id: "back", label: "← Volver al menú" },
+          { id: "human", label: "Hablar con asesor" },
+        ],
+      };
+    case "order_status":
+      return {
+        text: `Para consultar su cotización o pedido en ${unit.name}, indíqueme el número de cotización, número de pedido, RIF o cédula.`,
+        expects: "order_query",
+        options: [
+          { id: "back", label: "← Volver al menú" },
+          { id: "human", label: "Hablar con asesor" },
+        ],
+      };
+    case "schedule":
+      return {
+        text: `Con gusto le agendamos una visita técnica o cotización de ${unit.name}. Por favor comparta:\n\n1. Su nombre completo\n2. Empresa (si aplica)\n3. Teléfono de contacto\n4. Ciudad / zona\n5. Breve descripción de lo que necesita`,
+        expects: "schedule_data",
+        options: [
+          { id: "back", label: "← Volver al menú" },
+          { id: "human", label: "Hablar con asesor" },
+        ],
+      };
+    case "preventa":
+      return {
+        text: `${unit.name}: ${unit.tagline}\n\n¿Qué le gustaría saber? Puede preguntar sobre productos, servicios, garantías, formas de pago o cobertura geográfica.`,
+        expects: "preventa_query",
+        options: [
+          { id: "back", label: "← Volver al menú" },
+          { id: "human", label: "Hablar con asesor" },
+        ],
+      };
+    case "human":
+      return {
+        text: `Le vamos a conectar con un asesor humano de ${unit.name}. Antes de escalar, comparta por favor su nombre y una breve descripción de lo que necesita.`,
+        expects: "escalation_data",
+        options: [
+          { id: "back", label: "← Volver al menú" },
+        ],
+      };
+    case "back":
+      return {
+        text: `¿En qué más puedo ayudarle en ${unit.name}?`,
+        options: buildAtcMenu(unitKey).options,
+      };
+    default:
+      return {
+        text: `No entendí esa opción. Elija una de las siguientes:`,
+        options: buildAtcMenu(unitKey).options,
+      };
+  }
+}
+
+// POST /api/atc/session/:id/message — cliente envía mensaje o elige opción
+app.post("/api/atc/session/:id/message", wrap(async (req, res) => {
+  const sessions = await readCol("atcSessions");
+  const idx = sessions.findIndex(s => Number(s.id) === Number(req.params.id));
+  if (idx < 0) return res.status(404).json({ ok: false, error: "sesión no encontrada" });
+
+  const session = sessions[idx];
+  const { text = "", actionId = null, payload = {} } = req.body || {};
+  const now = Date.now();
+
+  // Guardar mensaje del cliente
+  const userMsg = {
+    role: "user",
+    at: now,
+    text: text || (actionId ? `[opción] ${actionId}` : ""),
+    actionId,
+    payload,
+  };
+  session.messages.push(userMsg);
+
+  // Determinar respuesta
+  let botResponse;
+  if (actionId) {
+    botResponse = resolveAtcAction(session.unitKey, actionId, payload);
+  } else {
+    // Texto libre — responder con fallback (por ahora, sin IA)
+    // Ver qué esperaba el bot
+    const lastBotMsg = [...session.messages].reverse().find(m => m.role === "bot");
+    const expects = lastBotMsg?.expects;
+    botResponse = handleFreeText(session.unitKey, text, expects, session);
+  }
+
+  const botMsg = {
+    role: "bot",
+    at: Date.now(),
+    text: botResponse.text,
+    options: botResponse.options || [],
+    expects: botResponse.expects,
+    data: botResponse.data,
+  };
+  session.messages.push(botMsg);
+  session.updatedAt = Date.now();
+
+  // Si se escaló, crear ticket y marcar sesión
+  if (botResponse.escalated) {
+    session.status = "escalated";
+    session.ticketId = botResponse.ticketId;
+  }
+
+  sessions[idx] = session;
+  await writeCol("atcSessions", sessions);
+
+  res.json({ ok: true, session, botMsg });
+}));
+
+// Handler de texto libre (SIN IA — fallback simple con búsqueda en catálogo)
+function handleFreeText(unitKey, text, expects, session) {
+  const unit = ATC_UNITS[unitKey];
+  const q = String(text || "").trim();
+
+  if (!q) {
+    return {
+      text: "No recibí ningún mensaje. ¿En qué puedo ayudarle?",
+      options: buildAtcMenu(unitKey).options,
+    };
+  }
+
+  // Caso escalamiento: si el bot pidió datos para pasar a humano
+  if (expects === "escalation_data") {
+    return { text: "En un momento cree su ticket. Presione 'Escalar a asesor' abajo para confirmar.", options: [
+      { id: "confirm_escalation", label: "✓ Escalar a asesor" },
+      { id: "back", label: "← Volver al menú" },
+    ]};
+  }
+
+  // Caso preventa / catálogo / búsqueda: por ahora damos una respuesta genérica
+  // (cuando conectemos la IA responderá aquí con contexto real)
+  return {
+    text: `Recibí su mensaje: "${q}".\n\nEsta versión del bot atiende con menú guiado. En breve activaremos la búsqueda inteligente con IA. Mientras tanto, ¿desea que le escale con un asesor humano de ${unit.name}?`,
+    options: [
+      { id: "human", label: "Sí, hablar con asesor" },
+      { id: "back", label: "Volver al menú" },
+    ],
+  };
+}
+
+// POST /api/atc/session/:id/escalate — crear ticket y notificar asesor
+app.post("/api/atc/session/:id/escalate", wrap(async (req, res) => {
+  const sessions = await readCol("atcSessions");
+  const idx = sessions.findIndex(s => Number(s.id) === Number(req.params.id));
+  if (idx < 0) return res.status(404).json({ ok: false, error: "sesión no encontrada" });
+  const session = sessions[idx];
+
+  const { subject = "Solicitud de asesor", details = "" } = req.body || {};
+
+  // Crear ticket
+  const tickets = await readCol("atcTickets");
+  const nextTicketId = tickets.reduce((m, it) => Math.max(m, Number(it?.id) || 0), 0) + 1;
+  const now = Date.now();
+  const ticket = {
+    id: nextTicketId,
+    sessionId: session.id,
+    unitKey: session.unitKey,
+    unitName: session.unitName,
+    subject,
+    details: details || (session.messages.slice(-6).map(m => `[${m.role}] ${m.text}`).join("\n")),
+    customerName: session.customerName,
+    customerPhone: session.customerPhone,
+    customerEmail: session.customerEmail,
+    status: "open",
+    priority: "normal",
+    assignedTo: null,
+    createdAt: now,
+    updatedAt: now,
+  };
+  tickets.push(ticket);
+  await writeCol("atcTickets", tickets);
+
+  // Marcar sesión como escalada
+  session.status = "escalated";
+  session.ticketId = ticket.id;
+  session.messages.push({
+    role: "system",
+    at: now,
+    text: `✓ Ticket #${ticket.id} creado. Un asesor de ${session.unitName} se pondrá en contacto pronto.`,
+  });
+  session.updatedAt = now;
+  sessions[idx] = session;
+  await writeCol("atcSessions", sessions);
+
+  // Notificar a coordinadores de la unidad (CEO + gerentes)
+  try {
+    const employees = await readCol("employees");
+    const targets = employees.filter(e => e && (e.level === "ceo" || e.level === "manager"));
+    for (const t of targets) {
+      await pushNotification({
+        userId: t.id,
+        title: `Nuevo ticket ATC #${ticket.id} – ${session.unitName}`,
+        message: `${session.customerName || "Cliente"}: ${subject}`,
+        type: "info",
+        link: `/comercializacion?tab=atc&ticket=${ticket.id}`,
+      });
+    }
+  } catch (e) { console.error("[atc] notif error", e); }
+
+  res.json({ ok: true, ticket, session });
+}));
+
+// GET /api/atc/tickets — bandeja de tickets
+app.get("/api/atc/tickets", wrap(async (req, res) => {
+  const tickets = await readCol("atcTickets");
+  const unitKey = req.query.unitKey || null;
+  const status = req.query.status || null;
+  let filtered = tickets;
+  if (unitKey) filtered = filtered.filter(t => t.unitKey === unitKey);
+  if (status) filtered = filtered.filter(t => t.status === status);
+  res.json({ ok: true, count: filtered.length, tickets: filtered.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0)) });
+}));
+
+// PATCH /api/atc/tickets/:id — actualizar estado / asignación
+app.patch("/api/atc/tickets/:id", wrap(async (req, res) => {
+  const tickets = await readCol("atcTickets");
+  const idx = tickets.findIndex(t => Number(t.id) === Number(req.params.id));
+  if (idx < 0) return res.status(404).json({ ok: false, error: "ticket no encontrado" });
+  const t = tickets[idx];
+  const { status, priority, assignedTo, resolution } = req.body || {};
+  if (status) t.status = status;
+  if (priority) t.priority = priority;
+  if (assignedTo !== undefined) t.assignedTo = assignedTo;
+  if (resolution) t.resolution = resolution;
+  t.updatedAt = Date.now();
+  tickets[idx] = t;
+  await writeCol("atcTickets", tickets);
+  res.json({ ok: true, ticket: t });
+}));
+
+// GET /api/atc/units — lista de unidades para el widget
+app.get("/api/atc/units", wrap(async (_req, res) => {
+  res.json({ ok: true, units: Object.values(ATC_UNITS) });
+}));
+
 (async () => {
   try {
     await ensureSchema();
