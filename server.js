@@ -2475,6 +2475,7 @@ app.get("/api/erp/analysis/turnover-6m", wrap(async (req, res) => {
     [
       "id", "default_code", "name", "categ_id",
       "list_price", "standard_price",
+      "x_studio_costo_landed", "x_studio_precio_mnimo_de_venta",
       "x_studio_marca", "x_studio_marca_1",
       "company_id", "uom_id",
     ],
@@ -2496,6 +2497,8 @@ app.get("/api/erp/analysis/turnover-6m", wrap(async (req, res) => {
         marca: p.x_studio_marca_1 || p.x_studio_marca || "",
         listPrice: Number(p.list_price) || 0,
         costPrice: Number(p.standard_price) || 0,
+        costLanded: Number(p.x_studio_costo_landed) || 0,
+        priceMin: Number(p.x_studio_precio_mnimo_de_venta) || 0,
         companyId: cid,
         uom: Array.isArray(p.uom_id) ? p.uom_id[1] : "",
       });
@@ -2566,6 +2569,8 @@ app.get("/api/erp/analysis/turnover-6m", wrap(async (req, res) => {
     const sales = salesByPid.get(p.id) || { qty: 0, revenue: 0 };
     const stock = stockByPid.get(p.id) || 0;
     const cost = p.costPrice || 0;
+    // Preferir costo landed si existe (Odoo Studio), luego standard_price, si nada usar precio*0.5 como proxy
+    const effCost = p.costLanded || cost || (p.listPrice ? +(p.listPrice * 0.5).toFixed(2) : 0);
     rows.push({
       productId: p.id,
       sku: p.sku,
@@ -2574,9 +2579,12 @@ app.get("/api/erp/analysis/turnover-6m", wrap(async (req, res) => {
       brand: p.marca,
       uom: p.uom,
       stockQty: stock,
-      costUsd: cost,
+      costUsd: effCost,
+      costLandedUsd: p.costLanded,
+      costStandardUsd: cost,
       priceUsd: p.listPrice,
-      stockValueUsd: +(stock * cost).toFixed(2),
+      priceMinUsd: p.priceMin,
+      stockValueUsd: +(stock * effCost).toFixed(2),
       qtySold6m: sales.qty,
       revenue6mUsd: +sales.revenue.toFixed(2),
     });
