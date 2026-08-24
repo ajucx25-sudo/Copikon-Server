@@ -2447,6 +2447,147 @@ app.get("/api/erp/stock-by-warehouse", wrap(async (req, res) => {
   });
 }));
 
+// GET /api/erp/analysis/turnover-6m
+// Análisis de rotación de inventario de Copikon C.A. últimos 6 meses.
+// Devuelve por SKU: stock actual (total), unidades vendidas 6M,
+// costo estándar, precio de venta, valor de inventario. Optimizado para exportar.
+app.get("/api/erp/analysis/turnover-6m", wrap(async (req, res) => {
+  if (!odoo.isConfigured()) {
+    return res.status(503).json({ ok: false, error: "Odoo no configurado" });
+  }
+  const t0 = Date.now();
+  const companyId = await getCopikonCompanyId();
+  if (!companyId) return res.status(500).json({ ok: false, error: "companyId Copikon C.A. no detectado" });
+
+  const now = new Date();
+  const start = new Date(now.getTime() - 183 * 24 * 60 * 60 * 1000);
+  const startStr = start.toISOString().slice(0, 19).replace("T", " ");
+
+  // 1) Productos storables activos
+  const products = await odoo.searchRead(
+    "product.product",
+    [
+      ["active", "=", true],
+      ["type", "=", "product"],
+      ["sale_ok", "=", true],
+      "|", ["company_id", "=", false], ["company_id", "=", companyId],
+    ],
+    [
+      "id", "default_code", "name", "categ_id",
+      "list_price", "standard_price",
+      "x_studio_marca", "x_studio_marca_1",
+      "company_id", "uom_id",
+    ],
+    { limit: 20000 }
+  );
+
+  const byKey = new Map();
+  for (const p of products) {
+    const sku = (p.default_code || "").trim();
+    const cid = Array.isArray(p.company_id) ? p.company_id[0] : p.company_id;
+    const key = sku || `NOSKU-${p.id}`;
+    const existing = byKey.get(key);
+    if (!existing || (cid === companyId && existing.companyId !== companyId)) {
+      byKey.set(key, {
+        id: p.id,
+        sku,
+        name: p.name,
+        categ: Array.isArray(p.categ_id) ? p.categ_id[1] : "",
+        marca: p.x_studio_marca_1 || p.x_studio_marca || "",
+        listPrice: Number(p.list_price) || 0,
+        costPrice: Number(p.standard_price) || 0,
+        companyId: cid,
+        uom: Array.isArray(p.uom_id) ? p.uom_id[1] : "",
+      });
+    }
+  }
+  const productIds = Array.from(byKey.values()).map(p => p.id);
+
+  // 2) Ventas 6M via sale.order.line
+  let salesGrouped = [];
+  try {
+    salesGrouped = await odoo.readGroup(
+      "sale.order.line",
+      [
+        ["company_id", "=", companyId],
+        ["state", "in", ["sale", "done"]],
+        ["order_id.date_order", ">=", startStr],
+        ["product_id", "in", productIds],
+      ],
+      ["product_id", "product_uom_qty:sum", "price_subtotal:sum"],
+      ["product_id"],
+      { limit: 20000 }
+    );
+  } catch (e) {
+    console.error("[turnover-6m] sale.order.line read_group error:", e.message);
+  }
+  const salesByPid = new Map();
+  for (const g of salesGrouped) {
+    const pid = Array.isArray(g.product_id) ? g.product_id[0] : g.product_id;
+    salesByPid.set(pid, {
+      qty: Number(g.product_uom_qty) || 0,
+      revenue: Number(g.price_subtotal) || 0,
+    });
+  }
+
+  // 3) Stock actual por producto (sum de stock.quant en ubicaciones internas)
+  let quantsGrouped = [];
+  try {
+    quantsGrouped = await odoo.readGroup(
+      "stock.quant",
+      [
+        ["product_id", "in", productIds],
+        ["location_id.usage", "=", "internal"],
+        ["company_id", "=", companyId],
+      ],
+      ["product_id", "quantity:sum"],
+      ["product_id"],
+      { limit: 20000 }
+    );
+  } catch (e) {
+    console.error("[turnover-6m] stock.quant read_group error:", e.message);
+  }
+  const stockByPid = new Map();
+  for (const g of quantsGrouped) {
+    const pid = Array.isArray(g.product_id) ? g.product_id[0] : g.product_id;
+    stockByPid.set(pid, Number(g.quantity) || 0);
+  }
+
+  // 4) Consolidar
+  const rows = [];
+  for (const p of byKey.values()) {
+    const sales = salesByPid.get(p.id) || { qty: 0, revenue: 0 };
+    const stock = stockByPid.get(p.id) || 0;
+    const cost = p.costPrice || 0;
+    rows.push({
+      productId: p.id,
+      sku: p.sku,
+      name: p.name,
+      category: p.categ,
+      brand: p.marca,
+      uom: p.uom,
+      stockQty: stock,
+      costUsd: cost,
+      priceUsd: p.listPrice,
+      stockValueUsd: +(stock * cost).toFixed(2),
+      qtySold6m: sales.qty,
+      revenue6mUsd: +sales.revenue.toFixed(2),
+    });
+  }
+
+  res.json({
+    ok: true,
+    generatedAt: new Date().toISOString(),
+    windowStart: startStr,
+    companyId,
+    productCount: rows.length,
+    withStock: rows.filter(r => r.stockQty > 0).length,
+    withSales: rows.filter(r => r.qtySold6m > 0).length,
+    tookMs: Date.now() - t0,
+    rows,
+  });
+}));
+
 // GET /api/erp/products/odoo-image/:odooId — sirve la imagen del producto desde Odoo (on-demand)
 // Cache 24h en cliente. Reduce el payload del catálogo (imagenes lazy).
 const _odooImageCache = new Map(); // odooId -> { dataUrl, at }
