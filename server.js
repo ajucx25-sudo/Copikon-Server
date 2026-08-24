@@ -2531,14 +2531,21 @@ app.get("/api/erp/analysis/turnover-6m", wrap(async (req, res) => {
   }
 
   // 3) Stock actual por producto (sum de stock.quant en ubicaciones internas)
+  // Primero obtener location_ids internas de la compañía
+  const internalLocs = await odoo.searchRead(
+    "stock.location",
+    [["usage", "=", "internal"], ["company_id", "=", companyId]],
+    ["id"],
+    { limit: 500 }
+  );
+  const internalLocIds = internalLocs.map(l => l.id);
   let quantsGrouped = [];
   try {
     quantsGrouped = await odoo.readGroup(
       "stock.quant",
       [
         ["product_id", "in", productIds],
-        ["location_id.usage", "=", "internal"],
-        ["company_id", "=", companyId],
+        ["location_id", "in", internalLocIds],
       ],
       ["product_id", "quantity:sum"],
       ["product_id"],
