@@ -486,10 +486,19 @@ for (const [route, key] of Object.entries(ROUTES)) {
     res.status(201).json(created);
   }));
 
+  // Matcher tolerante a IDs numéricos y string (ej. "baifa-1787259478849-000")
+  const matchId = (x, rawId) => {
+    if (x?.id == null) return false;
+    if (String(x.id) === String(rawId)) return true;
+    const nx = Number(x.id);
+    const nr = Number(rawId);
+    return Number.isFinite(nx) && Number.isFinite(nr) && nx === nr;
+  };
+
   app.patch(`${route}/:id`, wrap(async (req, res) => {
-    const id = Number(req.params.id);
+    const rawId = req.params.id;
     const items = await readCol(key);
-    const idx = items.findIndex((x) => Number(x.id) === id);
+    const idx = items.findIndex((x) => matchId(x, rawId));
     if (idx < 0) return res.status(404).json({ message: "not found" });
     items[idx] = { ...items[idx], ...(req.body || {}) };
     await writeCol(key, items);
@@ -497,19 +506,20 @@ for (const [route, key] of Object.entries(ROUTES)) {
   }));
 
   app.put(`${route}/:id`, wrap(async (req, res) => {
-    const id = Number(req.params.id);
+    const rawId = req.params.id;
     const items = await readCol(key);
-    const idx = items.findIndex((x) => Number(x.id) === id);
+    const idx = items.findIndex((x) => matchId(x, rawId));
     if (idx < 0) return res.status(404).json({ message: "not found" });
-    items[idx] = { ...items[idx], ...(req.body || {}), id };
+    const preservedId = items[idx].id; // preservar id string tal cual
+    items[idx] = { ...items[idx], ...(req.body || {}), id: preservedId };
     await writeCol(key, items);
     res.json(items[idx]);
   }));
 
   app.delete(`${route}/:id`, wrap(async (req, res) => {
-    const id = Number(req.params.id);
+    const rawId = req.params.id;
     const items = await readCol(key);
-    const idx = items.findIndex((x) => Number(x.id) === id);
+    const idx = items.findIndex((x) => matchId(x, rawId));
     if (idx < 0) return res.status(404).json({ message: "not found" });
     const [removed] = items.splice(idx, 1);
     await writeCol(key, items);
