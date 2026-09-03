@@ -12,6 +12,7 @@ import compression from "compression";
 import cors from "cors";
 import pkg from "pg";
 import * as odoo from "./odoo-client.js";
+import { registerPlaybooks } from "./playbooks.js";
 import XLSX from "xlsx";
 import { createRequire } from "module";
 const _require = createRequire(import.meta.url);
@@ -8066,6 +8067,10 @@ app.patch("/api/atc/tickets/:id", wrap(async (req, res) => {
 app.get("/api/atc/units", wrap(async (_req, res) => {
   res.json({ ok: true, units: Object.values(ATC_UNITS) });
 }));
+
+// Módulo Playbooks Comerciales — Comercialización
+// (registrado antes del listen para que las rutas queden montadas)
+registerPlaybooks(app, { pool, readCol, writeCol, wrap });
 
 (async () => {
   try {

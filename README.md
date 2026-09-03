@@ -52,6 +52,34 @@ erp/service-orders, erp/dispatches, erp/visits, erp/contracts, erp/leads,
 erp/reservations, salary-bands, erp/price-bands, erp/rental-contracts,
 erp/rental-payments.
 
+### Módulo Playbooks Comerciales (`playbooks.js`)
+
+Seguimiento de KPIs para campañas de venta desde Comercialización. Trae
+ventas reales desde Odoo (`sale.order.line`) filtradas por SKU + fecha +
+almacén, calcula avance vs meta, ritmo, cobertura, ranking y comisiones,
+y persiste snapshots en `kv`.
+
+Endpoints:
+
+- `GET  /api/playbooks` — lista todos los playbooks
+- `GET  /api/playbooks/:id` — config completa
+- `POST /api/playbooks` — crear (id string requerido)
+- `PATCH /api/playbooks/:id` — actualizar
+- `DELETE /api/playbooks/:id` — borrar
+- `POST /api/playbooks/:id/sync` — sincroniza ventas desde Odoo
+- `POST /api/playbooks/sync-all` — sync masivo (uso con cron)
+- `GET  /api/playbooks/:id/snapshot` — snapshot completo (KPIs + daily + leaderboard + cobertura)
+- `GET  /api/playbooks/:id/kpis` — solo KPIs (payload liviano)
+- `GET  /api/playbooks/:id/daily` — serie diaria (para gráfico)
+- `GET  /api/playbooks/:id/leaderboard` — ranking de vendedores
+- `GET  /api/playbooks/:id/sku-coverage` — cobertura por SKU
+- `GET  /api/playbooks/:id/commissions?month=YYYY-MM` — cálculo de comisiones
+
+Seed automático al arranque (solo si la colección `playbooks` está vacía):
+
+- `stanley-40oz-bto-2026q3` — Vasos Stanley 40oz Barquisimeto (1900 uds)
+- `conos-seguridad-bto-2026q3` — Conos PVC TRAFFCONE Barquisimeto (1900 uds)
+
 ## Desarrollo local
 
 ```bash
