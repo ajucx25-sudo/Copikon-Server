@@ -420,9 +420,15 @@ async function syncPlaybookFromOdoo(pool, playbook) {
     ["order_id.date_order", "<=", `${playbook.windowEnd} 23:59:59`],
     ["order_id.state", "in", ["sale", "done"]],
   ];
-  // Si tiene warehouseCode filtramos también por warehouse
-  if (playbook.warehouseCode) {
-    domain.push(["order_id.warehouse_id.code", "=", playbook.warehouseCode]);
+  // Multi-almacén: warehouseCodes[] tiene prioridad; warehouseCode (legacy) se usa como fallback.
+  const whCodes = Array.isArray(playbook.warehouseCodes) && playbook.warehouseCodes.length > 0
+    ? playbook.warehouseCodes.map((c) => String(c).toUpperCase().trim()).filter(Boolean)
+    : (playbook.warehouseCode ? [String(playbook.warehouseCode).toUpperCase().trim()] : []);
+
+  if (whCodes.length === 1) {
+    domain.push(["order_id.warehouse_id.code", "=", whCodes[0]]);
+  } else if (whCodes.length > 1) {
+    domain.push(["order_id.warehouse_id.code", "in", whCodes]);
   }
 
   let saleLines = [];
@@ -442,7 +448,7 @@ async function syncPlaybookFromOdoo(pool, playbook) {
     );
   } catch (e) {
     // Fallback: sin filtro por warehouse.code (algunos ODOO no exponen ese path directo)
-    if (playbook.warehouseCode) {
+    if (whCodes.length > 0) {
       const d2 = domain.filter((c) => c[0] !== "order_id.warehouse_id.code");
       saleLines = await odoo.searchRead("sale.order.line", d2, [
         "id",
@@ -470,17 +476,16 @@ async function syncPlaybookFromOdoo(pool, playbook) {
       : [];
   const orderById = new Map(orders.map((o) => [o.id, o]));
 
-  // 4) Filtrar por warehouse si aplica (post-filter para seguridad)
+  // 4) Filtrar por warehouse si aplica (post-filter para seguridad — cuando el path warehouse_id.code no fue aplicable)
   const lines = [];
   for (const l of saleLines) {
     const oid = Array.isArray(l.order_id) ? l.order_id[0] : l.order_id;
     const o = orderById.get(oid);
     if (!o) continue;
-    if (playbook.warehouseCode) {
-      const whName = Array.isArray(o.warehouse_id) ? o.warehouse_id[1] || "" : "";
-      // O bien coincide el name del warehouse o su código base
-      const matches =
-        whName.toUpperCase().includes(playbook.warehouseCode.toUpperCase());
+    if (whCodes.length > 0) {
+      const whName = Array.isArray(o.warehouse_id) ? (o.warehouse_id[1] || "").toUpperCase() : "";
+      // El name del warehouse debe contener alguno de los códigos configurados
+      const matches = whCodes.some((wc) => whName.includes(wc));
       if (!matches) continue;
     }
 
@@ -552,6 +557,7 @@ function registerPlaybooksRoutes(app, pool, wrap) {
         name: p.name,
         unit: p.unit,
         warehouseCode: p.warehouseCode,
+        warehouseCodes: Array.isArray(p.warehouseCodes) ? p.warehouseCodes : (p.warehouseCode ? [p.warehouseCode] : []),
         windowStart: p.windowStart,
         windowEnd: p.windowEnd,
         targetUnits: p.targetUnits,
@@ -587,6 +593,7 @@ function registerPlaybooksRoutes(app, pool, wrap) {
       name: body.name,
       unit: body.unit || "generators",
       warehouseCode: body.warehouseCode || "",
+      warehouseCodes: Array.isArray(body.warehouseCodes) ? body.warehouseCodes.filter(Boolean) : [],
       campaignTag: body.campaignTag || "",
       windowStart: body.windowStart || now.slice(0, 10),
       windowEnd: body.windowEnd || now.slice(0, 10),
