@@ -23,31 +23,42 @@ async function kvDel(pool, key) {
 const K_PLAYBOOKS = "playbooks"; // array con la config de cada playbook
 const K_SNAPSHOT = (id) => `playbook-daily-snapshot:${id}`;
 
-// ─── Config default de comisiones (pilotos) ────────────────────────────
+// ─── Config default de comisiones (Piloto Stanley 40oz — 7 bodegas primarias) ─
+// Basado en PDF "Playbook Comercial Stanley 40oz - Grupo Copikon" (pág. 13-16).
+// Cuando se replique a otras campañas o unidades se editará por playbook.
 const DEFAULT_COMMISSION_CONFIG = {
   salesperson: {
-    basePct: 0.015, // 1.5% sobre subtotal
-    overstockMultiplier: 1.5, // ×1.5 para productos flag "sobrestock"
-    perUnitBonusMayor: 1.0, // +$1/uds mayor
-    perUnitBonusInstitucional: 1.5, // +$1.50/uds institucional
-    referralBonusPerClient: 30, // $30 por cliente referido nuevo
+    basePct: 0.015,             // 1.5% sobre cobranza personal
+    overstockMultiplier: 1.5,   // ×1.5 → 2.25% en SKU sobrestock (SUSTITUYE base, no suma)
+    deadSkuMultiplier: 2.0,     // ×2.0 → 3.0% en SKU muerto (SUSTITUYE base, no suma)
+    perUnitBonusMayor: 2.0,             // +$2/uds venta B2B ≥50 uds a un mismo cliente
+    perUnitBonusPersonalizacion: 3.0,   // +$3/uds venta corp. con grabado ≥50 uds
+    referralBonusPerClient: 50,         // $50 fijo por primer pedido de mayorista nuevo ≥50 uds
   },
   coordManager: {
-    // banda plana por tramo; ambos cobran completa
+    // banda plana por tramo sobre cobranza total tienda; cada uno (gte y coord) cobra completa
     bands: [
-      { min: 0, max: 25000, pct: 0 },
-      { min: 25001, max: 50000, pct: 0.002 },
-      { min: 50001, max: 100000, pct: 0.0035 },
-      { min: 100001, max: null, pct: 0.005 },
+      { min: 0,      max: 25000,  pct: 0      },
+      { min: 25001,  max: 50000,  pct: 0.0020 },
+      { min: 50001,  max: 100000, pct: 0.0035 },
+      { min: 100001, max: null,   pct: 0.0050 },
     ],
   },
   monthlyBonus: {
-    // pool USD para coord/gerente según % meta
+    // Bono meta Stanley — se mide contra bonusTargetUnits (piloto: 350 uds).
+    // La meta operativa 2,779 uds vive en playbook.targetUnits; el bono se mide aparte.
+    bonusTargetUnits: 350,
+    bonusMonthlyTargets: [
+      { month: 1, units: 90 },
+      { month: 2, units: 120 },
+      { month: 3, units: 140 },
+    ],
     tiers: [
-      { minPct: 0.70, maxPct: 0.99, label: "Base", poolUsd: 60 },
-      { minPct: 1.00, maxPct: 1.29, label: "Meta", poolUsd: 150 },
-      { minPct: 1.30, maxPct: 1.59, label: "Sobre-meta", poolUsd: 260 },
-      { minPct: 1.60, maxPct: null, label: "Excelencia", poolUsd: 380 },
+      { minPct: 0,    maxPct: 0.6999, label: "— (sin bono)", poolUsd: 0,   gerenteUsd: 0,   coordUsd: 0,   vendPoolUsd: 0   },
+      { minPct: 0.70, maxPct: 0.99,   label: "Base",         poolUsd: 50,  gerenteUsd: 15,  coordUsd: 15,  vendPoolUsd: 20  },
+      { minPct: 1.00, maxPct: 1.29,   label: "Meta",         poolUsd: 130, gerenteUsd: 40,  coordUsd: 40,  vendPoolUsd: 50  },
+      { minPct: 1.30, maxPct: 1.59,   label: "Sobre-meta",   poolUsd: 230, gerenteUsd: 70,  coordUsd: 70,  vendPoolUsd: 90  },
+      { minPct: 1.60, maxPct: null,   label: "Excelencia",   poolUsd: 330, gerenteUsd: 100, coordUsd: 100, vendPoolUsd: 130 },
     ],
   },
 };
@@ -268,6 +279,7 @@ function computeMonthlyCommissions(playbook, orderLines, month /* YYYY-MM */) {
   const cfg = playbook.commissions || DEFAULT_COMMISSION_CONFIG;
   const linesInMonth = orderLines.filter((l) => (l.date || "").slice(0, 7) === month);
   const overstockSet = new Set((playbook.skus || []).filter((s) => s.overstock).map((s) => s.code));
+  const deadSkuSet   = new Set((playbook.skus || []).filter((s) => s.deadSku  ).map((s) => s.code));
 
   // Totales
   let totalValueUsd = 0;
@@ -286,55 +298,81 @@ function computeMonthlyCommissions(playbook, orderLines, month /* YYYY-MM */) {
         salespersonId: id,
         salespersonName: name,
         valueUsd: 0,
+        valueUsdBase: 0,          // porción a tasa base 1.5%
+        valueUsdOverstock: 0,     // porción a 2.25%
+        valueUsdDead: 0,          // porción a 3.0%
         units: 0,
         unitsMayor: 0,
-        unitsInstitucional: 0,
+        unitsPersonalizacion: 0,
         unitsOverstock: 0,
+        unitsDead: 0,
         referrals: 0,
       });
     }
     const p = byPerson.get(id);
     p.valueUsd += value;
     p.units += units;
+    // Bucketing por tipo de SKU — muerto y sobrestock SUSTITUYEN la tasa base
+    if (deadSkuSet.has(l.sku)) {
+      p.valueUsdDead += value;
+      p.unitsDead += units;
+    } else if (overstockSet.has(l.sku)) {
+      p.valueUsdOverstock += value;
+      p.unitsOverstock += units;
+    } else {
+      p.valueUsdBase += value;
+    }
     if (l.priceBand === "mayor") p.unitsMayor += units;
-    else if (l.priceBand === "institucional") p.unitsInstitucional += units;
-    if (overstockSet.has(l.sku)) p.unitsOverstock += units;
+    if (l.personalizacionCorp) p.unitsPersonalizacion += units;
     if (l.newReferralClient) p.referrals += 1;
   }
 
-  // Meta del mes
+  // Meta del mes (operativa — la del playbook.monthlyTargets)
   const monthTarget =
     (playbook.monthlyTargets || []).find((m) => m.month === month)?.units ||
     Math.round((playbook.targetUnits || 0) / Math.max(1, (playbook.monthlyTargets || []).length));
-
   const pctVsMonthTarget = monthTarget > 0 ? totalUnits / monthTarget : 0;
 
-  // Comisión de vendedores
+  // Meta bono Stanley (aparte de la operativa: piloto 350 uds → 90/120/140)
+  // Se busca por índice del mes dentro de playbook.monthlyTargets
+  const monthIdx = (playbook.monthlyTargets || []).findIndex((m) => m.month === month);
+  const bonusMonthlyTargets = cfg.monthlyBonus?.bonusMonthlyTargets || [];
+  const bonusMonthTarget =
+    bonusMonthlyTargets.find((t) => (t.month - 1) === monthIdx)?.units ||
+    Math.round((cfg.monthlyBonus?.bonusTargetUnits || 0) / Math.max(1, bonusMonthlyTargets.length || 1));
+  const pctVsBonusTarget = bonusMonthTarget > 0 ? totalUnits / bonusMonthTarget : 0;
+
+  // Comisión de vendedores (tasas SUSTITUYENTES por bucket)
+  const basePct = cfg.salesperson?.basePct || 0;
+  const overPct = basePct * (cfg.salesperson?.overstockMultiplier || 1);
+  const deadPct = basePct * (cfg.salesperson?.deadSkuMultiplier   || 1);
   const salespeople = [...byPerson.values()].map((p) => {
-    const baseCommission =
-      p.valueUsd * (cfg.salesperson?.basePct || 0);
-    // multiplicador para porción overstock (aprox por proporción de unidades overstock)
-    const overstockShare = p.units > 0 ? p.unitsOverstock / p.units : 0;
-    const overstockBoost =
-      baseCommission * overstockShare * ((cfg.salesperson?.overstockMultiplier || 1) - 1);
-    const bonusMayor = p.unitsMayor * (cfg.salesperson?.perUnitBonusMayor || 0);
-    const bonusInst = p.unitsInstitucional * (cfg.salesperson?.perUnitBonusInstitucional || 0);
-    const bonusReferral = p.referrals * (cfg.salesperson?.referralBonusPerClient || 0);
+    const baseCommission      = p.valueUsdBase      * basePct;
+    const overstockCommission = p.valueUsdOverstock * overPct;
+    const deadCommission      = p.valueUsdDead      * deadPct;
+    const bonusMayor          = p.unitsMayor           * (cfg.salesperson?.perUnitBonusMayor          || 0);
+    const bonusPersonalizacion= p.unitsPersonalizacion * (cfg.salesperson?.perUnitBonusPersonalizacion || 0);
+    const bonusReferral       = p.referrals            * (cfg.salesperson?.referralBonusPerClient     || 0);
     const totalCommission =
-      baseCommission + overstockBoost + bonusMayor + bonusInst + bonusReferral;
+      baseCommission + overstockCommission + deadCommission +
+      bonusMayor + bonusPersonalizacion + bonusReferral;
     return {
       ...p,
-      valueUsd: Math.round(p.valueUsd * 100) / 100,
-      baseCommission: Math.round(baseCommission * 100) / 100,
-      overstockBoost: Math.round(overstockBoost * 100) / 100,
-      bonusMayor: Math.round(bonusMayor * 100) / 100,
-      bonusInstitucional: Math.round(bonusInst * 100) / 100,
-      bonusReferral: Math.round(bonusReferral * 100) / 100,
-      totalCommission: Math.round(totalCommission * 100) / 100,
+      valueUsd:              Math.round(p.valueUsd              * 100) / 100,
+      valueUsdBase:          Math.round(p.valueUsdBase          * 100) / 100,
+      valueUsdOverstock:     Math.round(p.valueUsdOverstock     * 100) / 100,
+      valueUsdDead:          Math.round(p.valueUsdDead          * 100) / 100,
+      baseCommission:        Math.round(baseCommission          * 100) / 100,
+      overstockCommission:   Math.round(overstockCommission     * 100) / 100,
+      deadCommission:        Math.round(deadCommission          * 100) / 100,
+      bonusMayor:            Math.round(bonusMayor              * 100) / 100,
+      bonusPersonalizacion:  Math.round(bonusPersonalizacion    * 100) / 100,
+      bonusReferral:         Math.round(bonusReferral           * 100) / 100,
+      totalCommission:       Math.round(totalCommission         * 100) / 100,
     };
   });
 
-  // Comisión coord/gerente (banda plana)
+  // Comisión coord/gerente (banda plana sobre cobranza total tienda)
   const bands = cfg.coordManager?.bands || DEFAULT_COMMISSION_CONFIG.coordManager.bands;
   const activeBand =
     bands.find(
@@ -344,19 +382,37 @@ function computeMonthlyCommissions(playbook, orderLines, month /* YYYY-MM */) {
     ) || bands[0];
   const coordManagerCommission = totalValueUsd * (activeBand.pct || 0);
 
-  // Bono meta (pool para ambos)
+  // Bono meta Stanley (medido contra bonusMonthTarget, no contra monthTarget operativa)
   const tiers = cfg.monthlyBonus?.tiers || DEFAULT_COMMISSION_CONFIG.monthlyBonus.tiers;
   const activeTier =
     tiers.find(
       (t) =>
-        pctVsMonthTarget >= t.minPct &&
-        (t.maxPct === null || t.maxPct === undefined || pctVsMonthTarget <= t.maxPct)
-    ) || null;
-  const bonusPoolUsd = activeTier ? activeTier.poolUsd : 0;
+        pctVsBonusTarget >= (t.minPct || 0) &&
+        (t.maxPct === null || t.maxPct === undefined || pctVsBonusTarget <= t.maxPct)
+    ) || tiers[0] || null;
 
-  const totalSalesCommissions = salespeople.reduce((s, p) => s + p.totalCommission, 0);
+  const gerenteBonus = activeTier ? (activeTier.gerenteUsd || 0) : 0;
+  const coordBonus   = activeTier ? (activeTier.coordUsd   || 0) : 0;
+  const vendPool     = activeTier ? (activeTier.vendPoolUsd || 0) : 0;
+
+  // Reparto del pool de vendedores proporcional a uds vendidas ese mes por cada vendedor activo
+  const activeSellers = salespeople.filter((s) => s.units > 0);
+  const totalUnitsActive = activeSellers.reduce((s, p) => s + p.units, 0);
+  const salespeopleWithBonus = salespeople.map((s) => {
+    const share = totalUnitsActive > 0 && s.units > 0 ? s.units / totalUnitsActive : 0;
+    const bonusStanley = Math.round(vendPool * share * 100) / 100;
+    return {
+      ...s,
+      bonusStanley,
+      totalWithBonus: Math.round((s.totalCommission + bonusStanley) * 100) / 100,
+    };
+  });
+
+  const totalSalesCommissions = salespeopleWithBonus.reduce((s, p) => s + p.totalWithBonus, 0);
   const totalPayout =
-    totalSalesCommissions + coordManagerCommission * 2 + bonusPoolUsd * 2;
+    totalSalesCommissions +
+    coordManagerCommission * 2 +
+    gerenteBonus + coordBonus;
 
   return {
     month,
@@ -364,21 +420,25 @@ function computeMonthlyCommissions(playbook, orderLines, month /* YYYY-MM */) {
     totalValueUsd: Math.round(totalValueUsd * 100) / 100,
     monthTarget,
     pctVsMonthTarget: Math.round(pctVsMonthTarget * 10000) / 10000,
-    salespeople,
+    bonusMonthTarget,
+    pctVsBonusTarget: Math.round(pctVsBonusTarget * 10000) / 10000,
+    salespeople: salespeopleWithBonus,
     coordManager: {
       activeBand: activeBand
         ? { min: activeBand.min, max: activeBand.max, pct: activeBand.pct }
         : null,
       commissionPerPerson: Math.round(coordManagerCommission * 100) / 100,
-      commissionBoth: Math.round(coordManagerCommission * 2 * 100) / 100,
+      commissionBoth:      Math.round(coordManagerCommission * 2 * 100) / 100,
     },
     monthlyBonus: activeTier
       ? {
-          tier: activeTier.label,
-          poolUsdPerPerson: activeTier.poolUsd,
-          poolUsdBoth: activeTier.poolUsd * 2,
+          tier:           activeTier.label,
+          gerenteUsd:     gerenteBonus,
+          coordUsd:       coordBonus,
+          vendPoolUsd:    vendPool,
+          poolTotalUsd:   activeTier.poolUsd || (gerenteBonus + coordBonus + vendPool),
         }
-      : { tier: "Sin bono", poolUsdPerPerson: 0, poolUsdBoth: 0 },
+      : { tier: "Sin bono", gerenteUsd: 0, coordUsd: 0, vendPoolUsd: 0, poolTotalUsd: 0 },
     totalPayout: Math.round(totalPayout * 100) / 100,
   };
 }
@@ -494,9 +554,33 @@ async function syncPlaybookFromOdoo(pool, playbook) {
     const salespersonId = Array.isArray(o.user_id) ? o.user_id[0] : 0;
     const salespersonName = Array.isArray(o.user_id) ? o.user_id[1] : "Sin asignar";
     const price = Number(l.price_unit || 0);
-    // Inferir priceBand por comparación con precios del playbook
+    const units = Number(l.product_uom_qty || 0);
+
+    // Inferir priceBand por comparación. Prioridad:
+    //  1) pricing por SKU (skuPricing + mayorTiers) si está definido en el playbook
+    //  2) fallback: pricing genérico del playbook (detal/mayor/institucional)
     let priceBand = "detal";
-    if (playbook.prices) {
+    const skuDef = (playbook.skus || []).find((s) => (s.code || "").toUpperCase() === (sku || "").toUpperCase());
+    if (skuDef && (skuDef.detalUsd || skuDef.mayorTiers)) {
+      // Buscar el tier más cercano por precio unitario
+      const options = [];
+      if (skuDef.detalUsd) options.push({ band: "detal", price: Number(skuDef.detalUsd) });
+      if (Array.isArray(skuDef.mayorTiers)) {
+        for (const t of skuDef.mayorTiers) {
+          const tierBand = `mayor-${t.fromQty || 0}`;
+          options.push({ band: tierBand, price: Number(t.price) });
+        }
+      }
+      if (options.length > 0) {
+        let best = options[0];
+        let bestDelta = Math.abs(price - best.price);
+        for (const o2 of options.slice(1)) {
+          const d = Math.abs(price - o2.price);
+          if (d < bestDelta) { best = o2; bestDelta = d; }
+        }
+        priceBand = best.band;
+      }
+    } else if (playbook.prices) {
       const dDetal = Math.abs(price - (playbook.prices.pvpDetalUsd || 0));
       const dMayor = Math.abs(price - (playbook.prices.pvpMayorUsd || 0));
       const dInst = Math.abs(price - (playbook.prices.pvpInstitucionalUsd || 0));
@@ -505,19 +589,23 @@ async function syncPlaybookFromOdoo(pool, playbook) {
       else if (min === dInst) priceBand = "institucional";
     }
 
+    // Normalizar: cualquier banda "mayor-*" cuenta como "mayor" para cálculo de comisión legacy
+    const priceBandGroup = priceBand.startsWith("mayor") ? "mayor" : priceBand;
+
     lines.push({
       lineId: l.id,
       orderId: oid,
       orderName: o.name,
       date: (o.date_order || "").slice(0, 10),
       sku,
-      units: Number(l.product_uom_qty || 0),
+      units,
       priceUnit: price,
       valueUsd: Number(l.price_subtotal || 0),
       salespersonId,
       salespersonName,
       warehouse: Array.isArray(o.warehouse_id) ? o.warehouse_id[1] : "",
-      priceBand,
+      priceBand,       // detal | mayor-20 | mayor-50 | mayor-100 | mayor-250 | institucional
+      priceBandGroup,  // detal | mayor | institucional (para cálculo comisión legacy)
       newReferralClient: false, // marca manual futura
     });
   }
