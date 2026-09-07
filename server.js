@@ -13,6 +13,7 @@ import cors from "cors";
 import pkg from "pg";
 import * as odoo from "./odoo-client.js";
 import { registerPlaybooksRoutes } from "./playbooks.js";
+import { registerPricelistsRoutes } from "./pricelists.js";
 import XLSX from "xlsx";
 import { createRequire } from "module";
 const _require = createRequire(import.meta.url);
@@ -8070,6 +8071,7 @@ app.get("/api/atc/units", wrap(async (_req, res) => {
 
 // ─── Módulo Playbooks Comerciales ─────────────────────────────────────
 registerPlaybooksRoutes(app, pool, wrap);
+registerPricelistsRoutes(app, pool, wrap);
 
 (async () => {
   try {
