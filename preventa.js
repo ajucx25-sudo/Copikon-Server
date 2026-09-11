@@ -406,11 +406,39 @@ export function registerPreventaRoutes(app, pool, wrap) {
     const list = (await kvGet(pool, K_RESERVATIONS, [])) || [];
     const idx = list.findIndex((x) => x.id === req.params.id);
     if (idx < 0) return res.status(404).json({ ok: false, error: "reservation_not_found" });
-    // Solo permitimos editar notas + datos cliente si sigue pending
-    const allow = ["notes", "clientName", "clientRif", "clientContact", "clientId"];
-    for (const k of allow) if (req.body?.[k] !== undefined) list[idx][k] = req.body[k];
+    const r = list[idx];
+    // Bloqueado editar si ya se pagó
+    if (r.status === "paid") return res.status(400).json({ ok: false, error: "cannot_edit_paid" });
+    // Datos generales que se pueden reasignar/editar
+    const allow = ["notes", "clientName", "clientRif", "clientContact", "clientId", "salespersonId", "salespersonName"];
+    for (const k of allow) if (req.body?.[k] !== undefined) r[k] = req.body[k];
+    // Cantidad: recalcular disponibilidad si cambia
+    if (req.body?.qty !== undefined) {
+      const newQty = Math.max(1, Math.floor(Number(req.body.qty) || 1));
+      const productsMap = (await kvGet(pool, K_PRODUCTS, {})) || {};
+      const prod = (productsMap[r.campaignId] || []).find((p) => p.sku === r.sku);
+      if (prod) {
+        const reserved = computeReservedQty(list, r.campaignId, r.sku, r.id);
+        const available = Math.max(0, Number(prod.stockOffered || 0) - reserved);
+        if (newQty > available) {
+          return res.status(400).json({ ok: false, error: "insufficient_stock", stockAvailable: available });
+        }
+        r.qty = newQty;
+        r.totalUsd = Number((Number(r.pricePreventa || 0) * newQty).toFixed(2));
+      } else {
+        r.qty = newQty;
+        r.totalUsd = Number((Number(r.pricePreventa || 0) * newQty).toFixed(2));
+      }
+    }
+    // Extender vencimiento manualmente (horas adicionales desde ahora)
+    if (req.body?.extendHours !== undefined) {
+      const h = Number(req.body.extendHours) || 0;
+      if (h > 0) r.expiresAt = new Date(Date.now() + h * 3600 * 1000).toISOString();
+    }
+    r.updatedAt = nowIso();
+    list[idx] = r;
     await kvSet(pool, K_RESERVATIONS, list);
-    res.json({ ok: true, reservation: list[idx] });
+    res.json({ ok: true, reservation: r });
   }));
 
   app.delete("/api/preventa/reservations/:id", wrap(async (req, res) => {
@@ -418,6 +446,12 @@ export function registerPreventaRoutes(app, pool, wrap) {
     const idx = list.findIndex((x) => x.id === req.params.id);
     if (idx < 0) return res.status(404).json({ ok: false, error: "reservation_not_found" });
     if (list[idx].status === "paid") return res.status(400).json({ ok: false, error: "cannot_release_paid" });
+    // Modo hard=1 borra fila completamente; por defecto marca released (soft delete)
+    if (String(req.query?.hard || "") === "1") {
+      list.splice(idx, 1);
+      await kvSet(pool, K_RESERVATIONS, list);
+      return res.json({ ok: true, deleted: true });
+    }
     list[idx] = { ...list[idx], status: "released", releasedAt: nowIso() };
     await kvSet(pool, K_RESERVATIONS, list);
     res.json({ ok: true, reservation: list[idx] });
