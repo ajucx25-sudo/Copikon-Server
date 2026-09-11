@@ -133,7 +133,47 @@ function defaultCampaign(input = {}) {
   };
 }
 
+// === ATTACHMENTS (base64 en kv, patrón task-attachment) ===
+async function saveAttachment(pool, fileId, data) {
+  await pool.query(
+    `INSERT INTO kv (key, value, updated_at) VALUES ($1, $2::jsonb, $3)
+     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at`,
+    [`preventa-attachment:${fileId}`, JSON.stringify(data), Date.now()]
+  );
+}
+async function loadAttachment(pool, fileId) {
+  const r = await pool.query("SELECT value FROM kv WHERE key = $1", [`preventa-attachment:${fileId}`]);
+  return r.rows[0] ? r.rows[0].value : null;
+}
+
 export function registerPreventaRoutes(app, pool, wrap) {
+  // === ATTACHMENTS ===
+  app.post("/api/preventa/attachments", wrap(async (req, res) => {
+    const { name, mime, dataUrl } = req.body || {};
+    if (!dataUrl) return res.status(400).json({ ok: false, error: "missing_dataUrl" });
+    // Estimación tamaño base64 → bytes: (n * 3/4) - padding
+    const size = Math.floor((dataUrl.length * 3) / 4);
+    if (size > 25 * 1024 * 1024) return res.status(413).json({ ok: false, error: "too_large", max: "25MB" });
+    const fileId = newId("att");
+    await saveAttachment(pool, fileId, { name: name || "archivo", mime: mime || "application/octet-stream", dataUrl, size, uploadedAt: nowIso() });
+    res.json({ ok: true, fileId, url: `/api/preventa/attachments/${fileId}`, name, size });
+  }));
+
+  app.get("/api/preventa/attachments/:id", wrap(async (req, res) => {
+    const att = await loadAttachment(pool, req.params.id);
+    if (!att) return res.status(404).send("not_found");
+    // dataUrl formato: data:mime/type;base64,XXXX
+    const m = /^data:([^;]+);base64,(.+)$/.exec(att.dataUrl || "");
+    if (!m) return res.status(500).send("invalid_dataUrl");
+    const buf = Buffer.from(m[2], "base64");
+    res.setHeader("Content-Type", m[1] || att.mime || "application/octet-stream");
+    const safeName = (att.name || "archivo").replace(/[^\w\-\.\s]/g, "_");
+    const dispo = req.query.download === "1" ? "attachment" : "inline";
+    res.setHeader("Content-Disposition", `${dispo}; filename="${safeName}"`);
+    res.setHeader("Cache-Control", "private, max-age=3600");
+    res.send(buf);
+  }));
+
   // === CAMPAÑAS ===
 
   app.get("/api/preventa/campaigns", wrap(async (_req, res) => {
