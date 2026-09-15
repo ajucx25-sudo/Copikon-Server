@@ -753,6 +753,48 @@ function registerPlaybooksRoutes(app, pool, wrap) {
     res.json({ ok: true, results });
   }));
 
+  // DEBUG: inspecciona qué órdenes hay en Odoo para los SKUs del playbook en un rango de fechas
+  // Muestra TODOS los estados (draft, sent, sale, done, cancel) para diagnosticar por qué no aparecen ventas
+  app.get("/api/playbooks/:id/debug-odoo", wrap(async (req, res) => {
+    await ensure();
+    const list = (await kvGet(pool, K_PLAYBOOKS, [])) || [];
+    const p = list.find((x) => x.id === req.params.id);
+    if (!p) return res.status(404).json({ ok: false, error: "not-found" });
+    const skuCodes = (p.skus || []).map((s) => s.code).filter(Boolean);
+    if (skuCodes.length === 0) return res.json({ ok: false, error: "no-skus" });
+    const from = req.query.from || new Date(Date.now() - 7 * 86400000).toISOString().slice(0, 10);
+    const to = req.query.to || new Date().toISOString().slice(0, 10);
+    try {
+      const products = await odoo.searchRead(
+        "product.product",
+        [["default_code", "in", skuCodes]],
+        ["id", "default_code", "name"],
+        { limit: 500 }
+      );
+      const productIds = products.map((pp) => pp.id);
+      if (productIds.length === 0) return res.json({ ok: true, from, to, skuCodes, productsMatched: 0, lines: [], orders: [] });
+      const lines = await odoo.searchRead(
+        "sale.order.line",
+        [
+          ["product_id", "in", productIds],
+          ["order_id.date_order", ">=", `${from} 00:00:00`],
+          ["order_id.date_order", "<=", `${to} 23:59:59`],
+        ],
+        ["id", "order_id", "product_id", "product_uom_qty", "price_subtotal"],
+        { limit: 500 }
+      );
+      const orderIds = [...new Set(lines.map((l) => (Array.isArray(l.order_id) ? l.order_id[0] : l.order_id)))];
+      const orders = orderIds.length > 0
+        ? await odoo.searchRead("sale.order", [["id", "in", orderIds]], ["id", "name", "date_order", "state", "user_id", "warehouse_id", "partner_id"], { limit: 500 })
+        : [];
+      const byState = {};
+      for (const o of orders) byState[o.state] = (byState[o.state] || 0) + 1;
+      res.json({ ok: true, from, to, skuCodes, productsMatched: productIds.length, lineCount: lines.length, orderCount: orders.length, byState, orders: orders.map((o) => ({ id: o.id, name: o.name, date: o.date_order, state: o.state, warehouse: Array.isArray(o.warehouse_id) ? o.warehouse_id[1] : "", salesperson: Array.isArray(o.user_id) ? o.user_id[1] : "", partner: Array.isArray(o.partner_id) ? o.partner_id[1] : "" })) });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: e.message || String(e) });
+    }
+  }));
+
   app.get("/api/playbooks/:id/snapshot", wrap(async (req, res) => {
     await ensure();
     const list = (await kvGet(pool, K_PLAYBOOKS, [])) || [];
