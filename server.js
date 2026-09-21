@@ -15,6 +15,7 @@ import * as odoo from "./odoo-client.js";
 import { registerPlaybooksRoutes } from "./playbooks.js";
 import { registerPricelistsRoutes } from "./pricelists.js";
 import { registerPreventaRoutes } from "./preventa.js";
+import { registerShipmentsRoutes } from "./shipments.js";
 import XLSX from "xlsx";
 import { createRequire } from "module";
 const _require = createRequire(import.meta.url);
@@ -148,7 +149,11 @@ app.use(express.json({ limit: "150mb" }));
 const wrap = (fn) => (req, res) =>
   Promise.resolve(fn(req, res)).catch((err) => {
     console.error("[handler]", err);
-    res.status(500).json({ message: "internal", error: err?.message });
+    const status = Number(err?.status);
+    res.status(status >= 400 && status < 600 ? status : 500).json({
+      message: status >= 400 && status < 500 ? err?.message : "internal",
+      error: err?.message,
+    });
   });
 
 // ───── Salud ────────────────────────────────────────────────
@@ -8074,6 +8079,7 @@ app.get("/api/atc/units", wrap(async (_req, res) => {
 registerPlaybooksRoutes(app, pool, wrap);
 registerPricelistsRoutes(app, pool, wrap);
 registerPreventaRoutes(app, pool, wrap);
+registerShipmentsRoutes(app, pool, wrap);
 
 (async () => {
   try {
