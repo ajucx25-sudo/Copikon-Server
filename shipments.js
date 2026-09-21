@@ -32,6 +32,24 @@ function resolveUser(req) {
 }
 function userName(user) { return `${user?.firstName || ""} ${user?.lastName || ""}`.trim() || user?.username || "Usuario"; }
 
+// Todas las operaciones del módulo comparten un bloqueo transaccional,
+// incluyendo la primera carga: evita perder cambios entre procesos/usuarios.
+export async function withShipmentState(pool, operation) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [SHIPMENT_KEY]);
+    const current = await getState(client);
+    const result = await operation(current);
+    if (result.state) await kvSet(client, SHIPMENT_KEY, result.state);
+    await client.query("COMMIT");
+    return result;
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally { client.release(); }
+}
+
 export function registerShipmentsRoutes(app, pool, wrap) {
   const withUser = async (req) => {
     const id = resolveUser(req);
@@ -45,22 +63,19 @@ export function registerShipmentsRoutes(app, pool, wrap) {
 
   app.get("/api/generators/shipments", wrap(async (req, res) => {
     const { access } = await withUser(req);
-    res.json(publicState(await getState(pool), access.write));
+    const result = await withShipmentState(pool, current => ({ response: publicState(current, access.write) }));
+    res.json(result.response);
   }));
   app.post("/api/generators/shipments", wrap(async (req, res) => {
     const { user, access } = await withUser(req);
     if (!access.write) throw httpError(403, "Acceso de solo lectura.");
-    const current = await getState(pool);
-    const result = createItem(current, req.body, { userId: user.id, userName: userName(user) });
-    await kvSet(pool, SHIPMENT_KEY, result.state);
+    const result = await withShipmentState(pool, current => createItem(current, req.body, { userId: user.id, userName: userName(user) }));
     res.status(201).json({ ok: true, item: result.item });
   }));
   app.patch("/api/generators/shipments/:id", wrap(async (req, res) => {
     const { user, access } = await withUser(req);
     if (!access.write) throw httpError(403, "Acceso de solo lectura.");
-    const current = await getState(pool);
-    const result = updateItem(current, req.params.id, req.body?.item, req.body?.expectedVersion, { userId: user.id, userName: userName(user) });
-    await kvSet(pool, SHIPMENT_KEY, result.state);
+    const result = await withShipmentState(pool, current => updateItem(current, req.params.id, req.body?.item, req.body?.expectedVersion, { userId: user.id, userName: userName(user) }));
     res.json({ ok: true, item: result.item });
   }));
   app.post("/api/generators/shipments/import/preview", wrap(async (req, res) => {
@@ -77,9 +92,7 @@ export function registerShipmentsRoutes(app, pool, wrap) {
     const encoded = String(req.body?.dataBase64 || "");
     if (!encoded || encoded.length > Math.ceil(MAX_FILE_BYTES * 4 / 3) + 100) throw httpError(413, "El archivo está vacío o supera 8 MB.");
     const parsed = parseWorkbook(Buffer.from(encoded, "base64"));
-    const current = await getState(pool);
-    const result = importWorkbook(current, parsed, { userId: user.id, userName: userName(user), fileName: String(req.body?.fileName || "embarques.xlsx").slice(0, 180) });
-    await kvSet(pool, SHIPMENT_KEY, result.state);
+    const result = await withShipmentState(pool, current => importWorkbook(current, parsed, { userId: user.id, userName: userName(user), fileName: String(req.body?.fileName || "embarques.xlsx").slice(0, 180) }));
     res.json({ ok: true, ...result.result });
   }));
 }
