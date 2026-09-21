@@ -7677,6 +7677,7 @@ app.get("/api/public/baifa/price-list", wrap(async (_req, res) => {
       },
       validFrom: settings.validFrom || null,
       validUntil: settings.validUntil || null,
+      listDate: settings.listDate || "2026-08-14",
       notes: settings.notes || "",
       count: published.length,
       items: published,
@@ -7695,8 +7696,15 @@ app.get("/api/generators/price-list-settings", wrap(async (_req, res) => {
 }));
 app.put("/api/generators/price-list-settings", wrap(async (req, res) => {
   const body = req.body || {};
-  await writeSingleton("generatorsPriceListSettings", body);
-  res.json({ ok: true, ...body });
+  if (Object.hasOwn(body, "listDate") && (
+    typeof body.listDate !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(body.listDate)
+    || Number.isNaN(Date.parse(body.listDate))
+    || new Date(body.listDate).toISOString().slice(0, 10) !== body.listDate
+  )) return res.status(400).json({ ok: false, message: "Seleccione una fecha válida para la lista." });
+  const current = (await readSingleton("generatorsPriceListSettings")) || {};
+  const settings = { ...current, ...body };
+  await writeSingleton("generatorsPriceListSettings", settings);
+  res.json({ ...settings, ok: true });
 }));
 
 // Endpoint para importar los items del Excel de referencia (una sola vez, o resetear)
