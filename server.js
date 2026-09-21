@@ -16,6 +16,8 @@ import { registerPlaybooksRoutes } from "./playbooks.js";
 import { registerPricelistsRoutes } from "./pricelists.js";
 import { registerPreventaRoutes } from "./preventa.js";
 import { registerShipmentsRoutes } from "./shipments.js";
+import { createSessions, safeUser, canAccessPath, verifyPassword, protectCredentials } from "./secure-access.js";
+import { randomBytes } from "node:crypto";
 import XLSX from "xlsx";
 import { createRequire } from "module";
 const _require = createRequire(import.meta.url);
@@ -42,6 +44,11 @@ async function ensureSchema() {
       updated_at BIGINT NOT NULL
     );
   `);
+  await pool.query(`CREATE TABLE IF NOT EXISTS secure_sessions (
+    token_hash TEXT PRIMARY KEY, subject TEXT NOT NULL,
+    credential_digest TEXT NOT NULL, expires_at BIGINT NOT NULL
+  )`);
+  await pool.query("DELETE FROM secure_sessions WHERE expires_at < $1", [Date.now()]);
 }
 
 async function readCol(key) {
@@ -52,6 +59,7 @@ async function readCol(key) {
 }
 
 async function writeCol(key, arr) {
+  if ((key === "employees" || key === "salesPartners") && Array.isArray(arr)) arr = await protectCredentials(arr);
   await pool.query(
     `INSERT INTO kv (key, value, updated_at) VALUES ($1, $2::jsonb, $3)
      ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at`,
@@ -143,7 +151,15 @@ const STATIC_KEYS = ["departments", "announcements", "jobDescriptions", "process
 
 const app = express();
 app.use(compression({ level: 6, threshold: 1024 })); // gzip — reduce respuestas JSON ~70%
-app.use(cors({ origin: true, credentials: true }));
+const allowedOrigins = new Set([
+  "https://copikon-intranet.pplx.app",
+  "https://www.perplexity.ai",
+  ...(process.env.COPIKON_ALLOWED_ORIGINS || "").split(",").map(s => s.trim()).filter(Boolean),
+]);
+app.use(cors({
+  origin: (origin, done) => done(null, !!origin && allowedOrigins.has(origin)),
+  credentials: false,
+}));
 app.use(express.json({ limit: "150mb" }));
 
 const wrap = (fn) => (req, res) =>
@@ -152,9 +168,34 @@ const wrap = (fn) => (req, res) =>
     const status = Number(err?.status);
     res.status(status >= 400 && status < 600 ? status : 500).json({
       message: status >= 400 && status < 500 ? err?.message : "internal",
-      error: err?.message,
+      ...(status >= 400 && status < 500 ? { error: err?.message } : {}),
     });
   });
+
+const sessions = createSessions(pool, readCol, buildPartnerUser);
+// Require a server-issued session before the exposed legacy families and the
+// new Generators modules. Public BAIFA and token-scoped ally portals stay public.
+app.use((req, res, next) => {
+  const path = req.path.toLowerCase();
+  const protectedPath = /^\/api\/(?:logistica|employees|sales-partners|admin\/(?:users|sales-partners|providers|technical-providers)|sync)(?:\/|$)/.test(path) ||
+    /^\/api\/generators\/(?:shipments|price-list-settings|price-list-items)(?:\/|$)/.test(path) ||
+    /^\/api\/auth\/(?:me|change-password|logout)$/.test(path);
+  if (!protectedPath) return next();
+  res.setHeader("Cache-Control", "no-store");
+  sessions.authenticate(req).then(user => {
+    if (!user) return res.status(401).json({ message: "Sesión vencida o no válida. Inicia sesión de nuevo." });
+    if (!canAccessPath(user, path, req.method)) return res.status(403).json({ message: "No tienes permisos para esta operación." });
+    req.verifiedUser = user;
+    if (/^\/api\/(?:employees|admin\/users|auth)(?:\/|$)/.test(path)) {
+      const send = res.json.bind(res);
+      res.json = body => send(Array.isArray(body) ? body.map(safeUser) : safeUser(body));
+    }
+    next();
+  }).catch(error => {
+    console.error("[session verification failed]", error?.code || "internal");
+    res.status(503).json({ message: "No se pudo verificar la sesión. Intenta nuevamente." });
+  });
+});
 
 // ───── Salud ────────────────────────────────────────────────
 app.get("/api/health", wrap(async (_req, res) => {
@@ -193,52 +234,40 @@ function buildPartnerUser(p) {
 
 app.post("/api/auth/login", wrap(async (req, res) => {
   const { username, password } = req.body || {};
+  res.setHeader("Cache-Control", "no-store");
+  if (typeof username !== "string" || !username.trim() || typeof password !== "string" || !password) {
+    return res.status(401).json({ message: "Credenciales inválidas" });
+  }
   const employees = await readCol("employees");
-  const emp = employees.find(
-    (e) => e && e.username === username && e.password === password
-  );
-  if (emp) {
-    return res.json({ token: `srv-${emp.id}-${Date.now()}`, user: emp });
+  const emp = employees.find(e => e && e.username === username);
+  if (emp && await verifyPassword(password, emp.password)) {
+    if (["inactive", "disabled", "inactivo"].includes(emp.status) || [false, 0, "false"].includes(emp.canLogin)) return res.status(403).json({ message: "Acceso desactivado." });
+    return res.json({ token: await sessions.issue(emp), user: safeUser(emp) });
   }
   // Buscar en partners externos
   const partners = await readCol("salesPartners").catch(() => []);
   const p = (Array.isArray(partners) ? partners : []).find(
-    (x) => x && x.username && String(x.username) === String(username) && String(x.password ?? "") === String(password ?? "")
+    (x) => x && x.username && String(x.username) === String(username)
   );
-  if (p) {
+  if (p && await verifyPassword(password, p.password)) {
     if (p.canLogin === false || p.canLogin === 0 || p.canLogin === "false") {
       return res.status(403).json({ message: "Acceso desactivado. Contacta al administrador." });
     }
     if (p.status === "inactive") {
       return res.status(403).json({ message: "Partner inactivo." });
     }
-    return res.json({ token: `srv-p${p.id}-${Date.now()}`, user: buildPartnerUser(p) });
+    return res.json({ token: await sessions.issue(p, true), user: buildPartnerUser(p) });
   }
   return res.status(401).json({ message: "Credenciales inválidas" });
 }));
 
 app.get("/api/auth/me", wrap(async (req, res) => {
-  const auth = req.headers.authorization || "";
-  const token = auth.replace(/^Bearer\s+/, "");
-  // Token partner: srv-p<id>-<ts>
-  const mp = token.match(/^srv-p(\d+)-/);
-  if (mp) {
-    const pid = Number(mp[1]);
-    const partners = await readCol("salesPartners").catch(() => []);
-    const p = (Array.isArray(partners) ? partners : []).find((x) => Number(x.id) === pid);
-    if (!p) return res.status(401).json({ message: "Unauthorized" });
-    if (p.canLogin === false || p.status === "inactive") {
-      return res.status(401).json({ message: "Acceso revocado" });
-    }
-    return res.json(buildPartnerUser(p));
-  }
-  const m = token.match(/^srv-(\d+)-/);
-  if (!m) return res.status(401).json({ message: "Unauthorized" });
-  const id = Number(m[1]);
-  const employees = await readCol("employees");
-  const emp = employees.find((e) => Number(e.id) === id);
-  if (!emp) return res.status(401).json({ message: "Unauthorized" });
-  return res.json(emp);
+  return res.json(req.verifiedUser);
+}));
+
+app.post("/api/auth/logout", wrap(async (req, res) => {
+  await sessions.revoke(req);
+  res.json({ ok: true });
 }));
 
 // ───── Cambio de contraseña (usuario autenticado) ───────────
@@ -256,7 +285,7 @@ app.post("/api/auth/change-password", wrap(async (req, res) => {
   const idx = employees.findIndex((e) => Number(e.id) === id);
   if (idx < 0) return res.status(401).json({ error: "Usuario no encontrado" });
   const emp = employees[idx];
-  if (String(emp.password ?? "") !== String(currentPassword ?? "")) {
+  if (!await verifyPassword(currentPassword, emp.password)) {
     return res.status(400).json({ error: "La contraseña actual es incorrecta" });
   }
   if (String(newPassword) === String(currentPassword)) {
@@ -264,7 +293,7 @@ app.post("/api/auth/change-password", wrap(async (req, res) => {
   }
   employees[idx] = { ...emp, password: String(newPassword), mustChangePassword: 0 };
   await writeCol("employees", employees);
-  return res.json({ ok: true, user: employees[idx] });
+  return res.json({ ok: true, user: safeUser(employees[idx]) });
 }));
 
 // ───── Statics (read-only) ──────────────────────────────────
@@ -6998,7 +7027,7 @@ app.post("/api/admin/tesoreria/automatch/export-odoo", wrap(async (req, res) => 
 
 // Helper: token seguro para portal aliado
 function genPortalToken() {
-  return require("crypto").randomBytes(16).toString("hex");
+  return randomBytes(32).toString("hex");
 }
 
 // Semana ISO helpers (lunes-domingo)
@@ -8092,6 +8121,13 @@ registerShipmentsRoutes(app, pool, wrap);
 (async () => {
   try {
     await ensureSchema();
+    // One-way credential migration; keeps every user and their existing password
+    // valid, while removing plaintext from both credential collections.
+    for (const key of ["employees", "salesPartners"]) {
+      const users = await readCol(key);
+      const protectedUsers = await protectCredentials(users);
+      if (JSON.stringify(users) !== JSON.stringify(protectedUsers)) await writeCol(key, protectedUsers);
+    }
     console.log("[copikon-server] schema ready");
   } catch (e) {
     console.error("[copikon-server] schema init failed:", e);

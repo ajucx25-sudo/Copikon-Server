@@ -25,10 +25,8 @@ async function getState(pool) {
   return seeded;
 }
 function resolveUser(req) {
-  const token = String(req.headers.authorization || "").replace(/^Bearer\s+/, "");
-  const match = token.match(/^srv-(\d+)-/);
-  if (!match) throw httpError(401, "Sesión requerida.");
-  return Number(match[1]);
+  if (!req.verifiedUser || req.verifiedUser.isPartner) throw httpError(401, "Sesión requerida.");
+  return Number(req.verifiedUser.id);
 }
 function userName(user) { return `${user?.firstName || ""} ${user?.lastName || ""}`.trim() || user?.username || "Usuario"; }
 
