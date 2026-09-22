@@ -7651,7 +7651,7 @@ app.get("/api/logistica/gps/live", wrap(async (_req, res) => {
 // Se pensó para ser consumido desde el sitio web público de BAIFA.
 app.get("/api/public/baifa/price-list", wrap(async (_req, res) => {
   try {
-    res.set("Cache-Control", "public, max-age=300"); // 5 min cache CDN-friendly
+    res.set("Cache-Control", "no-store"); // Catálogo comercial vigente, sin persistir precios públicos antiguos.
     const items = await readCol("generatorsPriceListItems");
     const settings = (await readSingleton("generatorsPriceListSettings")) || {};
     const published = (Array.isArray(items) ? items : [])
@@ -7673,7 +7673,7 @@ app.get("/api/public/baifa/price-list", wrap(async (_req, res) => {
         atsAmp: it.atsAmp || "",
         priceExpress: Number(it.priceExpress) || 0,
         priceDirect: Number(it.priceDirect) || 0,
-        priceAmbassador: Number(it.priceAmbassador) || 0,
+        // Precio Embajador reservado a las rutas autenticadas de Generators.
         currency: it.currency || "USD",
         stockImmediate: Number(it.stockImmediate) || 0,
         stockTransit: Number(it.stockTransit) || 0,
