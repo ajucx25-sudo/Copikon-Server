@@ -36,6 +36,10 @@ export function permissionList(value) {
 }
 export const isAdministrator = user => user?.level === "ceo" || user?.username === "admin";
 export function canAccessPath(user, path, method) {
+  if (/^\/api\/erp\/pre-leads(?:\/|$)/.test(path)) {
+    if (user?.isPartner || user?.level === "partner_externo") return false;
+    return isAdministrator(user) || permissionList(user?.moduleAccess).some(m => ["generators-ventas", "generators-tecnico"].includes(m));
+  }
   if (isAdministrator(user)) return true;
   const modules = permissionList(user?.moduleAccess);
   if (/^\/api\/(?:admin\/(?:users|sales-partners|providers|technical-providers)|sync)(?:\/|$)/.test(path)) return false;

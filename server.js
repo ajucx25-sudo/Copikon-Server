@@ -178,6 +178,7 @@ const sessions = createSessions(pool, readCol, buildPartnerUser);
 app.use((req, res, next) => {
   const path = req.path.toLowerCase();
   const protectedPath = /^\/api\/(?:logistica|employees|sales-partners|admin\/(?:users|sales-partners|providers|technical-providers)|sync)(?:\/|$)/.test(path) ||
+    /^\/api\/erp\/pre-leads(?:\/|$)/.test(path) ||
     /^\/api\/generators\/(?:shipments|price-list-settings|price-list-items)(?:\/|$)/.test(path) ||
     /^\/api\/auth\/(?:me|change-password|logout)$/.test(path);
   if (!protectedPath) return next();

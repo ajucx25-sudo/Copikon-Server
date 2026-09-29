@@ -32,6 +32,9 @@ test("HTTP authorization through real Express routes with isolated fake database
       ["/api/generators/price-list-settings","PUT"],
       ["/api/sales-partners/1/set-credentials","POST"],
       ["/api/admin/technical-providers/1/reset-access","POST"],
+      ["/api/erp/pre-leads","GET"], ["/API/ERP/PRE-LEADS","GET"],
+      ["/api/erp/pre-leads","POST"], ["/api/erp/pre-leads/1","PATCH"],
+      ["/api/erp/pre-leads/1","PUT"], ["/api/erp/pre-leads/1","DELETE"],
     ];
     for(const [path,method] of routes){
       assert.equal((await request(path,method)).status,401,`${method} ${path}`);
@@ -43,6 +46,17 @@ test("HTTP authorization through real Express routes with isolated fake database
       assert.equal(body.user.password,undefined);return body.token;
     };
     const admin=await login("qa-admin"),sales=await login("qa-sales"),logistics=await login("qa-logistics");
+    assert.equal((await request("/api/erp/pre-leads","GET",logistics)).status,403);
+    assert.equal((await request("/api/erp/pre-leads","POST",logistics,{companyName:"forbidden"})).status,403);
+    const preleadResponse = await request("/api/erp/pre-leads","POST",sales,{id:12345,companyName:"QA intake",intakeBrand:"baifa",intakePhone:"+584126381163"});
+    assert.equal(preleadResponse.status,201);
+    assert.equal((await preleadResponse.json()).intakeBrand,"baifa");
+    const preleadRetry = await request("/api/erp/pre-leads","POST",sales,{id:12345,companyName:"QA intake"});
+    assert.equal(preleadRetry.status,200);
+    assert.equal((await request("/api/erp/pre-leads/12345","PATCH",sales,{intakeStatus:"contactado"})).status,200);
+    const preleads = await request("/api/erp/pre-leads","GET",sales);
+    assert.equal(preleads.headers.get("cache-control"),"no-store");
+    assert.equal((await preleads.json()).find(p=>p.id===12345).intakeStatus,"contactado");
     assert.equal((await request("/api/employees","GET",admin)).status,200);
     const employeeResponse=await request("/api/employees","GET",admin);
     assert.equal(employeeResponse.headers.get("cache-control"),"no-store");

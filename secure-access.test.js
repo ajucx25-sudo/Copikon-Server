@@ -76,4 +76,9 @@ test("role checks deny unprivileged mutations and permit intended modules", () =
   assert.equal(canAccessPath({ moduleAccess: ["logistica-nacional"] }, "/api/logistica/shipments", "GET"), true);
   assert.equal(canAccessPath({ level: "ceo" }, "/api/employees/1", "PATCH"), true);
   assert.deepEqual(safeUser({ id: 4, password: "x", passwordHash: "y" }), { id: 4 });
+  assert.equal(canAccessPath(user, "/api/erp/pre-leads", "POST"), true);
+  assert.equal(canAccessPath({ moduleAccess: ["generators-tecnico"] }, "/api/erp/pre-leads", "GET"), true);
+  assert.equal(canAccessPath({ isPartner: true, moduleAccess: ["generators-ventas"] }, "/api/erp/pre-leads", "GET"), false);
+  assert.equal(canAccessPath({ level: "partner_externo", moduleAccess: ["generators-ventas"] }, "/api/erp/pre-leads", "POST"), false);
+  assert.equal(canAccessPath({ moduleAccess: [] }, "/api/erp/pre-leads/1", "DELETE"), false);
 });
