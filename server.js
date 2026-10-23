@@ -18,6 +18,7 @@ import { registerPreventaRoutes } from "./preventa.js";
 import { registerShipmentsRoutes } from "./shipments.js";
 import { createSessions, safeUser, canAccessPath, verifyPassword, protectCredentials } from "./secure-access.js";
 import { isClientMutation, validateClientEdit } from "./client-edit-access.js";
+import { isEquipmentMutation, isPosventaEquipmentPath, validateEquipmentEdit } from "./equipment-edit-access.js";
 import { randomBytes } from "node:crypto";
 import XLSX from "xlsx";
 import { createRequire } from "module";
@@ -179,7 +180,9 @@ const sessions = createSessions(pool, readCol, buildPartnerUser);
 app.use((req, res, next) => {
   const path = req.path.toLowerCase();
   const clientMutation = isClientMutation(path, req.method);
-  const protectedPath = clientMutation || /^\/api\/(?:logistica|employees|sales-partners|admin\/(?:users|sales-partners|providers|technical-providers)|sync)(?:\/|$)/.test(path) ||
+  const equipmentMutation = isEquipmentMutation(path, req.method);
+  const posventaEquipment = isPosventaEquipmentPath(path);
+  const protectedPath = clientMutation || equipmentMutation || posventaEquipment || /^\/api\/(?:logistica|employees|sales-partners|admin\/(?:users|sales-partners|providers|technical-providers)|sync)(?:\/|$)/.test(path) ||
     /^\/api\/erp\/pre-leads(?:\/|$)/.test(path) ||
     /^\/api\/generators\/(?:shipments|price-list-settings|price-list-items)(?:\/|$)/.test(path) ||
     /^\/api\/auth\/(?:me|change-password|logout)$/.test(path);
@@ -193,6 +196,11 @@ app.use((req, res, next) => {
       if (error) return res.status(400).json({ message: error });
       req.body = patch;
     }
+    if ((equipmentMutation || posventaEquipment) && ["PATCH","PUT"].includes(req.method)) {
+      const {patch,error} = validateEquipmentEdit(req.body, equipmentMutation);
+      if (error) return res.status(400).json({message:error});
+      req.body = patch;
+    }
     req.verifiedUser = user;
     if (/^\/api\/(?:employees|admin\/users|auth)(?:\/|$)/.test(path)) {
       const send = res.json.bind(res);
@@ -204,6 +212,18 @@ app.use((req, res, next) => {
     res.status(503).json({ message: "No se pudo verificar la sesión. Intenta nuevamente." });
   });
 });
+
+app.patch("/api/generators/posventa/equipment/:id", wrap(async (req,res) => {
+  const rows = await readCol("erpClientEquipment");
+  const index = rows.findIndex(row => String(row.id) === req.params.id);
+  if (index === -1) return res.status(404).json({message:"Equipo no encontrado."});
+  if (rows[index].active === false || ["externo","alquiler"].includes(rows[index].source)) {
+    return res.status(403).json({message:"Solo se pueden editar equipos activos vendidos por Copikon."});
+  }
+  rows[index] = {...rows[index],...req.body};
+  await writeCol("erpClientEquipment",rows);
+  res.json(rows[index]);
+}));
 
 // ───── Salud ────────────────────────────────────────────────
 app.get("/api/health", wrap(async (_req, res) => {

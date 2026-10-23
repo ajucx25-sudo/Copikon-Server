@@ -8,6 +8,12 @@ const kv = new Map([
   ]],
   ["logisticaCarriers",[{id:1,name:"Fictional carrier"}]],
   ["erpClients",[{id:501,name:"QA client",odooId:771,phone:"123",status:"activo"}]],
+  ["erpClientEquipment",[
+    {id:601,clientId:501,model:"QA",source:"venta",serial:"QA-601",active:true},
+    {id:602,clientId:501,model:"QA other",source:"venta",active:true},
+    {id:603,source:"externo",active:true},
+    {id:604,source:"venta",active:false},
+  ]],
 ]);
 const sessions=new Map();
 class Pool {

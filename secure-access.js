@@ -1,6 +1,7 @@
 import { createHash, randomBytes, scrypt, timingSafeEqual } from "node:crypto";
 import { promisify } from "node:util";
 import { isClientMutation } from "./client-edit-access.js";
+import { isEquipmentMutation, isPosventaEquipmentPath } from "./equipment-edit-access.js";
 
 const hash = value => createHash("sha256").update(String(value)).digest("hex");
 const derive = promisify(scrypt);
@@ -37,6 +38,16 @@ export function permissionList(value) {
 }
 export const isAdministrator = user => user?.level === "ceo" || user?.username === "admin";
 export function canAccessPath(user, path, method) {
+  if (isPosventaEquipmentPath(path)) {
+    return !user?.isPartner && user?.level !== "partner_externo" && (isAdministrator(user) || user?.level === "coordinador");
+  }
+  if (isEquipmentMutation(path, method)) {
+    // Existing technical/sales maintenance workflows retain their module access;
+    // the focused Posventa editor above is restricted to management.
+    return !user?.isPartner && user?.level !== "partner_externo" &&
+      (isAdministrator(user) || user?.level === "coordinador" || permissionList(user?.moduleAccess).some(m =>
+        ["generators-tecnico","generators-mantenimiento","generators-ventas","generators-alquiler","generators-posventa"].includes(m)));
+  }
   if (isClientMutation(path, method)) {
     if (user?.isPartner || user?.level === "partner_externo") return false;
     return isAdministrator(user) || user?.level === "coordinador";

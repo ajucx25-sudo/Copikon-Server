@@ -37,6 +37,9 @@ test("HTTP authorization through real Express routes with isolated fake database
       ["/api/erp/pre-leads/1","PUT"], ["/api/erp/pre-leads/1","DELETE"],
       ["/api/erp/clients/501","PATCH"], ["/API/ERP/CLIENTS/501","PUT"],
       ["/api/erp/clients/501","DELETE"],
+      ["/api/generators/posventa/equipment/601","PATCH"],
+      ["/api/erp/client-equipment/601","PATCH"], ["/api/erp/client-equipment/601","PUT"],
+      ["/api/erp/client-equipment/601","DELETE"],
     ];
     for(const [path,method] of routes){
       assert.equal((await request(path,method)).status,401,`${method} ${path}`);
@@ -49,6 +52,29 @@ test("HTTP authorization through real Express routes with isolated fake database
     };
     const admin=await login("qa-admin"),sales=await login("qa-sales"),logistics=await login("qa-logistics");
     const coordinator = await login("qa-coordinator");
+    assert.equal((await request("/api/generators/posventa/equipment/601","PATCH",sales,{warrantyMonths:12})).status,403);
+    assert.equal((await request("/api/erp/client-equipment/601","PATCH",logistics,{warrantyMonths:12})).status,403);
+    for (const bad of [{clientId:999},{id:2},{installedAt:"2026-02-30"},{warrantyMonths:1.5},{warrantyMonths:0},{warrantyMonths:121},{}]) {
+      assert.equal((await request("/api/generators/posventa/equipment/601","PATCH",coordinator,bad)).status,400);
+    }
+    for (const method of ["PATCH","PUT"]) {
+      assert.equal((await request("/api/erp/client-equipment/601",method,admin,{commissionedAt:"bad"})).status,400);
+    }
+    const eqEdit = await request("/api/generators/posventa/equipment/601","PATCH",coordinator,{
+      installedAt:"2026-01-01",commissionedAt:"2026-02-01",warrantyMonths:24,invoiceNumber:" QA-01 "
+    });
+    assert.equal(eqEdit.status,200);
+    const editedEq=await eqEdit.json();
+    assert.equal(editedEq.clientId,501); assert.equal(editedEq.serial,"QA-601"); assert.equal(editedEq.invoiceNumber,"QA-01");
+    const eqRead=await request("/api/erp/client-equipment/601","GET",admin);
+    assert.equal((await eqRead.json()).warrantyMonths,24);
+    assert.equal((await (await request("/api/erp/client-equipment/602","GET",admin)).json()).warrantyMonths,undefined);
+    assert.equal((await request("/api/generators/posventa/equipment/603","PATCH",admin,{warrantyMonths:12})).status,403);
+    assert.equal((await request("/api/generators/posventa/equipment/604","PATCH",admin,{warrantyMonths:12})).status,403);
+    assert.equal((await request("/api/generators/posventa/equipment/999","PATCH",admin,{warrantyMonths:12})).status,404);
+    assert.equal((await request("/api/erp/client-equipment/601","PATCH",sales,{location:"QA location"})).status,200);
+    const clearEq=await request("/api/generators/posventa/equipment/601","PATCH",admin,{commissionedAt:null,warrantyMonths:null,invoiceNumber:null});
+    assert.equal(clearEq.status,200); assert.equal((await clearEq.json()).warrantyMonths,null);
     for (const method of ["PATCH","PUT","DELETE"]) {
       assert.equal((await request("/api/erp/clients/501",method,sales,{name:"forbidden"})).status,403);
     }
