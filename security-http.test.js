@@ -35,6 +35,8 @@ test("HTTP authorization through real Express routes with isolated fake database
       ["/api/erp/pre-leads","GET"], ["/API/ERP/PRE-LEADS","GET"],
       ["/api/erp/pre-leads","POST"], ["/api/erp/pre-leads/1","PATCH"],
       ["/api/erp/pre-leads/1","PUT"], ["/api/erp/pre-leads/1","DELETE"],
+      ["/api/erp/clients/501","PATCH"], ["/API/ERP/CLIENTS/501","PUT"],
+      ["/api/erp/clients/501","DELETE"],
     ];
     for(const [path,method] of routes){
       assert.equal((await request(path,method)).status,401,`${method} ${path}`);
@@ -46,6 +48,25 @@ test("HTTP authorization through real Express routes with isolated fake database
       assert.equal(body.user.password,undefined);return body.token;
     };
     const admin=await login("qa-admin"),sales=await login("qa-sales"),logistics=await login("qa-logistics");
+    const coordinator = await login("qa-coordinator");
+    for (const method of ["PATCH","PUT","DELETE"]) {
+      assert.equal((await request("/api/erp/clients/501",method,sales,{name:"forbidden"})).status,403);
+    }
+    for (const body of [{id:999,name:"Bad"}, {odooId:1}, {name:" "}, {email:"bad"}, {phone:123}, [], {}]) {
+      assert.equal((await request("/api/erp/clients/501","PATCH",admin,body)).status,400);
+    }
+    const edit = await request("/api/erp/clients/501","PATCH",coordinator,{name:" Updated QA ",phone:null});
+    assert.equal(edit.status,200);
+    assert.equal(edit.headers.get("cache-control"),"no-store");
+    const edited = await edit.json();
+    assert.equal(edited.name,"Updated QA"); assert.equal(edited.phone,null);
+    assert.equal(edited.id,501); assert.equal(edited.odooId,771); assert.equal(edited.status,"activo");
+    const putEdit = await request("/api/erp/clients/501","PUT",admin,{city:"Barquisimeto"});
+    assert.equal(putEdit.status,200);
+    assert.equal((await putEdit.json()).odooId,771);
+    const reread = await request("/api/erp/clients/501","GET",admin);
+    assert.equal((await reread.json()).name,"Updated QA");
+    assert.equal((await request("/api/erp/clients/999999","PATCH",admin,{name:"Not found"})).status,404);
     assert.equal((await request("/api/erp/pre-leads","GET",logistics)).status,403);
     assert.equal((await request("/api/erp/pre-leads","POST",logistics,{companyName:"forbidden"})).status,403);
     const preleadResponse = await request("/api/erp/pre-leads","POST",sales,{id:12345,companyName:"QA intake",intakeBrand:"baifa",intakePhone:"+584126381163"});

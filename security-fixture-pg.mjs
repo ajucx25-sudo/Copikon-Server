@@ -4,8 +4,10 @@ const kv = new Map([
     {id:1,username:"qa-admin",level:"ceo",password:"test-only-password",status:"active"},
     {id:2,username:"qa-sales",level:"employee",password:"test-only-password",moduleAccess:["generators-ventas"],status:"active"},
     {id:3,username:"qa-logistics",level:"employee",password:"test-only-password",moduleAccess:["logistica-nacional"],status:"active"},
+    {id:4,username:"qa-coordinator",level:"coordinador",password:"test-only-password",moduleAccess:["generators-posventa"],status:"active"},
   ]],
   ["logisticaCarriers",[{id:1,name:"Fictional carrier"}]],
+  ["erpClients",[{id:501,name:"QA client",odooId:771,phone:"123",status:"activo"}]],
 ]);
 const sessions=new Map();
 class Pool {

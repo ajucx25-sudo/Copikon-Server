@@ -17,6 +17,7 @@ import { registerPricelistsRoutes } from "./pricelists.js";
 import { registerPreventaRoutes } from "./preventa.js";
 import { registerShipmentsRoutes } from "./shipments.js";
 import { createSessions, safeUser, canAccessPath, verifyPassword, protectCredentials } from "./secure-access.js";
+import { isClientMutation, validateClientEdit } from "./client-edit-access.js";
 import { randomBytes } from "node:crypto";
 import XLSX from "xlsx";
 import { createRequire } from "module";
@@ -177,7 +178,8 @@ const sessions = createSessions(pool, readCol, buildPartnerUser);
 // new Generators modules. Public BAIFA and token-scoped ally portals stay public.
 app.use((req, res, next) => {
   const path = req.path.toLowerCase();
-  const protectedPath = /^\/api\/(?:logistica|employees|sales-partners|admin\/(?:users|sales-partners|providers|technical-providers)|sync)(?:\/|$)/.test(path) ||
+  const clientMutation = isClientMutation(path, req.method);
+  const protectedPath = clientMutation || /^\/api\/(?:logistica|employees|sales-partners|admin\/(?:users|sales-partners|providers|technical-providers)|sync)(?:\/|$)/.test(path) ||
     /^\/api\/erp\/pre-leads(?:\/|$)/.test(path) ||
     /^\/api\/generators\/(?:shipments|price-list-settings|price-list-items)(?:\/|$)/.test(path) ||
     /^\/api\/auth\/(?:me|change-password|logout)$/.test(path);
@@ -186,6 +188,11 @@ app.use((req, res, next) => {
   sessions.authenticate(req).then(user => {
     if (!user) return res.status(401).json({ message: "Sesión vencida o no válida. Inicia sesión de nuevo." });
     if (!canAccessPath(user, path, req.method)) return res.status(403).json({ message: "No tienes permisos para esta operación." });
+    if (clientMutation && ["PATCH", "PUT"].includes(req.method)) {
+      const { patch, error } = validateClientEdit(req.body);
+      if (error) return res.status(400).json({ message: error });
+      req.body = patch;
+    }
     req.verifiedUser = user;
     if (/^\/api\/(?:employees|admin\/users|auth)(?:\/|$)/.test(path)) {
       const send = res.json.bind(res);

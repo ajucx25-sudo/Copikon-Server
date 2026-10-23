@@ -1,5 +1,6 @@
 import { createHash, randomBytes, scrypt, timingSafeEqual } from "node:crypto";
 import { promisify } from "node:util";
+import { isClientMutation } from "./client-edit-access.js";
 
 const hash = value => createHash("sha256").update(String(value)).digest("hex");
 const derive = promisify(scrypt);
@@ -36,6 +37,10 @@ export function permissionList(value) {
 }
 export const isAdministrator = user => user?.level === "ceo" || user?.username === "admin";
 export function canAccessPath(user, path, method) {
+  if (isClientMutation(path, method)) {
+    if (user?.isPartner || user?.level === "partner_externo") return false;
+    return isAdministrator(user) || user?.level === "coordinador";
+  }
   if (/^\/api\/erp\/pre-leads(?:\/|$)/.test(path)) {
     if (user?.isPartner || user?.level === "partner_externo") return false;
     return isAdministrator(user) || permissionList(user?.moduleAccess).some(m => ["generators-ventas", "generators-tecnico"].includes(m));
