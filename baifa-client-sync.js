@@ -10,11 +10,16 @@ export const fingerprint = value => createHash("sha256").update(JSON.stringify(v
 export const isBaifaSyncPath = path => /^\/api\/generators\/clients\/odoo-baifa(?:\/|$)/i.test(path);
 
 export function isGenerator(p) {
-  const name = norm(p.name);
+  const name = norm(p.name).trim();
   const brand = norm(`${p.x_studio_marca || ""} ${p.x_studio_marca_1 || ""} ${p.name || ""}`);
+  // Verified in Odoo: legacy category 60 and current category 3439 both carry
+  // this category name. Full sets mention ATS and oil capacity in specifications;
+  // those words must not classify an entire generator as a spare part.
+  const category = tax(Array.isArray(p.categ_id) ? p.categ_id[1] : "");
   return /\bBAIFA\b/.test(brand) && p.type !== "service" &&
-    /GENERADOR|GENERATOR|GENSET|GRUPO ELECTROGENO|PLANTA ELECTRICA/.test(name) &&
-    !/REPUESTO|FILTRO|ACEITE|MANTENIMIENTO|SERVICIO|ALQUILER|ARRENDAMIENTO|TRANSFERENCIA|TABLERO|\bATS\b|CONTROLADOR|TARJETA|BATERIA|BOMBA|INYECTOR|AVR|SENSOR|CORREA|RADIADOR|SILENCIADOR|ESCAPE|BASE PARA|KIT\b|PARA (?:GENERADOR|PLANTA|GRUPO)|FOR GENERATOR/.test(name);
+    category === "GENERADORESELECTRICOS" &&
+    /^(?:GENERADOR(?:ES)?|GENERATOR|GENSET|GRUPO ELECTROGENO|PLANTA ELECTRICA)\b/.test(name) &&
+    !/\b(?:REPUESTO|MANTENIMIENTO|SERVICIO|ALQUILER|ARRENDAMIENTO)\b/.test(name);
 }
 
 async function all(odoo, model, domain, fields, maximum = 50000, context = {}) {
@@ -40,8 +45,8 @@ async function byIds(odoo, model, ids, fields, context = {}) {
 
 export async function loadBaifaCustomers(odoo) {
   if (!odoo.isConfigured()) throw Error("Odoo no está configurado en el servidor.");
-  const companies = (await all(odoo, "res.company", [], ["id", "name"], 100))
-    .filter(c => ["COPIKONCA", "COPIKONVENEZUELACA"].includes(tax(c.name)));
+  const companies = (await all(odoo, "res.company", [], ["id", "name", "vat"], 100))
+    .filter(c => tax(c.vat) === "J294654568" && /^(?:COPIKONCA|COPIKONVENEZUELACA)(?:J294654568)?$/.test(tax(c.name)));
   if (!companies.length) throw Error("No se pudo identificar la compañía Copikon en Odoo.");
   const context = {allowed_company_ids: companies.map(c => c.id)};
   const until = new Intl.DateTimeFormat("en-CA", {timeZone: "America/Caracas", year: "numeric", month: "2-digit", day: "2-digit"}).format(new Date());
@@ -49,7 +54,7 @@ export async function loadBaifaCustomers(odoo) {
   const brandFields = ["x_studio_marca", "x_studio_marca_1"].filter(f => fields[f]);
   const clauses = [["name", "ilike", "BAIFA"], ...brandFields.map(f => [f, "ilike", "BAIFA"])];
   const domain = [...Array(clauses.length - 1).fill("|"), ...clauses];
-  const products = await all(odoo, "product.product", domain, ["id", "name", "default_code", "type", ...brandFields], 50000, context);
+  const products = await all(odoo, "product.product", domain, ["id", "name", "default_code", "type", "categ_id", ...brandFields], 50000, context);
   const included = products.filter(isGenerator);
   if (!included.length) throw Error("No se identificaron generadores BAIFA; revisa la clasificación antes de importar.");
   const lines = await all(odoo, "account.move.line", [

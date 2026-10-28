@@ -9,11 +9,16 @@ const source = {
     sales: [{invoiceId: 81, lineId: 901, productId: 100, quantity: 1}], credits: []}],
 };
 test("only BAIFA complete generators, not parts or services", () => {
-  for (const name of ["GENERADOR ELECTRICO BAIFA 50 KVA", "GRUPO ELECTROGENO BAIFA BF110"]) assert.ok(isGenerator({name,type:"product"}));
-  for (const name of ["FILTRO PARA GENERADOR BAIFA", "ALQUILER GENERADOR BAIFA", "TABLERO ATS BAIFA", "ACEITE BAIFA", "GENERADOR OTRA MARCA"])
-    assert.equal(isGenerator({name,type:"product"}),false,name);
-  assert.equal(isGenerator({name:"GENERADOR BAIFA",type:"service"}),false);
-  assert.ok(isGenerator({name:"GENERADOR 50KVA",x_studio_marca:"BAIFA",type:"product"}));
+  const categ_id = [60, "GENERADORES ELÉCTRICOS"];
+  for (const name of ["GENERADOR ELECTRICO BAIFA 50 KVA", "GRUPO ELECTROGENO BAIFA BF110",
+    "GENERADOR ELÉCTRICO DIÉSEL MONOFÁSICO: POTENCIA 125 KVA STANDBY//MOTOR CUMMINS//ATS 630A// MARCA BAIFA",
+    "GENERADOR ELECTRICO DIESEL 180KVA CAPACIDAD DE ACEITE 16.4L MARCA BAIFA ATS 630A"])
+    assert.ok(isGenerator({name,type:"product",categ_id}), name);
+  for (const name of ["FILTRO PARA GENERADOR BAIFA", "ALQUILER GENERADOR BAIFA", "TABLERO ATS BAIFA", "ACEITE BAIFA", "GENERADOR OTRA MARCA", "SILENCIADOR GENERADOR BAIFA", "BASE PARA GRUPO ELECTROGENO BAIFA"])
+    assert.equal(isGenerator({name,type:"product",categ_id}),false,name);
+  assert.equal(isGenerator({name:"GENERADOR BAIFA",type:"service",categ_id}),false);
+  assert.ok(isGenerator({name:"GENERADOR 50KVA",x_studio_marca:"BAIFA",type:"product",categ_id}));
+  assert.equal(isGenerator({name:"GENERADOR BAIFA",type:"product",categ_id:[99,"REPUESTOS"]}),false);
 });
 test("plan adds clients, reserves orphan equipment IDs, does not mutate original", () => {
   const existing=[{id:1,name:"Otro cliente",notes:"Conservar"}], snapshot=structuredClone(existing);
@@ -47,8 +52,8 @@ test("read-only historical source includes old/current Copikon, archived product
   const odoo={isConfigured:()=>true,execute:async(model,method)=>{assert.equal(method,"fields_get");return {x_studio_marca:{type:"char"}};},
     searchRead:async(model,domain,fields,opts)=>{
       calls.push({model,domain,opts});
-      if(model==="res.company")return [{id:1,name:"COPIKON VENEZUELA, C.A."},{id:12,name:"COPIKON C.A."},{id:6,name:"Otra empresa"}];
-      if(model==="product.product")return [{id:100,name:"GENERADOR BAIFA",type:"product"},{id:101,name:"FILTRO BAIFA",type:"product"}];
+      if(model==="res.company")return [{id:1,name:"COPIKON VENEZUELA, C.A. J294654568",vat:"J294654568"},{id:12,name:"COPIKON C.A. J294654568",vat:"J294654568"},{id:6,name:"Otra empresa",vat:"J294654568"}];
+      if(model==="product.product")return [{id:100,name:"GENERADOR BAIFA",type:"product",categ_id:[60,"GENERADORES ELÉCTRICOS"]},{id:101,name:"FILTRO BAIFA",type:"product",categ_id:[99,"REPUESTOS"]}];
       if(model==="account.move.line")return [{id:901,move_id:[81,"F1"],product_id:[100,"BAIFA"],quantity:1},{id:902,move_id:[82,"NC1"],product_id:[100,"BAIFA"],quantity:1}];
       if(model==="account.move")return [{id:81,name:"F1",invoice_date:"2022-01-01",state:"posted",move_type:"out_invoice",commercial_partner_id:[7001,"QA"],company_id:[1,"COPIKON"]},
         {id:82,name:"NC1",invoice_date:"2023-01-01",state:"posted",move_type:"out_refund",commercial_partner_id:[7001,"QA"],company_id:[12,"COPIKON"]}];
