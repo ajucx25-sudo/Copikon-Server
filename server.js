@@ -17,8 +17,10 @@ import { registerPricelistsRoutes } from "./pricelists.js";
 import { registerPreventaRoutes } from "./preventa.js";
 import { registerShipmentsRoutes } from "./shipments.js";
 import { createSessions, safeUser, canAccessPath, verifyPassword, protectCredentials } from "./secure-access.js";
-import { isClientMutation, validateClientEdit } from "./client-edit-access.js";
+import { isClientMutation, isClientResource, validateClientCreate, validateClientEdit } from "./client-edit-access.js";
+import {collectionContext, requiresCollectionTransaction, runCollectionTransaction, isPricelistClientMutation} from "./client-collection-transactions.js";
 import { isEquipmentMutation, isPosventaEquipmentPath, validateEquipmentEdit } from "./equipment-edit-access.js";
+import { registerBaifaClientSync, isBaifaSyncPath } from "./baifa-client-sync.js";
 import { randomBytes } from "node:crypto";
 import XLSX from "xlsx";
 import { createRequire } from "module";
@@ -54,15 +56,28 @@ async function ensureSchema() {
 }
 
 async function readCol(key) {
-  const r = await pool.query("SELECT value FROM kv WHERE key = $1", [key]);
+  const r = await (collectionContext.getStore() || pool).query("SELECT value FROM kv WHERE key = $1", [key]);
   if (!r.rows[0]) return [];
   const v = r.rows[0].value;
   return Array.isArray(v) ? v : [];
 }
 
 async function writeCol(key, arr) {
+  if (["erpClients","erpClientEquipment"].includes(key) && !collectionContext.getStore()) {
+    throw Error("Escritura de clientes/equipos fuera de una transacción protegida.");
+  }
+  if (key === "erpClientEquipment") {
+    const old = await readCol(key);
+    const clients = new Set((await readCol("erpClients")).map(c => Number(c.id)));
+    const oldById = new Map(old.map(e => [String(e.id),e]));
+    for (const equipment of arr) {
+      const previous = oldById.get(String(equipment.id));
+      if (equipment.clientId != null && (!previous || Number(previous.clientId) !== Number(equipment.clientId)) &&
+          !clients.has(Number(equipment.clientId))) throw Error("El cliente asignado al equipo no existe.");
+    }
+  }
   if ((key === "employees" || key === "salesPartners") && Array.isArray(arr)) arr = await protectCredentials(arr);
-  await pool.query(
+  await (collectionContext.getStore() || pool).query(
     `INSERT INTO kv (key, value, updated_at) VALUES ($1, $2::jsonb, $3)
      ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at`,
     [key, JSON.stringify(arr ?? []), Date.now()]
@@ -165,7 +180,8 @@ app.use(cors({
 app.use(express.json({ limit: "150mb" }));
 
 const wrap = (fn) => (req, res) =>
-  Promise.resolve(fn(req, res)).catch((err) => {
+  Promise.resolve(requiresCollectionTransaction(req.path, req.method)
+    ? runCollectionTransaction(pool, req, res, fn) : fn(req, res)).catch((err) => {
     console.error("[handler]", err);
     const status = Number(err?.status);
     res.status(status >= 400 && status < 600 ? status : 500).json({
@@ -182,7 +198,8 @@ app.use((req, res, next) => {
   const clientMutation = isClientMutation(path, req.method);
   const equipmentMutation = isEquipmentMutation(path, req.method);
   const posventaEquipment = isPosventaEquipmentPath(path);
-  const protectedPath = clientMutation || equipmentMutation || posventaEquipment || /^\/api\/(?:logistica|employees|sales-partners|admin\/(?:users|sales-partners|providers|technical-providers)|sync)(?:\/|$)/.test(path) ||
+  const equipmentCreate = /^\/api\/erp\/client-equipment(?:\/|$)/.test(path) && req.method === "POST";
+  const protectedPath = isPricelistClientMutation(path, req.method) || isClientResource(path) || equipmentCreate || isBaifaSyncPath(path) || clientMutation || equipmentMutation || posventaEquipment || /^\/api\/(?:logistica|employees|sales-partners|admin\/(?:users|sales-partners|providers|technical-providers)|sync)(?:\/|$)/.test(path) ||
     /^\/api\/erp\/pre-leads(?:\/|$)/.test(path) ||
     /^\/api\/generators\/(?:shipments|price-list-settings|price-list-items)(?:\/|$)/.test(path) ||
     /^\/api\/auth\/(?:me|change-password|logout)$/.test(path);
@@ -194,6 +211,11 @@ app.use((req, res, next) => {
     if (clientMutation && ["PATCH", "PUT"].includes(req.method)) {
       const { patch, error } = validateClientEdit(req.body);
       if (error) return res.status(400).json({ message: error });
+      req.body = patch;
+    }
+    if (isClientResource(path) && req.method === "POST") {
+      const {patch,error} = validateClientCreate(req.body);
+      if (error) return res.status(400).json({message:error});
       req.body = patch;
     }
     if ((equipmentMutation || posventaEquipment) && ["PATCH","PUT"].includes(req.method)) {
@@ -212,6 +234,8 @@ app.use((req, res, next) => {
     res.status(503).json({ message: "No se pudo verificar la sesión. Intenta nuevamente." });
   });
 });
+
+registerBaifaClientSync(app, {odoo, readCol, pool, wrap});
 
 app.patch("/api/generators/posventa/equipment/:id", wrap(async (req,res) => {
   const rows = await readCol("erpClientEquipment");
@@ -339,6 +363,10 @@ app.post("/api/sync/migrate", wrap(async (req, res) => {
   const results = {};
   for (const [key, arr] of Object.entries(snapshot)) {
     if (!Array.isArray(arr)) continue;
+    if (["erpClients","erpClientEquipment"].includes(key) || key.startsWith("baifaClientSync")) {
+      results[key] = {skipped:true, reason:"Colección protegida: usar sus formularios o la sincronización dedicada."};
+      continue;
+    }
     if (mode === "replace") {
       await writeCol(key, arr);
       results[key] = { mode: "replace", count: arr.length };
@@ -368,6 +396,7 @@ app.post("/api/sync/seed", wrap(async (req, res) => {
   const written = {};
   for (const [key, arr] of Object.entries(seed)) {
     if (!Array.isArray(arr)) continue;
+    if (["erpClients","erpClientEquipment"].includes(key) || key.startsWith("baifaClientSync")) continue;
     const existing = await readCol(key);
     if (existing.length === 0) {
       await writeCol(key, arr);

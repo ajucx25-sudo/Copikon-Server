@@ -12,16 +12,19 @@
 //   GET    /api/pricelists/client/:clientId      → retorna lista asignada + materializada del cliente
 
 const K = "pricelistsB2B";
+import {collectionContext} from "./client-collection-transactions.js";
 
 async function readList(pool) {
-  const r = await pool.query("SELECT value FROM kv WHERE key = $1", [K]);
+  const r = await (collectionContext.getStore() || pool).query("SELECT value FROM kv WHERE key = $1", [K]);
   if (!r.rows[0]) return [];
   const v = r.rows[0].value;
   return Array.isArray(v) ? v : [];
 }
 
 async function writeList(pool, arr) {
-  await pool.query(
+  const db = collectionContext.getStore();
+  if (!db) throw Error("Listas de precio requieren una transacción compartida.");
+  await db.query(
     `INSERT INTO kv (key, value, updated_at) VALUES ($1, $2::jsonb, $3)
      ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at`,
     [K, JSON.stringify(arr ?? []), Date.now()]
@@ -29,21 +32,23 @@ async function writeList(pool, arr) {
 }
 
 async function readProducts(pool) {
-  const r = await pool.query("SELECT value FROM kv WHERE key = 'erpProducts'");
+  const r = await (collectionContext.getStore() || pool).query("SELECT value FROM kv WHERE key = 'erpProducts'");
   if (!r.rows[0]) return [];
   const v = r.rows[0].value;
   return Array.isArray(v) ? v : [];
 }
 
 async function readClients(pool) {
-  const r = await pool.query("SELECT value FROM kv WHERE key = 'erpClients'");
+  const r = await (collectionContext.getStore() || pool).query("SELECT value FROM kv WHERE key = 'erpClients'");
   if (!r.rows[0]) return [];
   const v = r.rows[0].value;
   return Array.isArray(v) ? v : [];
 }
 
 async function writeClients(pool, arr) {
-  await pool.query(
+  const db = collectionContext.getStore();
+  if (!db) throw Error("Cambios de clientes requieren una transacción compartida.");
+  await db.query(
     `INSERT INTO kv (key, value, updated_at) VALUES ($1, $2::jsonb, $3)
      ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at`,
     ["erpClients", JSON.stringify(arr ?? []), Date.now()]

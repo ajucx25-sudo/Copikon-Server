@@ -37,9 +37,14 @@ test("HTTP authorization through real Express routes with isolated fake database
       ["/api/erp/pre-leads/1","PUT"], ["/api/erp/pre-leads/1","DELETE"],
       ["/api/erp/clients/501","PATCH"], ["/API/ERP/CLIENTS/501","PUT"],
       ["/api/erp/clients/501","DELETE"],
+      ["/api/erp/clients","GET"], ["/api/erp/clients/501","GET"], ["/api/erp/clients","POST"],
+      ["/api/erp/client-equipment","POST"],
+      ["/api/pricelists/qa/assign-clients","POST"], ["/API/PRICELISTS/qa","DELETE"],
       ["/api/generators/posventa/equipment/601","PATCH"],
       ["/api/erp/client-equipment/601","PATCH"], ["/api/erp/client-equipment/601","PUT"],
       ["/api/erp/client-equipment/601","DELETE"],
+      ["/api/generators/clients/odoo-baifa/preview","GET"],
+      ["/API/GENERATORS/CLIENTS/ODOO-BAIFA/import","POST"],
     ];
     for(const [path,method] of routes){
       assert.equal((await request(path,method)).status,401,`${method} ${path}`);
@@ -52,6 +57,18 @@ test("HTTP authorization through real Express routes with isolated fake database
     };
     const admin=await login("qa-admin"),sales=await login("qa-sales"),logistics=await login("qa-logistics");
     const coordinator = await login("qa-coordinator");
+    assert.equal((await request("/api/erp/clients","GET",logistics)).status,403);
+    assert.equal((await request("/api/pricelists/qa/assign-clients","POST",sales,{clientIds:[501]})).status,403);
+    assert.equal((await request("/api/pricelists/qa","DELETE",logistics)).status,403);
+    assert.equal((await request("/api/erp/clients","POST",sales,{name:"Forged",odooBaifaSales:"{}"})).status,400);
+    assert.equal((await request("/api/erp/clients","POST",sales,{name:"Forged",odooId:7001})).status,400);
+    assert.equal((await request("/api/erp/clients","POST",sales,{name:"Legitimate local QA",convertedFromLeadId:123,phone:"123"})).status,201);
+    const migration = await request("/api/sync/migrate","POST",admin,{mode:"replace",snapshot:{erpClients:[],erpClientEquipment:[]}});
+    assert.equal(migration.status,200);
+    assert.equal((await migration.json()).results.erpClients.skipped,true);
+    assert.equal((await request("/api/generators/clients/odoo-baifa/preview","GET",sales)).status,403);
+    assert.equal((await request("/api/generators/clients/odoo-baifa/import","POST",coordinator,{})).status,403);
+    assert.equal((await request("/api/generators/clients/odoo-baifa/import","POST",admin,{})).status,400);
     assert.equal((await request("/api/generators/posventa/equipment/601","PATCH",sales,{warrantyMonths:12})).status,403);
     assert.equal((await request("/api/erp/client-equipment/601","PATCH",logistics,{warrantyMonths:12})).status,403);
     for (const bad of [{clientId:999},{id:2},{installedAt:"2026-02-30"},{warrantyMonths:1.5},{warrantyMonths:0},{warrantyMonths:121},{}]) {

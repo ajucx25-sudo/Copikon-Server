@@ -1,7 +1,9 @@
 import { createHash, randomBytes, scrypt, timingSafeEqual } from "node:crypto";
 import { promisify } from "node:util";
-import { isClientMutation } from "./client-edit-access.js";
+import { isClientMutation, isClientResource } from "./client-edit-access.js";
+import { isPricelistClientMutation } from "./client-collection-transactions.js";
 import { isEquipmentMutation, isPosventaEquipmentPath } from "./equipment-edit-access.js";
+import { isBaifaSyncPath } from "./baifa-client-sync.js";
 
 const hash = value => createHash("sha256").update(String(value)).digest("hex");
 const derive = promisify(scrypt);
@@ -38,6 +40,17 @@ export function permissionList(value) {
 }
 export const isAdministrator = user => user?.level === "ceo" || user?.username === "admin";
 export function canAccessPath(user, path, method) {
+  if (isBaifaSyncPath(path)) {
+    return !user?.isPartner && user?.level !== "partner_externo" && isAdministrator(user);
+  }
+  if (isClientResource(path) && ["GET","POST"].includes(method)) {
+    if (user?.isPartner || user?.level === "partner_externo") return false;
+    return isAdministrator(user) || user?.level === "coordinador" || permissionList(user?.moduleAccess).some(m =>
+      ["generators-ventas","generators-tecnico","generators-mantenimiento","generators-posventa","generators-alquiler"].includes(m));
+  }
+  if (/^\/api\/erp\/client-equipment(?:\/|$)/i.test(path) && method === "POST") {
+    return canAccessPath(user,path,"PATCH");
+  }
   if (isPosventaEquipmentPath(path)) {
     return !user?.isPartner && user?.level !== "partner_externo" && (isAdministrator(user) || user?.level === "coordinador");
   }
@@ -48,7 +61,7 @@ export function canAccessPath(user, path, method) {
       (isAdministrator(user) || user?.level === "coordinador" || permissionList(user?.moduleAccess).some(m =>
         ["generators-tecnico","generators-mantenimiento","generators-ventas","generators-alquiler","generators-posventa"].includes(m)));
   }
-  if (isClientMutation(path, method)) {
+  if (isClientMutation(path, method) || isPricelistClientMutation(path, method)) {
     if (user?.isPartner || user?.level === "partner_externo") return false;
     return isAdministrator(user) || user?.level === "coordinador";
   }
