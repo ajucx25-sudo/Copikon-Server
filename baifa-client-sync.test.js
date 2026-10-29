@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import {isGenerator, buildPlan, loadBaifaCustomers, isBaifaSyncPath, registerBaifaClientSync, fingerprint} from "./baifa-client-sync.js";
+import {isGenerator, buildPlan, loadBaifaCustomers, isBaifaSyncPath, registerBaifaClientSync, fingerprint, fiscalIdentity, consolidateCustomers} from "./baifa-client-sync.js";
 import {canAccessPath} from "./secure-access.js";
 
 const source = {
@@ -12,9 +12,11 @@ test("only BAIFA complete generators, not parts or services", () => {
   const categ_id = [60, "GENERADORES ELÉCTRICOS"];
   for (const name of ["GENERADOR ELECTRICO BAIFA 50 KVA", "GRUPO ELECTROGENO BAIFA BF110",
     "GENERADOR ELÉCTRICO DIÉSEL MONOFÁSICO: POTENCIA 125 KVA STANDBY//MOTOR CUMMINS//ATS 630A// MARCA BAIFA",
+    "[BF-C110S-60] GENERADOR DIESEL BAIFA 1250KVA",
+    "GENERADOR DIESEL BAIFA // 1250KVA // INCLUYE 1000HRS DE PIEZAS DE MANTENIMIENTO",
     "GENERADOR ELECTRICO DIESEL 180KVA CAPACIDAD DE ACEITE 16.4L MARCA BAIFA ATS 630A"])
     assert.ok(isGenerator({name,type:"product",categ_id}), name);
-  for (const name of ["FILTRO PARA GENERADOR BAIFA", "ALQUILER GENERADOR BAIFA", "TABLERO ATS BAIFA", "ACEITE BAIFA", "GENERADOR OTRA MARCA", "SILENCIADOR GENERADOR BAIFA", "BASE PARA GRUPO ELECTROGENO BAIFA"])
+  for (const name of ["FILTRO PARA GENERADOR BAIFA", "ALQUILER GENERADOR BAIFA", "TABLERO ATS BAIFA", "ACEITE BAIFA", "GENERADOR OTRA MARCA", "SILENCIADOR GENERADOR BAIFA", "BASE PARA GRUPO ELECTROGENO BAIFA", "GENERADOR BAIFA // ALQUILER", "GENERADOR BAIFA // SERVICIO DE MANTENIMIENTO", "GENERADOR BAIFA // REPUESTOS"])
     assert.equal(isGenerator({name,type:"product",categ_id}),false,name);
   assert.equal(isGenerator({name:"GENERADOR BAIFA",type:"service",categ_id}),false);
   assert.ok(isGenerator({name:"GENERADOR 50KVA",x_studio_marca:"BAIFA",type:"product",categ_id}));
@@ -84,3 +86,43 @@ test("import rejects malformed payload before database connection", async()=>{
   assert.equal(response.code,409);
 });
 test("fingerprints detect local changes",()=>assert.notEqual(fingerprint([{id:1,name:"A"}]),fingerprint([{id:1,name:"B"}])));
+
+test("fiscal identity requires explicit consistent evidence, never fuzzy names",()=>{
+  assert.equal(fiscalIdentity({name:"Cliente",vat:"J-12345678-9"}).rif,"J123456789");
+  assert.equal(fiscalIdentity({name:"Cliente J123456789",vat:false}).rif,"J123456789");
+  assert.equal(fiscalIdentity({name:"Cliente J123456789",vat:"123456789"}).rif,"J123456789");
+  for(const p of [{name:"Cliente"}, {name:"Cliente J123",vat:false},
+    {name:"Cliente J123456789",vat:"J999999999"}, {name:"Cliente J123456789",vat:"INVALID"}])
+    assert.equal(fiscalIdentity(p).rif,undefined);
+});
+test("consolidates explicit RIF across historical/current IDs, preserves history and is repeatable",()=>{
+  const other=structuredClone(source.customers[0]);
+  other.partner={id:9001,name:"Cliente actual J123456789",vat:false};
+  other.sales=[{invoiceId:82,lineId:902,companyId:12,quantity:1}];
+  other.credits=[{invoiceId:83,lineId:903,companyId:12,quantity:1}];
+  const s={...source,customers:[...source.customers,other]};
+  const original=[{id:45,odooId:7001,name:"Nombre local",rif:"J-12345678-9",notes:"Conservar"}];
+  const plan=buildPlan(original,s,[450]);
+  assert.equal(plan.created,0);assert.equal(plan.updated,1);assert.equal(plan.conflicts.length,0);
+  assert.equal(plan.next.length,1);assert.equal(plan.next[0].odooId,7001);
+  assert.equal(plan.next[0].name,"Nombre local");assert.equal(plan.next[0].notes,"Conservar");
+  const evidence=JSON.parse(plan.next[0].odooBaifaSales);
+  assert.deepEqual(evidence.sourcePartnerIds,[7001,9001]);assert.equal(evidence.sales.length,2);assert.equal(evidence.credits.length,1);
+  assert.deepEqual(buildPlan(plan.next,s).next,plan.next);
+  assert.equal(buildPlan([{id:1,odooId:7001,rif:"J999999999"}],s).conflicts.length,1);
+  const creditOnly={...other,sales:[]};
+  const withCreditAlias=buildPlan([],{...source,customers:[source.customers[0],creditOnly]});
+  assert.equal(withCreditAlias.actions.length,1);
+  assert.equal(JSON.parse(withCreditAlias.next[0].odooBaifaSales).credits.length,1);
+  assert.equal(buildPlan([],{...source,customers:[creditOnly]}).actions.length,0);
+});
+test("excludes internal use and leaves unverified identity pending without touching local records",()=>{
+  const c=source.customers[0];
+  const customers=[c,{...c,partner:{id:2,name:"Uso Interno Copikon Venezuela C.A.",vat:"J294654568"}},
+    {...c,partner:{id:3,name:"Sin identificación",vat:false}}];
+  const grouped=consolidateCustomers(customers);
+  assert.equal(grouped.customers.length,1);assert.equal(grouped.pending.length,1);assert.equal(grouped.excluded.length,1);
+  const original=[{id:8,name:"Otra ficha",notes:"No borrar"}];
+  const result=buildPlan(original,{...source,customers},[450]);
+  assert.equal(result.next.length,2);assert.deepEqual(result.next[0],original[0]);assert.equal(result.next[1].id,451);
+});

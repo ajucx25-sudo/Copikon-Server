@@ -2,6 +2,7 @@ import { createHash, randomBytes } from "node:crypto";
 import {CLIENT_LOCK} from "./client-collection-transactions.js";
 
 export const SINCE = "2022-01-01";
+export const POLICY_VERSION = "rif-consolidation-2026-10-29";
 const norm = v => String(v || "").normalize("NFD").replace(/\p{Diacritic}/gu, "").toUpperCase();
 const tax = v => norm(v).replace(/[^A-Z0-9]/g, "");
 const idOf = v => Array.isArray(v) ? Number(v[0]) : Number(v);
@@ -11,6 +12,8 @@ export const isBaifaSyncPath = path => /^\/api\/generators\/clients\/odoo-baifa(
 
 export function isGenerator(p) {
   const name = norm(p.name).trim();
+  const title = name.replace(/^\[[^\]]{1,100}\]\s*/, "").split(/\/\/|\|/)[0];
+  const scopeText = name.replace(/\bINCLUYE\s+\d+\s*HRS\s+DE\s+PIEZAS\s+DE\s+MANTENIMIENTO\b/g, "");
   const brand = norm(`${p.x_studio_marca || ""} ${p.x_studio_marca_1 || ""} ${p.name || ""}`);
   // Verified in Odoo: legacy category 60 and current category 3439 both carry
   // this category name. Full sets mention ATS and oil capacity in specifications;
@@ -18,8 +21,53 @@ export function isGenerator(p) {
   const category = tax(Array.isArray(p.categ_id) ? p.categ_id[1] : "");
   return /\bBAIFA\b/.test(brand) && p.type !== "service" &&
     category === "GENERADORESELECTRICOS" &&
-    /^(?:GENERADOR(?:ES)?|GENERATOR|GENSET|GRUPO ELECTROGENO|PLANTA ELECTRICA)\b/.test(name) &&
-    !/\b(?:REPUESTO|MANTENIMIENTO|SERVICIO|ALQUILER|ARRENDAMIENTO)\b/.test(name);
+    /^(?:GENERADOR(?:ES)?|GENERATOR|GENSET|GRUPO ELECTROGENO|PLANTA ELECTRICA)\b/.test(title) &&
+    !/\b(?:REPUESTOS?|MANTENIMIENTO|SERVICIOS?|ALQUILER|ARRENDAMIENTO)\b/.test(scopeText);
+}
+
+// Identity is evidenced by explicit Odoo fiscal text, not a fuzzy name match or
+// an assertion of verification against a government registry.
+export function fiscalIdentity(p) {
+  const vat = tax(p.vat);
+  const suffix = norm(p.name).match(/\b([JGVEP])[\s-]*(\d(?:[\s-]*\d){8})\s*$/);
+  const nameRif = suffix ? tax(suffix[0]) : "";
+  const valid = v => /^[JGVEP]\d{9}$/.test(v);
+  let rif = valid(vat) ? vat : "";
+  if (vat && !rif && !(nameRif && /^\d{9}$/.test(vat) && nameRif.slice(1) === vat))
+    return {reason: "Campo fiscal incompleto o no reconocido", vat, nameRif};
+  if (rif && nameRif && rif !== nameRif)
+    return {reason: "El RIF fiscal y el de la razón social no coinciden", vat, nameRif};
+  rif ||= nameRif;
+  return rif ? {rif, vat, nameRif, basis: valid(vat) ? "odoo-vat" : vat ? "odoo-vat-and-legal-name" : "odoo-legal-name"}
+    : {reason: "Sin RIF explícito suficiente en Odoo", vat, nameRif};
+}
+
+export function consolidateCustomers(customers) {
+  const groups = new Map(), pending = [], excluded = [];
+  for (const customer of customers) {
+    const p = customer.partner;
+    if (/^USOINTERNOCOPIKON(?:VENEZUELA)?CA(?:J294654568)?$/.test(tax(p.name))) {
+      excluded.push({odooId: p.id, name: p.name, reason: "Uso interno excluido por autorización"}); continue;
+    }
+    const identity = fiscalIdentity(p);
+    if (!identity.rif) {
+      pending.push({odooId: p.id, name: p.name, ...identity}); continue;
+    }
+    if (!groups.has(identity.rif)) groups.set(identity.rif, []);
+    groups.get(identity.rif).push({...customer, identity});
+  }
+  const merged = [...groups.entries()].map(([rif, members]) => {
+    members.sort((a, b) => Number(a.partner.id) - Number(b.partner.id));
+    const uniqueLines = key => [...new Map(members.flatMap(c => c[key]).map(line =>
+      [`${line.companyId}:${line.invoiceId}:${line.lineId}`, line])).values()];
+    return {
+      partner: structuredClone(members.at(-1).partner), rif,
+      partnerIds: members.map(c => Number(c.partner.id)),
+      identityEvidence: members.map(c => ({odooId: c.partner.id, name: c.partner.name, ...c.identity})),
+      sales: uniqueLines("sales"), credits: uniqueLines("credits"),
+    };
+  });
+  return {customers: merged.filter(c => c.sales.some(s => s.quantity > 0)), pending, excluded};
 }
 
 async function all(odoo, model, domain, fields, maximum = 50000, context = {}) {
@@ -90,44 +138,51 @@ export async function loadBaifaCustomers(odoo) {
     since: SINCE, observedAt: new Date().toISOString(), companies,
     products: included.map(p => ({id: p.id, name: p.name, sku: p.default_code || ""})),
     excludedProducts: products.filter(p => !isGenerator(p)).map(p => ({id: p.id, name: p.name})),
-    customers: [...grouped.values()].filter(c => c.sales.some(s => s.quantity > 0)),
+    customers: [...grouped.values()],
     invoiceCount: moves.filter(m => m.move_type === "out_invoice").length,
     creditNoteCount: moves.filter(m => m.move_type === "out_refund").length,
   };
 }
 
 export function buildPlan(existing, source, reservedIds = []) {
+  const consolidated = consolidateCustomers(source.customers);
   const next = structuredClone(existing);
   let nextId = Math.max(0, ...existing.map(c => Number(c.id) || 0), ...reservedIds.map(Number).filter(Number.isFinite)) + 1;
   const actions = [], conflicts = [];
-  for (const customer of source.customers) {
+  for (const customer of consolidated.customers) {
     const p = customer.partner;
-    const exact = next.filter(c => Number(c.odooId) === Number(p.id));
-    const rif = tax(p.vat);
+    const exact = next.filter(c => customer.partnerIds.includes(Number(c.odooId)));
+    const rif = customer.rif;
     const byRif = rif ? next.filter(c => tax(c.rif) === rif) : [];
     if (exact.length > 1 || byRif.length > 1 || (exact.length && byRif.some(c => c.id !== exact[0].id)) ||
-        (!exact.length && byRif.some(c => c.odooId && Number(c.odooId) !== Number(p.id)))) {
+        exact.some(c => tax(c.rif) && tax(c.rif) !== rif) ||
+        (!exact.length && byRif.some(c => c.odooId && !customer.partnerIds.includes(Number(c.odooId))))) {
       conflicts.push({odooId: p.id, name: p.name, reason: "Identificador Odoo o RIF ambiguo"}); continue;
     }
     const current = exact[0] || byRif[0];
     const record = current || {id: nextId++, name: clean(p.name), status: "activo", createdAt: source.observedAt};
-    const proposed = {name: p.name, rif: p.vat, phone: p.phone || p.mobile, email: p.email,
+    const proposed = {name: p.name, rif, phone: p.phone || p.mobile, email: p.email,
       address: [p.street, p.street2].filter(Boolean).join(", "), city: p.city, state: p.state_id?.[1]};
     // Preserve entered local fields. Only fill blanks; do not infer classifications, regions or sellers.
     for (const [key, value] of Object.entries(proposed)) if (!clean(record[key]) && clean(value)) record[key] = clean(value);
-    record.odooId = p.id;
+    record.odooId = current?.odooId || p.id;
     record.odooRef = clean(p.ref);
     record.syncStatus = "synced";
     record.lastSyncAt = source.observedAt;
     record.odooBaifaSales = JSON.stringify({
+      policyVersion: POLICY_VERSION,
       since: SINCE, observedAt: source.observedAt, invoiceCount: new Set(customer.sales.map(s => s.invoiceId)).size,
       sales: customer.sales, credits: customer.credits,
+      rif, sourcePartnerIds: customer.partnerIds, identityEvidence: customer.identityEvidence,
     });
     if (!current) next.push(record);
     actions.push({id: record.id, odooId: p.id, name: record.name, action: current ? "actualizar" : "crear",
+      rif, sourcePartnerIds: customer.partnerIds, identityEvidence: customer.identityEvidence,
       invoiceCount: new Set(customer.sales.map(s => s.invoiceId)).size});
   }
-  return {next, actions, conflicts, created: actions.filter(a => a.action === "crear").length,
+  return {next, actions, conflicts, pending: consolidated.pending, excludedCustomers: consolidated.excluded,
+    consolidatedGroups: consolidated.customers.filter(c => c.partnerIds.length > 1).length,
+    created: actions.filter(a => a.action === "crear").length,
     updated: actions.filter(a => a.action === "actualizar").length};
 }
 
@@ -149,6 +204,8 @@ export function registerBaifaClientSync(app, {odoo, readCol, pool, wrap}) {
       previews.set(token, {owner: String(req.verifiedUser.id), expires: Date.now() + 15 * 60 * 1000,
         beforeHash: fingerprint(clients), equipmentHash: fingerprint(equipment), plan, source});
       res.json({ok: true, previewToken: token, since: SINCE, observedAt: source.observedAt,
+        policyVersion: POLICY_VERSION, pending: plan.pending, excludedCustomers: plan.excludedCustomers,
+        consolidatedGroups: plan.consolidatedGroups,
         companies: source.companies, products: source.products, excludedProducts: source.excludedProducts,
         invoiceCount: source.invoiceCount, creditNoteCount: source.creditNoteCount,
         customers: plan.actions, conflicts: plan.conflicts, created: plan.created, updated: plan.updated});
@@ -188,6 +245,9 @@ export function registerBaifaClientSync(app, {odoo, readCol, pool, wrap}) {
       await write(backupKey, {at: new Date().toISOString(), by: req.verifiedUser.id, clients: before});
       await write("erpClients", entry.plan.next);
       const result = {ok: true, created: entry.plan.created, updated: entry.plan.updated,
+        policyVersion: POLICY_VERSION,
+        pending: entry.plan.pending, excludedCustomers: entry.plan.excludedCustomers,
+        consolidatedGroups: entry.plan.consolidatedGroups,
         total: entry.plan.next.length, imported: entry.plan.actions.length, since: SINCE, syncedAt: new Date().toISOString()};
       await write("baifaClientSyncLastRun", {...result, by: req.verifiedUser.id, backupKey});
       await db.query("COMMIT");
