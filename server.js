@@ -21,6 +21,7 @@ import { isClientMutation, isClientResource, validateClientCreate, validateClien
 import {collectionContext, requiresCollectionTransaction, runCollectionTransaction, isPricelistClientMutation} from "./client-collection-transactions.js";
 import { isEquipmentMutation, isPosventaEquipmentPath, validateEquipmentEdit } from "./equipment-edit-access.js";
 import { registerBaifaClientSync, isBaifaSyncPath } from "./baifa-client-sync.js";
+import { registerPosventaClientSync, POSVENTA_SYNC_POLICY } from "./posventa-client-sync.js";
 import { randomBytes } from "node:crypto";
 import XLSX from "xlsx";
 import { createRequire } from "module";
@@ -236,6 +237,7 @@ app.use((req, res, next) => {
 });
 
 registerBaifaClientSync(app, {odoo, readCol, pool, wrap});
+registerPosventaClientSync(app, {readCol, writeCol, wrap});
 
 app.patch("/api/generators/posventa/equipment/:id", wrap(async (req,res) => {
   const rows = await readCol("erpClientEquipment");
@@ -252,7 +254,10 @@ app.patch("/api/generators/posventa/equipment/:id", wrap(async (req,res) => {
 // ───── Salud ────────────────────────────────────────────────
 app.get("/api/health", wrap(async (_req, res) => {
   await pool.query("SELECT 1");
-  res.json({ ok: true, time: Date.now(), version: "1.1", db: "postgres" });
+  res.json({ ok: true, time: Date.now(), version: "1.1", db: "postgres",
+    posventaClientSyncPolicy: POSVENTA_SYNC_POLICY,
+    revision: /^[a-f0-9]{40}$/i.test(process.env.RENDER_GIT_COMMIT || "") ? process.env.RENDER_GIT_COMMIT : undefined,
+  });
 }));
 
 // ───── Login simple (sin hash) ──────────────────────────────
