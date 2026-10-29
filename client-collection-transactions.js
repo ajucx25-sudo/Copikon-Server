@@ -1,11 +1,12 @@
 import {AsyncLocalStorage} from "node:async_hooks";
+import {isEquipmentDocumentResource} from "./equipment-reference-access.js";
 export const collectionContext = new AsyncLocalStorage();
 export const CLIENT_LOCK = 176202210;
 export const isPricelistClientMutation = (path, method) =>
   (method === "DELETE" && /^\/api\/pricelists\/[^/]+\/?$/i.test(path)) ||
   (method === "POST" && /^\/api\/pricelists\/[^/]+\/assign-clients\/?$/i.test(path));
 export const requiresCollectionTransaction = (path, method) => ["POST","PATCH","PUT","DELETE"].includes(method) &&
-  (/^\/api\/erp\/(?:clients|client-equipment)(?:\/|$)/i.test(path) ||
+  (isEquipmentDocumentResource(path) || /^\/api\/erp\/(?:clients|client-equipment)(?:\/|$)/i.test(path) ||
    /^\/api\/generators\/posventa\/equipment(?:\/|$)/i.test(path) ||
    /^\/api\/pricelists(?:\/|$)/i.test(path) ||
    /^\/api\/sync\/(?:migrate|seed)$/i.test(path));

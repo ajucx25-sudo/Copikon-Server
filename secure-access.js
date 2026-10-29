@@ -4,6 +4,7 @@ import { isClientMutation, isClientResource } from "./client-edit-access.js";
 import { isPricelistClientMutation } from "./client-collection-transactions.js";
 import { isEquipmentMutation, isPosventaEquipmentPath } from "./equipment-edit-access.js";
 import { isBaifaSyncPath } from "./baifa-client-sync.js";
+import {isEquipmentResource, isEquipmentDocumentResource} from "./equipment-reference-access.js";
 
 const hash = value => createHash("sha256").update(String(value)).digest("hex");
 const derive = promisify(scrypt);
@@ -40,6 +41,11 @@ export function permissionList(value) {
 }
 export const isAdministrator = user => user?.level === "ceo" || user?.username === "admin";
 export function canAccessPath(user, path, method) {
+  if ((isEquipmentResource(path) && ["GET","HEAD"].includes(method)) || isEquipmentDocumentResource(path)) {
+    return !user?.isPartner && user?.level !== "partner_externo" &&
+      (isAdministrator(user) || user?.level === "coordinador" || permissionList(user?.moduleAccess).some(m =>
+        ["generators-ventas","generators-tecnico","generators-mantenimiento","generators-posventa","generators-alquiler"].includes(m)));
+  }
   if (isBaifaSyncPath(path)) {
     return !user?.isPartner && user?.level !== "partner_externo" && isAdministrator(user);
   }

@@ -22,6 +22,7 @@ import {collectionContext, requiresCollectionTransaction, runCollectionTransacti
 import { isEquipmentMutation, isPosventaEquipmentPath, validateEquipmentEdit } from "./equipment-edit-access.js";
 import { registerBaifaClientSync, isBaifaSyncPath } from "./baifa-client-sync.js";
 import { registerPosventaClientSync, POSVENTA_SYNC_POLICY } from "./posventa-client-sync.js";
+import {isEquipmentResource, isEquipmentDocumentResource, EQUIPMENT_DOCUMENT_KEYS, validateEquipmentDocuments} from "./equipment-reference-access.js";
 import { randomBytes } from "node:crypto";
 import XLSX from "xlsx";
 import { createRequire } from "module";
@@ -64,8 +65,11 @@ async function readCol(key) {
 }
 
 async function writeCol(key, arr) {
-  if (["erpClients","erpClientEquipment"].includes(key) && !collectionContext.getStore()) {
+  if ((["erpClients","erpClientEquipment"].includes(key) || EQUIPMENT_DOCUMENT_KEYS.has(key)) && !collectionContext.getStore()) {
     throw Error("Escritura de clientes/equipos fuera de una transacción protegida.");
+  }
+  if (EQUIPMENT_DOCUMENT_KEYS.has(key)) {
+    validateEquipmentDocuments(arr, await readCol(key), await readCol("erpClientEquipment"));
   }
   if (key === "erpClientEquipment") {
     const old = await readCol(key);
@@ -199,8 +203,10 @@ app.use((req, res, next) => {
   const clientMutation = isClientMutation(path, req.method);
   const equipmentMutation = isEquipmentMutation(path, req.method);
   const posventaEquipment = isPosventaEquipmentPath(path);
+  const equipmentRead = isEquipmentResource(path) && ["GET","HEAD"].includes(req.method);
+  const equipmentDocument = isEquipmentDocumentResource(path);
   const equipmentCreate = /^\/api\/erp\/client-equipment(?:\/|$)/.test(path) && req.method === "POST";
-  const protectedPath = isPricelistClientMutation(path, req.method) || isClientResource(path) || equipmentCreate || isBaifaSyncPath(path) || clientMutation || equipmentMutation || posventaEquipment || /^\/api\/(?:logistica|employees|sales-partners|admin\/(?:users|sales-partners|providers|technical-providers)|sync)(?:\/|$)/.test(path) ||
+  const protectedPath = equipmentRead || equipmentDocument || isPricelistClientMutation(path, req.method) || isClientResource(path) || equipmentCreate || isBaifaSyncPath(path) || clientMutation || equipmentMutation || posventaEquipment || /^\/api\/(?:logistica|employees|sales-partners|admin\/(?:users|sales-partners|providers|technical-providers)|sync)(?:\/|$)/.test(path) ||
     /^\/api\/erp\/pre-leads(?:\/|$)/.test(path) ||
     /^\/api\/generators\/(?:shipments|price-list-settings|price-list-items)(?:\/|$)/.test(path) ||
     /^\/api\/auth\/(?:me|change-password|logout)$/.test(path);
@@ -209,6 +215,13 @@ app.use((req, res, next) => {
   sessions.authenticate(req).then(user => {
     if (!user) return res.status(401).json({ message: "Sesión vencida o no válida. Inicia sesión de nuevo." });
     if (!canAccessPath(user, path, req.method)) return res.status(403).json({ message: "No tienes permisos para esta operación." });
+    if (equipmentDocument && ["POST","PATCH","PUT"].includes(req.method)) {
+      if (!req.body || typeof req.body !== "object" || Array.isArray(req.body) ||
+          Object.keys(req.body).some(key => ["__proto__","constructor","prototype"].includes(key) ||
+            (["PATCH","PUT"].includes(req.method) && key === "id"))) {
+        return res.status(400).json({message:"Datos del documento inválidos."});
+      }
+    }
     if (clientMutation && ["PATCH", "PUT"].includes(req.method)) {
       const { patch, error } = validateClientEdit(req.body);
       if (error) return res.status(400).json({ message: error });

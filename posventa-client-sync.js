@@ -1,4 +1,5 @@
 import {createHash, randomUUID} from "node:crypto";
+import {EQUIPMENT_DOCUMENT_KEYS} from "./equipment-reference-access.js";
 
 export const POSVENTA_SYNC_PATH = "/api/generators/posventa/equipment/sync-from-clients";
 export const POSVENTA_SYNC_POLICY = "clients-to-posventa-append-v1";
@@ -150,7 +151,7 @@ export function registerPosventaClientSync(app, {readCol, writeCol, wrap}) {
           } else if (child && typeof child === "object") collect(child);
         }
       };
-      for (const key of ["erpMaintenanceOrders","erpMaintenancePlans","erpMaintenanceContracts","erpServiceContracts","erpSalesInvoices"]) {
+      for (const key of EQUIPMENT_DOCUMENT_KEYS) {
         collect(await readCol(key));
       }
       const {additions,result} = planPosventaClientSync(clients,equipment,{actorId:req.verifiedUser?.id ?? null,reservedIds});
