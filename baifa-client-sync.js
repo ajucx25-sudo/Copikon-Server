@@ -70,7 +70,7 @@ export function consolidateCustomers(customers) {
   return {customers: merged.filter(c => c.sales.some(s => s.quantity > 0)), pending, excluded};
 }
 
-async function all(odoo, model, domain, fields, maximum = 50000, context = {}) {
+export async function all(odoo, model, domain, fields, maximum = 50000, context = {}) {
   const rows = [];
   for (let offset = 0; offset <= maximum; offset += 500) {
     const batch = await odoo.searchRead(model, domain, fields, {offset, limit: 500, order: "id asc", context: {...context, active_test: false}});
@@ -82,7 +82,7 @@ async function all(odoo, model, domain, fields, maximum = 50000, context = {}) {
   throw Error("Consulta incompleta");
 }
 
-async function byIds(odoo, model, ids, fields, context = {}) {
+export async function byIds(odoo, model, ids, fields, context = {}) {
   const result = [];
   const unique = [...new Set(ids)].filter(id => Number.isSafeInteger(id) && id > 0);
   for (let i = 0; i < unique.length; i += 300)
