@@ -1,4 +1,5 @@
 import {all, byIds, fiscalIdentity, isGenerator, POLICY_VERSION} from "./baifa-client-sync.js";
+import {loadUnitClose} from "./baifa-unit-close.js";
 
 const norm = v => String(v || "").normalize("NFD").replace(/\p{Diacritic}/gu, "").toUpperCase().replace(/[^A-Z0-9]/g, "");
 const id = v => Array.isArray(v) ? v[0] : v;
@@ -129,12 +130,18 @@ export function registerMonthlyClose(app, {odoo, wrap}) {
     // Defense in depth; existing session/role middleware protects the entire prefix.
     res.setHeader("Cache-Control","no-store");
     if (!req.verifiedUser) return res.status(401).json({message:"Se requiere iniciar sesión."});
-    if (Object.keys(req.query).some(k=>k!=="month")) return res.status(400).json({message:"Parámetros inválidos."});
+    if (Object.keys(req.query).some(k=>!["month","scope"].includes(k)) ||
+      (req.query.scope!==undefined && req.query.scope!=="unit"))
+      return res.status(400).json({message:"Parámetros inválidos."});
     const now = new Date();
     const range = monthRange(req.query.month, now, {allowCurrent:true});
     if (busy) return res.status(409).json({message:"Hay una consulta de cierre en curso. Intenta nuevamente al terminar."});
     busy = true;
-    try { res.json(await loadMonthlyClose(odoo,range.month,now)); }
+    try {
+      const result=await loadMonthlyClose(odoo,range.month,now);
+      if (req.query.scope==="unit") result.unit=await loadUnitClose(odoo,range,result.companies);
+      res.json(result);
+    }
     catch { res.status(502).json({message:"No se pudo verificar el cierre completo en Odoo. No se guardó ni modificó ningún dato."}); }
     finally { busy = false; }
   }));
