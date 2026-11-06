@@ -7,15 +7,17 @@ const fail = message => { throw new Error(message); };
 const assert = (ok, message) => { if (!ok) fail(message); };
 const finite = v => typeof v === "number" && Number.isFinite(v);
 
-export function monthRange(month, now = new Date()) {
+export function monthRange(month, now = new Date(), {allowCurrent=false} = {}) {
   const today = new Intl.DateTimeFormat("en-CA", {
     timeZone:"America/Caracas", year:"numeric", month:"2-digit", day:"2-digit",
   }).format(now);
   if (typeof month !== "string" || !/^20\d{2}-(0[1-9]|1[0-2])$/.test(month) ||
-      month < "2022-01" || month >= today.slice(0,7))
-    throw Object.assign(new Error("Selecciona un mes completo desde enero de 2022, anterior al mes actual."), {status:400});
+      month < "2022-01" || month > today.slice(0,7) || (!allowCurrent && month===today.slice(0,7)))
+    throw Object.assign(new Error(allowCurrent ? "Selecciona un mes desde enero de 2022 hasta el mes actual." :
+      "Selecciona un mes completo desde enero de 2022, anterior al mes actual."), {status:400});
   const [y,m] = month.split("-").map(Number);
-  return {month, from:`${month}-01`, until:new Date(Date.UTC(y,m,0)).toISOString().slice(0,10)};
+  const periodClosed = month < today.slice(0,7);
+  return {month, from:`${month}-01`, until:periodClosed ? new Date(Date.UTC(y,m,0)).toISOString().slice(0,10) : today, periodClosed};
 }
 
 // A source line can appear more than once due to paging or partner aliases.
@@ -66,7 +68,7 @@ export function summarizeClose({month, from, until, observedAt, rows, excluded})
 }
 
 export async function loadMonthlyClose(odoo, month, now = new Date()) {
-  const range = monthRange(month, now);
+  const range = monthRange(month, now, {allowCurrent:true});
   assert(odoo.isConfigured(), "Odoo no configurado.");
   const companies = (await all(odoo,"res.company",[],["id","name","vat"],100)).filter(c=>
     norm(c.vat)==="J294654568" && /^(?:COPIKONCA|COPIKONVENEZUELACA)(?:J294654568)?$/.test(norm(c.name)));
@@ -118,7 +120,7 @@ export async function loadMonthlyClose(odoo, month, now = new Date()) {
     });
   }
   return {...summarizeClose({...range,observedAt:new Date().toISOString(),rows,excluded:[...exclusions.values()]}),
-    companies:companies.map(c=>({id:c.id,name:c.name})), source:"odoo-live"};
+    companies:companies.map(c=>({id:c.id,name:c.name})), source:"odoo-live", periodClosed:range.periodClosed};
 }
 
 export function registerMonthlyClose(app, {odoo, wrap}) {
@@ -128,10 +130,11 @@ export function registerMonthlyClose(app, {odoo, wrap}) {
     res.setHeader("Cache-Control","no-store");
     if (!req.verifiedUser) return res.status(401).json({message:"Se requiere iniciar sesión."});
     if (Object.keys(req.query).some(k=>k!=="month")) return res.status(400).json({message:"Parámetros inválidos."});
-    const range = monthRange(req.query.month);
+    const now = new Date();
+    const range = monthRange(req.query.month, now, {allowCurrent:true});
     if (busy) return res.status(409).json({message:"Hay una consulta de cierre en curso. Intenta nuevamente al terminar."});
     busy = true;
-    try { res.json(await loadMonthlyClose(odoo,range.month)); }
+    try { res.json(await loadMonthlyClose(odoo,range.month,now)); }
     catch { res.status(502).json({message:"No se pudo verificar el cierre completo en Odoo. No se guardó ni modificó ningún dato."}); }
     finally { busy = false; }
   }));

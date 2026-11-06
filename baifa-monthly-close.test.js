@@ -10,6 +10,15 @@ const row = {companyId:12,invoiceId:1,lineId:10,invoice:"F1",date:"2026-10-10",t
   client:"Cliente",rif:"J123456789",product:"BAIFA",quantity:2,subtotal:100.15,currencyId:1,currency:"USD",digits:2};
 const summary = (rows,excluded=[])=>summarizeClose({...range,observedAt:now.toISOString(),rows,excluded});
 
+test("current month is explicitly allowed as month-to-date, future is never allowed",()=>{
+  assert.deepEqual(monthRange("2026-11",now,{allowCurrent:true}),{
+    month:"2026-11",from:"2026-11-01",until:"2026-11-04",periodClosed:false});
+  assert.equal(monthRange("2026-10",now,{allowCurrent:true}).periodClosed,true);
+  assert.throws(()=>monthRange("2026-12",now,{allowCurrent:true}));
+  assert.equal(monthRange("2026-10",new Date("2026-11-01T03:59:59Z"),{allowCurrent:true}).periodClosed,false);
+  assert.equal(monthRange("2026-10",new Date("2026-11-01T04:00:00Z"),{allowCurrent:true}).periodClosed,true);
+});
+
 test("month dates, leap year and Caracas boundary",()=>{
   assert.equal(monthRange("2024-02",now).until,"2024-02-29");
   assert.equal(monthRange("2026-10",new Date("2026-11-01T04:00:00Z")).until,"2026-10-31");
@@ -75,6 +84,17 @@ test("loader never labels an unverifiable fiscal client complete",async()=>{
   const o=mockOdoo();o.data["res.partner"][1].vat="";
   const d=await loadMonthlyClose(o,"2026-10",now);
   assert.equal(d.complete,false);assert.equal(d.excluded.length,1);assert.equal(d.creditNoteCount,0);
+});
+test("current-month loader cuts off today and keeps credit-only scope",async()=>{
+  const o=mockOdoo();
+  o.data["account.move"][0].invoice_date="2026-11-04";
+  o.data["account.move"][1].invoice_date="2026-11-01";
+  const d=await loadMonthlyClose(o,"2026-11",now);
+  assert.equal(d.periodClosed,false);assert.equal(d.until,"2026-11-04");
+  assert.equal(d.creditNoteCount,1);assert.equal(d.totals[0].net,40000);
+  assert.ok(o.calls.find(c=>c.model==="account.move.line").domain.some(x=>x[0]==="move_id.invoice_date"&&x[1]==="<="&&x[2]==="2026-11-04"));
+  o.data["account.move"][0].invoice_date="2026-11-05";
+  await assert.rejects(()=>loadMonthlyClose(o,"2026-11",now));
 });
 for(const [name,mutate] of [
   ["draft",o=>o.data["account.move"][0].state="draft"],
