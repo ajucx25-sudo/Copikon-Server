@@ -1,9 +1,10 @@
-import {all, byIds, isGenerator} from "./baifa-client-sync.js";
+import {all, byIds} from "./baifa-client-sync.js";
 
 export const INVENTORY_PATH = "/api/generators/inventory/odoo-stock";
 export const isInventoryPath = path => /^\/api\/generators\/inventory(?:\/|$)/i.test(path);
 const id = v => Array.isArray(v) ? v[0] : v;
 const validId = v => Number.isSafeInteger(v) && v > 0;
+const physical = p => ["product","consu"].includes(p.type);
 const assert = (ok, message) => { if (!ok) throw Error(message); };
 const norm = v => String(v || "").normalize("NFD").replace(/\p{Diacritic}/gu,"").toUpperCase().replace(/[^A-Z0-9]/g,"");
 const quantity = v => {
@@ -30,7 +31,8 @@ export function reconcileInventory({products, orders, purchaseLines, invoices, i
     const code = typeof p.default_code === "string" ? p.default_code.trim() : "";
     assert(code, "Producto sin código verificable.");
     if (!groups.has(code)) groups.set(code, {
-      code, productIds:[], received:0, invoiced:0, creditUnits:0, pending:0, orders:[],
+      code, name:p.name || code, uomLabel:Array.isArray(p.uom_id) ? String(p.uom_id[1]) : `Unidad ${id(p.uom_id)}`,
+      productIds:[], received:0, invoiced:0, creditUnits:0, pending:0, orders:[],
     });
     const group = groups.get(code);
     assert(!group.uomId || group.uomId === id(p.uom_id), "SKU repetido con unidades distintas.");
@@ -83,17 +85,43 @@ export async function loadInventory(odoo, now = new Date()) {
   const brands = ["x_studio_marca","x_studio_marca_1"].filter(f=>fields[f]);
   const clauses = [["name","ilike","BAIFA"], ...brands.map(f=>[f,"ilike","BAIFA"]),
     ["default_code","=ilike","TRPE%"], ["default_code","=ilike","VTM%"]];
-  const products = unique(await all(odoo,"product.product",[...Array(clauses.length-1).fill("|"),...clauses],
-    ["id","name","default_code","type","categ_id","uom_id",...brands],50000,context))
-    .filter(p=>isGenerator(p) || (p.type !== "service" && /^(TRPE|VTM)/i.test(p.default_code || "")));
-  assert(products.length > 0,"No hay productos verificables.");
-  const productIds = products.map(p=>p.id);
-  const purchaseLines = await all(odoo,"purchase.order.line",[
+  const productFields = ["id","name","default_code","type","categ_id","uom_id",...brands];
+  const seeds = unique(await all(odoo,"product.product",[...Array(clauses.length-1).fill("|"),...clauses],
+    productFields,50000,context)).filter(physical);
+  assert(seeds.length > 0,"No hay productos verificables.");
+  const seedIds = new Set(seeds.map(p=>p.id));
+  const seedLines = unique(await all(odoo,"purchase.order.line",[
     ["company_id","in",companyIds],["order_id.state","in",["purchase","done"]],
-    ["product_id","in",productIds],
-  ],["id","order_id","product_id","product_qty","qty_received","product_uom","date_planned"],50000,context);
-  const orders = await byIds(odoo,"purchase.order",purchaseLines.map(l=>id(l.order_id)),
+    ["product_id","in",[...seedIds]],
+  ],["id","order_id","product_id","product_qty","qty_received","product_uom","date_planned"],50000,context));
+  assert(seedLines.every(l=>seedIds.has(id(l.product_id)) && validId(id(l.order_id))),"PO fuera del alcance.");
+  const orderIds = new Set(seedLines.map(l=>id(l.order_id)));
+  const orders = await byIds(odoo,"purchase.order",[...orderIds],
     ["id","name","state","company_id"],context);
+  assert(orders.every(o=>companyIds.includes(id(o.company_id)) && ["purchase","done"].includes(o.state)),
+    "PO no confirmada o fuera de compañía.");
+  // Include every physical line of the identified BAIFA POs, not just generators.
+  // Do not follow a discovered spare into other POs: shared SKUs must not expand scope transitively.
+  const wholeLines = orderIds.size ? unique(await all(odoo,"purchase.order.line",[
+    ["company_id","in",companyIds],["order_id","in",[...orderIds]],
+    ["order_id.state","in",["purchase","done"]],["product_id","!=",false],
+  ],["id","order_id","product_id","product_qty","qty_received","product_uom","date_planned"],50000,context)) : [];
+  assert(wholeLines.every(l=>orderIds.has(id(l.order_id)) && validId(id(l.product_id))),"Línea fuera de las PO BAIFA.");
+  const completeLineIds = new Set(wholeLines.map(l=>l.id));
+  assert(seedLines.every(l=>completeLineIds.has(l.id)),"Lectura de PO incompleta.");
+  const discoveredIds = new Set(wholeLines.map(l=>id(l.product_id)).filter(pid=>!seedIds.has(pid)));
+  const discovered = await byIds(odoo,"product.product",[...discoveredIds],productFields,context);
+  assert(discovered.every(p=>discoveredIds.has(p.id)) &&
+    [...discoveredIds].every(pid=>discovered.some(p=>p.id===pid)), "Producto de PO incompleto.");
+  const physicalProducts = [...seeds,...discovered.filter(physical)];
+  const codes = [...new Set(physicalProducts.map(p=>p.default_code).filter(c=>typeof c==="string" && c.trim()))];
+  // Historical product identities sharing an exact SKU must also participate in invoice subtraction.
+  const aliases = codes.length ? await all(odoo,"product.product",[["default_code","in",codes]],
+    productFields,50000,context) : [];
+  assert(aliases.every(p=>codes.includes(p.default_code)),"Código fuera del alcance.");
+  const products = unique([...physicalProducts,...aliases.filter(physical)]);
+  const productIds = products.map(p=>p.id), productSet = new Set(productIds);
+  const purchaseLines = wholeLines.filter(l=>productSet.has(id(l.product_id)));
   const invoiceLines = await all(odoo,"account.move.line",[
     ["company_id","in",companyIds],["move_id.state","=","posted"],
     ["move_id.move_type","in",["out_invoice","out_refund"]],["move_id.invoice_date","<=",until],
@@ -103,7 +131,7 @@ export async function loadInventory(odoo, now = new Date()) {
     ["id","state","move_type","invoice_date","company_id"],context);
   return {ok:true,schemaVersion:1,source:"odoo-po-invoices",complete:true,until,
     observedAt:new Date().toISOString(),companies:companies.map(c=>({id:c.id,name:c.name})),
-    history:"Todo el histórico disponible en Odoo; sin saldo inicial manual.",
+    history:"Histórico de PO identificadas por productos BAIFA/TRPE/VTM y todas sus líneas físicas; sin saldo inicial manual.",
     ...reconcileInventory({products,orders,purchaseLines,invoices,invoiceLines,companyIds,until})};
 }
 
