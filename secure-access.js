@@ -5,6 +5,7 @@ import { isPricelistClientMutation } from "./client-collection-transactions.js";
 import { isEquipmentMutation, isPosventaEquipmentPath } from "./equipment-edit-access.js";
 import { isBaifaSyncPath } from "./baifa-client-sync.js";
 import {isEquipmentResource, isEquipmentDocumentResource} from "./equipment-reference-access.js";
+import {isInventoryPath} from "./generators-inventory.js";
 
 const hash = value => createHash("sha256").update(String(value)).digest("hex");
 const derive = promisify(scrypt);
@@ -41,6 +42,10 @@ export function permissionList(value) {
 }
 export const isAdministrator = user => user?.level === "ceo" || user?.username === "admin";
 export function canAccessPath(user, path, method) {
+  if (isInventoryPath(path)) {
+    return ["GET","HEAD"].includes(method) && !user?.isPartner && user?.level !== "partner_externo" &&
+      (isAdministrator(user) || permissionList(user?.moduleAccess).includes("generators-inventario"));
+  }
   if ((isEquipmentResource(path) && ["GET","HEAD"].includes(method)) || isEquipmentDocumentResource(path)) {
     return !user?.isPartner && user?.level !== "partner_externo" &&
       (isAdministrator(user) || user?.level === "coordinador" || permissionList(user?.moduleAccess).some(m =>
