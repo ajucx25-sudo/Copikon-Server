@@ -157,6 +157,25 @@ test("BAIFA spare-only PO and historical exact-SKU invoice identity are included
   assert.equal(r.rows[0].available,4);
   assert.deepEqual(r.rows[0].productIds,[10,15]);
 });
+test("Unused BAIFA catalog template without SKU is not an inventory item",async()=>{
+  const o=mockOdoo();
+  o.data["product.product"].push({id:19,name:"BAIFA template",default_code:false,type:"consu",uom_id:[1,"Units"]});
+  const result=await loadInventory(o);
+  assert.equal(result.rows.length,1);
+  assert.equal(result.rows[0].available,4);
+  assert.ok(!result.rows.some(r=>r.productIds.includes(19)));
+});
+test("Missing SKU on an actual selected PO still fails closed",async()=>{
+  const o=mockOdoo();
+  o.data["product.product"].push({id:19,name:"BAIFA template",default_code:false,type:"consu",uom_id:[1,"Units"]});
+  o.data["purchase.order.line"].push({id:39,order_id:[20,"PO-TEST"],product_id:[19,"Template"],product_qty:1,qty_received:1,product_uom:[1,"Units"]});
+  await assert.rejects(loadInventory(o),e=>safeInventoryReason(e)==="SKU_MISSING");
+});
+test("No confirmed PO means no opening stock, even for seeded products",async()=>{
+  const o=mockOdoo();
+  o.data["purchase.order.line"]=[];
+  assert.deepEqual((await loadInventory(o)).rows,[]);
+});
 test("Whole PO read cannot omit seed lines or inject an unrelated order",async()=>{
   for(const inject of [false,true]) {
     const o=mockOdoo(),read=o.searchRead;

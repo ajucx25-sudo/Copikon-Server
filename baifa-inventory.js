@@ -130,7 +130,10 @@ export async function loadInventory(odoo, now = new Date()) {
   const discovered = await byIds(odoo,"product.product",[...discoveredIds],productFields,context);
   assert(discovered.every(p=>discoveredIds.has(p.id)) &&
     [...discoveredIds].every(pid=>discovered.some(p=>p.id===pid)), "Producto de PO incompleto.");
-  const physicalProducts = [...seeds,...discovered.filter(physical)];
+  // Seeds identify orders, not opening stock. Only products actually on the
+  // selected POs enter reconciliation; unused catalog templates are not stock.
+  const selectedProductIds = new Set(wholeLines.map(l=>id(l.product_id)));
+  const physicalProducts = [...seeds.filter(p=>selectedProductIds.has(p.id)),...discovered.filter(physical)];
   const codes = [...new Set(physicalProducts.map(p=>p.default_code).filter(c=>typeof c==="string" && c.trim()))];
   // Historical product identities sharing an exact SKU must also participate in invoice subtraction.
   const aliases = codes.length ? await all(odoo,"product.product",[["default_code","in",codes]],
