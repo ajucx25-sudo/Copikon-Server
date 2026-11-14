@@ -13,6 +13,7 @@ import cors from "cors";
 import pkg from "pg";
 import * as odoo from "./odoo-client.js";
 import { registerPlaybooksRoutes } from "./playbooks.js";
+import { registerSalesDocumentRoutes, SALES_DOCUMENTS_PATH } from "./baifa-sales-documents.js";
 import { registerPricelistsRoutes } from "./pricelists.js";
 import { registerPreventaRoutes } from "./preventa.js";
 import { registerShipmentsRoutes } from "./shipments.js";
@@ -68,6 +69,9 @@ async function readCol(key) {
 }
 
 async function writeCol(key, arr) {
+  if (String(key).startsWith("baifa.sales.")) {
+    throw Object.assign(new Error("Los documentos de ventas son inmutables; utiliza sus rutas protegidas."), { status: 403 });
+  }
   if ((["erpClients","erpClientEquipment"].includes(key) || EQUIPMENT_DOCUMENT_KEYS.has(key)) && !collectionContext.getStore()) {
     throw Error("Escritura de clientes/equipos fuera de una transacción protegida.");
   }
@@ -185,7 +189,10 @@ app.use(cors({
   origin: (origin, done) => done(null, !!origin && allowedOrigins.has(origin)),
   credentials: false,
 }));
-app.use(express.json({ limit: "150mb" }));
+const legacyJsonParser = express.json({ limit: "150mb" });
+// Document uploads authenticate before their smaller, route-specific JSON parser.
+app.use((req, res, next) => req.path.toLowerCase().startsWith(SALES_DOCUMENTS_PATH + "/")
+  ? next() : legacyJsonParser(req, res, next));
 
 const wrap = (fn) => (req, res) =>
   Promise.resolve(requiresCollectionTransaction(req.path, req.method)
@@ -199,6 +206,7 @@ const wrap = (fn) => (req, res) =>
   });
 
 const sessions = createSessions(pool, readCol, buildPartnerUser);
+registerSalesDocumentRoutes(app, { sessions, pool, readCol });
 // Require a server-issued session before the exposed legacy families and the
 // new Generators modules. Public BAIFA and token-scoped ally portals stay public.
 app.use((req, res, next) => {
@@ -387,7 +395,7 @@ app.post("/api/sync/migrate", wrap(async (req, res) => {
   const results = {};
   for (const [key, arr] of Object.entries(snapshot)) {
     if (!Array.isArray(arr)) continue;
-    if (["erpClients","erpClientEquipment"].includes(key) || key.startsWith("baifaClientSync")) {
+    if (["erpClients","erpClientEquipment"].includes(key) || key.startsWith("baifaClientSync") || key.startsWith("baifa.sales.")) {
       results[key] = {skipped:true, reason:"Colección protegida: usar sus formularios o la sincronización dedicada."};
       continue;
     }
