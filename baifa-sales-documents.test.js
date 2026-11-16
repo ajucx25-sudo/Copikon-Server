@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import express from "express";
-import { PDFDocument, PDFName } from "pdf-lib";
+import { PDFDocument, PDFName, PDFString } from "pdf-lib";
 import { canUseSalesDocuments, cleanBrief, createPackagePdf, registerSalesDocumentRoutes, SALES_DOCUMENTS_PATH } from "./baifa-sales-documents.js";
 import { financingSchedule, validateQuote, isGenerator } from "./baifa-sales-rules.js";
 
@@ -65,6 +65,38 @@ test("single PDF contains proforma, plan and brief in sequence", async () => {
   const result = await PDFDocument.load(bytes);
   assert.equal(result.getPageCount(), 3);
   assert.match(result.getTitle(), /FLASH-QA/);
+});
+test("PDF binary streams and text containing action-like bytes are not executable actions", async () => {
+  const pdf = await PDFDocument.create(); const page = pdf.addPage();
+  const stream = pdf.context.stream(Buffer.from("q\n% /A /JavaScript /EmbeddedFile are inert comment bytes\nQ\n"));
+  page.node.set(PDFName.of("Contents"), pdf.context.register(stream));
+  pdf.catalog.set(PDFName.of("Description"), PDFString.of("Description /A /OpenAction"));
+  const raw = Buffer.from(await pdf.save()).toString("base64");
+  assert.equal((await cleanBrief(raw)).pages, 1);
+});
+test("nested direct/indirect, encoded and stream dictionary actions stay blocked", async () => {
+  for (const mode of ["direct", "indirect", "encoded", "stream", "embedded"]) {
+    const pdf = await PDFDocument.create(); pdf.addPage();
+    const action = pdf.context.obj({S: "JavaScript", JS: PDFString.of("app.alert(1)")});
+    if (mode === "direct") pdf.catalog.set(PDFName.of("Nested"),pdf.context.obj([{A: action}]));
+    if (mode === "indirect") pdf.catalog.set(PDFName.of("Nested"),pdf.context.register(action));
+    if (mode === "encoded") pdf.catalog.set(PDFName.of("#41"),action);
+    if (mode === "stream") pdf.catalog.set(PDFName.of("Nested"),pdf.context.register(pdf.context.stream("safe",{AA: action})));
+    if (mode === "embedded") pdf.catalog.set(PDFName.of("Nested"),pdf.context.register(pdf.context.stream("safe",{Type: "EmbeddedFile"})));
+    const raw = Buffer.from(await pdf.save()).toString("base64");
+    await assert.rejects(()=>cleanBrief(raw),/acciones o archivos incrustados/,mode);
+  }
+});
+test("escaped action names alone are rejected with and without object streams", async () => {
+  for (const useObjectStreams of [true, false]) {
+    for (const encodedKey of [true, false]) {
+      const pdf = await PDFDocument.create(); pdf.addPage();
+      pdf.catalog.set(PDFName.of(encodedKey ? "#41" : "Nested"),
+        encodedKey ? PDFString.of("plain text") : PDFName.of("Java#53cript"));
+      const raw = Buffer.from(await pdf.save({useObjectStreams})).toString("base64");
+      await assert.rejects(()=>cleanBrief(raw),/acciones o archivos incrustados/);
+    }
+  }
 });
 test("authenticated API stores immutable documents and excludes private payload from lists", async () => {
   const store = new Map(), calls = [];

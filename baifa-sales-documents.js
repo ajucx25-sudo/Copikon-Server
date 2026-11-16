@@ -1,7 +1,7 @@
 import express from "express";
 import { randomUUID } from "node:crypto";
 import { Worker } from "node:worker_threads";
-import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
+import { PDFDocument, PDFDict, PDFArray, PDFName, PDFRawStream, StandardFonts, rgb } from "pdf-lib";
 import { isAdministrator, permissionList } from "./secure-access.js";
 import { isGenerator, financingSchedule, validateQuote } from "./baifa-sales-rules.js";
 
@@ -12,6 +12,32 @@ const error = (message, status = 400) => Object.assign(new Error(message), { sta
 export const canUseSalesDocuments = user => !!user && !user.isPartner && user.level !== "partner_externo" &&
   (isAdministrator(user) || permissionList(user.moduleAccess).includes("generators-ventas"));
 const publicMeta = ({ dataBase64, quote, plan, ...meta }) => meta;
+
+const ACTIVE_PDF_NAMES = new Set(["A", "AA", "OpenAction", "JavaScript", "JS", "Launch",
+  "RichMedia", "EmbeddedFiles", "EmbeddedFile", "AcroForm", "XFA", "SubmitForm",
+  "ImportData", "GoToR", "GoToE", "Rendition", "SetOCGState"]);
+function containsActivePdfObjects(context) {
+  const pending = context.enumerateIndirectObjects().map(([, object]) => object);
+  const seen = new Set();
+  while (pending.length) {
+    const object = pending.pop();
+    if (!object || seen.has(object)) continue;
+    seen.add(object);
+    if (object instanceof PDFName) {
+      if (ACTIVE_PDF_NAMES.has(object.decodeText())) return true;
+    } else if (object instanceof PDFRawStream) {
+      // Inspect the stream dictionary, never compressed image/font/content bytes.
+      pending.push(object.dict);
+    } else if (object instanceof PDFDict) {
+      for (const [key, value] of object.entries()) pending.push(key, value);
+    } else if (object instanceof PDFArray) {
+      for (const value of object.asArray()) pending.push(value);
+    }
+    // Indirect references are covered by enumerateIndirectObjects. Strings and
+    // binary stream data are not PDF names or executable object structure.
+  }
+  return false;
+}
 
 export async function cleanBrief(base64) {
   if (typeof base64 !== "string" || base64.length > Math.ceil(MAX_PDF / 3) * 4 ||
@@ -25,11 +51,8 @@ export async function cleanBrief(base64) {
   try { pages = original.getPageCount(); } catch { throw error("El PDF está dañado o incompleto."); }
   if (pages < 1 || pages > 60) throw error("El brief debe tener entre 1 y 60 páginas.");
   // Reject active content (including page/annotation actions) rather than relying on MIME.
-  for (const [, object] of original.context.enumerateIndirectObjects()) {
-    const contents = object.toString();
-    if (/\/(?:A|AA|OpenAction|JavaScript|JS|Launch|RichMedia|EmbeddedFiles|EmbeddedFile|AcroForm|XFA|SubmitForm|ImportData|GoToR|GoToE|Rendition|SetOCGState)\b/.test(contents))
-      throw error("El PDF contiene acciones o archivos incrustados. Exporta una copia PDF simple.");
-  }
+  if (containsActivePdfObjects(original.context))
+    throw error("El PDF contiene acciones o archivos incrustados. Exporta una copia PDF simple.");
   const doc = await PDFDocument.create();
   const copied = await doc.copyPages(original, original.getPageIndices());
   copied.forEach(page => doc.addPage(page));
