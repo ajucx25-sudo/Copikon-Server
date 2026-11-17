@@ -178,7 +178,7 @@ export function runPdfWorker(task, args) {
   });
 }
 
-export function registerSalesDocumentRoutes(app, { sessions, pool, readCol }) {
+export function registerSalesDocumentRoutes(app, { sessions, pool, readCol, readInventory }) {
   const router = express.Router();
   let working = 0;
   router.use(async (req, res, next) => {
@@ -195,6 +195,29 @@ export function registerSalesDocumentRoutes(app, { sessions, pool, readCol }) {
     try { await fn(req, res); }
     catch (e) { res.status(e.status || 500).json({ message: e.status ? e.message : "No se pudo procesar el documento. Intenta nuevamente." }); }
   };
+  // Sales needs inventory membership, not the inventory module's PO/invoice detail.
+  // Same live reader as Inventario; no writes, brand inference or catalog fallback.
+  router.get("/quote-inventory", handle(async (req, res) => {
+    if (Object.keys(req.query).length) throw error("Parámetros no permitidos.");
+    try {
+      const snapshot = await readInventory();
+      if (snapshot?.ok !== true || snapshot.schemaVersion !== 1 || snapshot.complete !== true || snapshot.source !== "odoo-po-invoices" ||
+          !Array.isArray(snapshot.rows) || !Number.isFinite(Date.parse(snapshot.observedAt)))
+        throw Error("Incomplete inventory");
+      const codes = new Set();
+      const rows = snapshot.rows.map(row => {
+        if (typeof row.code !== "string" || !row.code.trim() || codes.has(row.code) ||
+            ![row.available, row.pending].every(n => typeof n === "number" && Number.isFinite(n) && n >= 0))
+          throw Error("Invalid inventory row");
+        codes.add(row.code);
+        return { code: row.code, available: row.available, pending: row.pending };
+      }).filter(row => row.available > 0 || row.pending > 0);
+      res.json({ ok: true, schemaVersion: 1, source: "generators-inventory", complete: true,
+        observedAt: snapshot.observedAt, rows });
+    } catch {
+      throw error("No se pudo verificar el inventario. Reintenta antes de agregar productos.", 502);
+    }
+  }));
   const save = async (key, value) => {
     const client = await pool.connect();
     try {

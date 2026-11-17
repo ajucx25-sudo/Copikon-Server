@@ -155,15 +155,21 @@ export async function loadInventory(odoo, now = new Date()) {
     ...reconcileInventory({products,orders,purchaseLines,invoices,invoiceLines,companyIds,until})};
 }
 
-export function registerInventory(app,{odoo,wrap}) {
+export function createInventoryReader(odoo) {
   let running;
+  return () => {
+    running ||= loadInventory(odoo).finally(()=>{running = undefined;});
+    return running;
+  };
+}
+
+export function registerInventory(app,{odoo,wrap,readInventory=createInventoryReader(odoo)}) {
   app.get(INVENTORY_PATH,wrap(async(req,res)=>{
     res.setHeader("Cache-Control","no-store");
     if (!req.verifiedUser) return res.status(401).json({message:"Se requiere iniciar sesión."});
     if (Object.keys(req.query).length) return res.status(400).json({message:"Parámetros no permitidos."});
     // Share one in-flight read only, never persist a stale or cross-scope snapshot.
-    running ||= loadInventory(odoo).finally(()=>{running = undefined;});
-    try { return res.json(await running); }
+    try { return res.json(await readInventory()); }
     catch (error) { return res.status(502).json({
       message:"No se pudo verificar el histórico completo de PO y facturas en Odoo. No se modificaron datos.",
       reason:safeInventoryReason(error),

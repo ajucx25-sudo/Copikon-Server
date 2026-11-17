@@ -24,7 +24,7 @@ import { isEquipmentMutation, isPosventaEquipmentPath, validateEquipmentEdit } f
 import { registerBaifaClientSync, isBaifaSyncPath } from "./baifa-client-sync.js";
 import { registerMonthlyClose } from "./baifa-monthly-close.js";
 import { registerInventory, isInventoryPath } from "./generators-inventory.js";
-import { registerInventory as registerBaifaInventory } from "./baifa-inventory.js";
+import { registerInventory as registerBaifaInventory, createInventoryReader } from "./baifa-inventory.js";
 import { registerPosventaClientSync, POSVENTA_SYNC_POLICY } from "./posventa-client-sync.js";
 import {isEquipmentResource, isEquipmentDocumentResource, EQUIPMENT_DOCUMENT_KEYS, validateEquipmentDocuments} from "./equipment-reference-access.js";
 import { randomBytes } from "node:crypto";
@@ -206,7 +206,8 @@ const wrap = (fn) => (req, res) =>
   });
 
 const sessions = createSessions(pool, readCol, buildPartnerUser);
-registerSalesDocumentRoutes(app, { sessions, pool, readCol });
+const readBaifaInventory = createInventoryReader(odoo);
+registerSalesDocumentRoutes(app, { sessions, pool, readCol, readInventory: readBaifaInventory });
 // Require a server-issued session before the exposed legacy families and the
 // new Generators modules. Public BAIFA and token-scoped ally portals stay public.
 app.use((req, res, next) => {
@@ -263,7 +264,7 @@ app.use((req, res, next) => {
 registerBaifaClientSync(app, {odoo, readCol, pool, wrap});
 registerMonthlyClose(app, {odoo, wrap});
 registerInventory(app, {odoo, wrap});
-registerBaifaInventory(app, {odoo, wrap});
+registerBaifaInventory(app, {odoo, wrap, readInventory: readBaifaInventory});
 registerPosventaClientSync(app, {readCol, writeCol, wrap});
 
 app.patch("/api/generators/posventa/equipment/:id", wrap(async (req,res) => {

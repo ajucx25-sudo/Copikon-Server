@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import express from "express";
 import {readFileSync} from "node:fs";
-import {reconcileInventory, loadInventory, registerInventory, INVENTORY_PATH, safeInventoryReason} from "./baifa-inventory.js";
+import {reconcileInventory, loadInventory, registerInventory, createInventoryReader, INVENTORY_PATH, safeInventoryReason} from "./baifa-inventory.js";
 import {canAccessPath} from "./secure-access.js";
 
 const fixture = () => ({
@@ -120,6 +120,16 @@ test("Loader: complete historical read, confirmed/posted, company and product sc
     assert.ok(domain.some(c=>c[0]==="company_id"&&c[2][0]===91));
     assert.ok(domain.some(c=>c[0]==="product_id"&&c[2][0]===10));
   }
+});
+test("Shared reader reuses only concurrent requests and clears both success and failure",async()=>{
+  const o=mockOdoo(),read=createInventoryReader(o);
+  const first=read(), second=read(); assert.equal(first,second);
+  await first; const calls=o.calls.length;
+  await read(); assert.equal(o.calls.length,calls*2);
+  const original=o.searchRead;
+  o.searchRead=async()=>{throw Error("QA outage");};
+  const failed=read(); assert.equal(read(),failed); await assert.rejects(failed);
+  o.searchRead=original; assert.equal((await read()).rows[0].available,4);
 });
 test("Loader fails closed for missing company and missing invoice",async()=>{
   for(const key of ["res.company","account.move"]) {
