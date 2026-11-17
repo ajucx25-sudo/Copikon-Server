@@ -1,5 +1,6 @@
 import express from "express";
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { Worker } from "node:worker_threads";
 import { PDFDocument, PDFDict, PDFArray, PDFName, PDFRawStream, StandardFonts, rgb } from "pdf-lib";
 import { isAdministrator, permissionList } from "./secure-access.js";
@@ -7,6 +8,8 @@ import { isGenerator, financingSchedule, validateQuote } from "./baifa-sales-rul
 
 export const SALES_DOCUMENTS_PATH = "/api/generators/sales-documents";
 const MAX_PDF = 10 * 1024 * 1024;
+// Official Copikon Generators letterhead supplied by Copikon for printed quotations.
+const LETTERHEAD_PNG = readFileSync(new URL("./assets/copikon-generators-membrete.png", import.meta.url));
 const UUID = /^[a-f0-9-]{36}$/i;
 const error = (message, status = 400) => Object.assign(new Error(message), { status });
 export const canUseSalesDocuments = user => !!user && !user.isPartner && user.level !== "partner_externo" &&
@@ -68,16 +71,22 @@ export async function createPackagePdf(quote, plan, briefs, number, now) {
   const font = await doc.embedFont(StandardFonts.Helvetica);
   const bold = await doc.embedFont(StandardFonts.HelveticaBold);
   const blue = rgb(.04, .20, .38), gray = rgb(.38, .42, .46);
+  const letterhead = await doc.embedPng(LETTERHEAD_PNG);
+  const logo = letterhead.scaleToFit(160, 106);
   let page, y;
   const clean = value => [...String(value ?? "").replace(/[\r\t]/g, " ")].map(c => {
     if (c === "\n") return c;
     try { font.encodeText(c); return c; } catch { return "?"; }
   }).join("");
   const newPage = title => {
-    page = doc.addPage([595.28, 841.89]); y = 720;
-    page.drawText("UNIDAD BAIFA", { x: 40, y: 797, size: 18, font: bold, color: blue });
-    page.drawText(clean(title), { x: 40, y: 773, size: 12, font: bold, color: blue });
-    page.drawText(`${number} | ${now.slice(0, 10)} | USD`, { x: 40, y: 755, size: 9, font, color: gray });
+    page = doc.addPage([595.28, 841.89]); y = 690;
+    page.drawImage(letterhead, { x: 40, y: 815 - logo.height, width: logo.width, height: logo.height });
+    const right = (text, size, f, yy, color) => page.drawText(text, { x: 555 - f.widthOfTextAtSize(text, size), y: yy, size, font: f, color });
+    right("UNIDAD BAIFA", 16, bold, 790, blue);
+    const heading = clean(title);
+    right(heading, 11, bold, 770, blue);
+    right(`${number} | ${now.slice(0, 10)} | USD`, 9, font, 754, gray);
+    page.drawLine({ start: { x: 40, y: 815 - logo.height - 8 }, end: { x: 555, y: 815 - logo.height - 8 }, thickness: 1.5, color: blue });
     page.drawText("Propuesta comercial. No es una factura fiscal ni una aprobación de crédito.", { x: 40, y: 24, size: 8, font, color: gray });
   };
   const line = (value, strong = false) => {
