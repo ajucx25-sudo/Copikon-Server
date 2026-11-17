@@ -13,8 +13,14 @@ export function financingSchedule(total, plan) {
   const amount = money(total, "Total");
   if (!plan || !["contado", "financiado"].includes(plan.mode)) fail("Selecciona la forma de pago.");
   if (plan.mode === "contado") return { initial: amount, principal: 0, surcharge: 0, payable: amount, payments: [] };
+  const amortized = plan.method === "amortizacion_mensual";
+  if (plan.method != null && !["amortizacion_mensual", "recargo_fijo"].includes(plan.method)) fail("Método de financiamiento inválido.");
+  if (amortized && (Number(plan.annualRate) !== 24 || plan.frequency !== "mensual"))
+    fail("Este plan requiere tasa nominal anual de 24% y cuotas mensuales.");
+  if (amortized && plan.surcharge != null && plan.surcharge !== "" && Number(plan.surcharge) !== 0)
+    fail("El plan al 24% no admite un recargo fijo adicional.");
   const initial = money(plan.initial, "Inicial");
-  const surcharge = money(plan.surcharge, "Recargo fijo acordado");
+  const surcharge = amortized ? 0 : money(plan.surcharge, "Recargo fijo acordado");
   const count = Number(plan.count);
   if (initial >= amount) fail("La inicial debe ser menor que el total para financiar.");
   if (!Number.isInteger(count) || count < 1 || count > 60) fail("Indica entre 1 y 60 cuotas.");
@@ -23,16 +29,36 @@ export function financingSchedule(total, plan) {
   const date = new Date(`${plan.firstDate}T12:00:00Z`);
   if (!Number.isFinite(date.getTime()) || date.toISOString().slice(0, 10) !== plan.firstDate) fail("Fecha de primera cuota inválida.");
   const principal = amount - initial;
-  const debt = principal + surcharge;
-  const installment = Math.floor(debt / count);
-  const payments = Array.from({ length: count }, (_, i) => {
+  const dueDate = i => {
     let due = new Date(date);
     if (plan.frequency === "mensual") {
       due = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth() + i, 1, 12));
       const lastDay = new Date(Date.UTC(due.getUTCFullYear(), due.getUTCMonth() + 1, 0)).getUTCDate();
       due.setUTCDate(Math.min(date.getUTCDate(), lastDay));
     } else due.setUTCDate(date.getUTCDate() + i * (plan.frequency === "semanal" ? 7 : 15));
-    return { number: i + 1, date: due.toISOString().slice(0, 10), amount: installment + (i === count - 1 ? debt % count : 0) };
+    return due.toISOString().slice(0, 10);
+  };
+  if (amortized) {
+    // All balances are integer cents. Nominal annual 24% / 12 = 2% per month.
+    const rate = 0.02;
+    const installment = Math.round(principal * rate / (1 - Math.pow(1 + rate, -count)));
+    let balance = principal;
+    const payments = Array.from({ length: count }, (_, i) => {
+      const interest = Math.round(balance * rate);
+      const capital = i === count - 1 ? balance : installment - interest;
+      if (capital <= 0 || capital > balance || (i < count - 1 && capital === balance))
+        fail("Saldo demasiado pequeño para ese plazo. Reduce el número de cuotas.");
+      balance -= capital;
+      return { number: i + 1, date: dueDate(i), amount: capital + interest, capital, interest, balance };
+    });
+    const interest = payments.reduce((sum, p) => sum + p.interest, 0);
+    return { method: plan.method, annualRate: 24, monthlyRate: 2, initial, principal, surcharge: 0,
+      interest, installment, payable: amount + interest, payments };
+  }
+  const debt = principal + surcharge;
+  const installment = Math.floor(debt / count);
+  const payments = Array.from({ length: count }, (_, i) => {
+    return { number: i + 1, date: dueDate(i), amount: installment + (i === count - 1 ? debt % count : 0) };
   });
   return { initial, principal, surcharge, payable: amount + surcharge, payments };
 }

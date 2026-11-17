@@ -126,12 +126,27 @@ test("authenticated API stores immutable documents and excludes private payload 
     const pdf = await request(`/briefs/${brief.id}/download`); assert.equal(pdf.headers.get("cache-control"), "no-store"); assert.equal(pdf.headers.get("content-type"), "application/pdf");
     assert.equal((await request("/packages", { quote: rawQuote, plan, briefIds: [] })).status, 400);
     assert.equal((await request("/packages", { quote: rawQuote, plan, briefIds: [brief.id, second.id] })).status, 400);
-    const packed = await request("/packages", { quote: rawQuote, plan, briefIds: [brief.id] }); assert.equal(packed.status, 201);
+    const packed = await request("/packages", { quote: rawQuote, plan: {...plan,annualRate:{ignored:"legacy"}}, briefIds: [brief.id] }); assert.equal(packed.status, 201);
     const record = await packed.json(); assert.equal(record.quote, undefined);
+    assert.equal(store.get(`baifa.sales.package:${record.id}`).plan.annualRate,undefined);
     const archive = await (await request("/packages")).json(); assert.equal(archive.length, 1); assert.equal(archive[0].plan, undefined);
     const one = Buffer.from(await (await request(`/packages/${record.id}/download`)).arrayBuffer());
     const two = Buffer.from(await (await request(`/packages/${record.id}/download`)).arrayBuffer());
     assert.deepEqual(one, two); assert.equal((await PDFDocument.load(one)).getPageCount(), 3);
     assert.equal(calls.filter(s => s.startsWith("INSERT")).length, 3);
+    const annualPlan = {...plan,method:"amortizacion_mensual",annualRate:24,surcharge:"",count:12};
+    assert.equal((await request("/packages", {quote:rawQuote,plan:{...annualPlan,annualRate:12},briefIds:[brief.id]})).status,400);
+    const financed=await request("/packages", {quote:rawQuote,plan:annualPlan,briefIds:[brief.id]});
+    assert.equal(financed.status,201);
+    const financedMeta=await financed.json();
+    const stored=store.get(`baifa.sales.package:${financedMeta.id}`);
+    assert.equal(stored.plan.method,"amortizacion_mensual");
+    assert.equal(stored.plan.annualRate,24);
+    assert.equal(stored.plan.surcharge,0);
+    const persistedSchedule=financingSchedule(stored.total,stored.plan);
+    assert.equal(persistedSchedule.payments.at(-1).balance,0);
+    const annualPdf=await request(`/packages/${financedMeta.id}/download`);
+    assert.equal(annualPdf.status,200);
+    assert.ok((await annualPdf.arrayBuffer()).byteLength>1000);
   } finally { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); }
 });

@@ -128,14 +128,31 @@ export async function createPackagePdf(quote, plan, briefs, number, now) {
   line(`Total proforma: ${usd(quote.total)}`);
   line(`Pago inicial: ${usd(schedule.initial)}`);
   line(`Saldo a financiar: ${usd(schedule.principal)}`);
-  line(`Recargo fijo acordado: ${usd(schedule.surcharge)}`);
+  if (schedule.method === "amortizacion_mensual") {
+    line("Tasa nominal anual fija: 24% | Tasa mensual: 2% sobre saldo pendiente.", true);
+    line(`Plazo: ${schedule.payments.length} meses | Cuota mensual: ${usd(schedule.installment)}`);
+    line(`Intereses totales: ${usd(schedule.interest)}`);
+  } else line(`Recargo fijo acordado: ${usd(schedule.surcharge)}`);
   line(`Total a pagar (inicial + cuotas): ${usd(schedule.payable)}`, true);
   if (schedule.payments.length) {
     y -= 12; box(`CRONOGRAMA · PERIODICIDAD ${plan.frequency.toUpperCase()}`);
-    schedule.payments.forEach(p => line(`Cuota ${p.number}   |   ${p.date}   |   ${usd(p.amount)}`));
+    schedule.payments.forEach(p => {
+      line(`Cuota ${p.number}   |   ${p.date}   |   Pago: ${usd(p.amount)}`, schedule.method === "amortizacion_mensual");
+      if (schedule.method === "amortizacion_mensual") {
+        line(`Capital: ${usd(p.capital)}   |   Interés: ${usd(p.interest)}   |   Saldo: ${usd(p.balance)}`);
+        y -= 4;
+      }
+    });
     y -= 12;
-    line("Cálculo: saldo = total - inicial; cuotas = (saldo + recargo fijo) / número de cuotas. El ajuste de centavos se aplica a la última cuota.");
-    line("No se calcula una tasa de interés. Condiciones sujetas a revisión y aprobación comercial.");
+    if (schedule.method === "amortizacion_mensual") {
+      line("Método: amortización con cuota mensual constante. Capital = total proforma - inicial; r = 0.24 / 12; cuota = capital x r / (1 - (1 + r)^(-n)).");
+      line("Cada mes: interés = saldo pendiente x 2%; capital amortizado = cuota - interés. Importes redondeados a centavos; la última cuota liquida el saldo.");
+      line("La inicial no genera intereses. Cada cuota corresponde a un mes; las fechas no generan prorrateo diario. Sin recargo fijo adicional.");
+      line("Propuesta sujeta a evaluación y aprobación comercial. Este documento no constituye aprobación de crédito.");
+    } else {
+      line("Cálculo: saldo = total - inicial; cuotas = (saldo + recargo fijo) / número de cuotas. El ajuste de centavos se aplica a la última cuota.");
+      line("No se calcula una tasa de interés. Condiciones sujetas a revisión y aprobación comercial.");
+    }
   } else line("Pago completo de la proforma; no aplica financiamiento.");
   for (const brief of briefs) {
     const source = await PDFDocument.load(Buffer.from(brief.dataBase64, "base64"));
@@ -235,6 +252,7 @@ export function registerSalesDocumentRoutes(app, { sessions, pool, readCol }) {
     const plan = inputPlan?.mode === "contado" ? { mode: "contado" } : {
       mode: inputPlan?.mode, initial: inputPlan?.initial, surcharge: inputPlan?.surcharge,
       count: inputPlan?.count, frequency: inputPlan?.frequency, firstDate: inputPlan?.firstDate,
+      method: inputPlan?.method, annualRate: inputPlan?.annualRate,
     };
     const checkedPlan = financingSchedule(quote.total / 100, plan);
     if (plan.mode === "financiado") {
@@ -243,6 +261,8 @@ export function registerSalesDocumentRoutes(app, { sessions, pool, readCol }) {
       plan.count = Number(plan.count);
       plan.frequency = String(plan.frequency);
       plan.firstDate = String(plan.firstDate);
+      if (checkedPlan.method === "amortizacion_mensual") plan.annualRate = checkedPlan.annualRate;
+      else delete plan.annualRate;
     }
     const ids = req.body?.briefIds;
     if (!Array.isArray(ids) || !ids.length || ids.length > 15 || new Set(ids).size !== ids.length) throw error("Selecciona entre 1 y 15 briefs distintos.");
