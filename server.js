@@ -881,6 +881,14 @@ async function syncOdooCatalog({ limit = 25000, includeImages = false } = {}) {
     throw new Error("Odoo no configurado en el servidor");
   }
 
+  // JSON-RPC sin context.lang devuelve el texto base, que puede diferir de
+  // la ficha visible en Odoo. Usar el idioma del usuario de integración,
+  // sin copiar allowed_company_ids y alterar el catálogo multi-company.
+  const userContext = await odoo.execute("res.users", "context_get", [], {});
+  const catalogLang = typeof userContext?.lang === "string" ? userContext.lang.trim() : "";
+  if (!catalogLang) throw new Error("No se pudo determinar el idioma del catálogo Odoo");
+  const catalogContext = { lang: catalogLang };
+
   // Detectar qué campos existen en Odoo para incluir landed_cost y mínimo si están disponibles
   const availableFields = await getOdooProductAvailableFields();
 
@@ -936,7 +944,7 @@ async function syncOdooCatalog({ limit = 25000, includeImages = false } = {}) {
       "product.product",
       domain,
       fields,
-      { order: "id asc", limit: remaining, offset }
+      { order: "id asc", limit: remaining, offset, context: catalogContext }
     );
     odooRows.push(...page);
     if (page.length < remaining) break; // última página
@@ -1051,6 +1059,7 @@ async function syncOdooCatalog({ limit = 25000, includeImages = false } = {}) {
     updated,
     purged,
     companyId: copikonCompanyId,
+    language: catalogLang,
     manualPreserved: finalArr.length - created - updated,
   };
   await pool.query(
