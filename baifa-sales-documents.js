@@ -10,6 +10,9 @@ export const SALES_DOCUMENTS_PATH = "/api/generators/sales-documents";
 const MAX_PDF = 10 * 1024 * 1024;
 // Official Copikon Generators letterhead supplied by Copikon for printed quotations.
 const LETTERHEAD_PNG = readFileSync(new URL("./assets/copikon-generators-membrete.png", import.meta.url));
+// Brand strip (BAIFA, Stamford, redes) and slogan band taken from Copikon's quotation format.
+const BRANDS_PNG = readFileSync(new URL("./assets/copikon-generators-marcas.png", import.meta.url));
+const SLOGAN_PNG = readFileSync(new URL("./assets/copikon-generators-eslogan.png", import.meta.url));
 const UUID = /^[a-f0-9-]{36}$/i;
 const error = (message, status = 400) => Object.assign(new Error(message), { status });
 export const canUseSalesDocuments = user => !!user && !user.isPartner && user.level !== "partner_externo" &&
@@ -64,109 +67,237 @@ export async function cleanBrief(base64) {
   return { dataBase64: result.toString("base64"), size: result.length, pages };
 }
 
-export async function createPackagePdf(quote, plan, briefs, number, now) {
+export async function createPackagePdf(quote, plan, briefs, number, now, meta = {}) {
   const doc = await PDFDocument.create();
-  doc.setTitle(`Cotización Flash ${number} · Unidad BAIFA`);
-  doc.setAuthor("Perplexity Computer");
+  doc.setTitle(`Cotización ${number} · Copikon Generators`);
+  doc.setAuthor("Copikon Generators");
   const font = await doc.embedFont(StandardFonts.Helvetica);
   const bold = await doc.embedFont(StandardFonts.HelveticaBold);
-  const blue = rgb(.04, .20, .38), gray = rgb(.38, .42, .46);
+  const boldItalic = await doc.embedFont(StandardFonts.HelveticaBoldOblique);
+  const ink = rgb(.07, .07, .08), gray = rgb(.36, .38, .42), light = rgb(.93, .93, .94), line = rgb(.78, .79, .81), red = rgb(.80, .09, .13);
   const letterhead = await doc.embedPng(LETTERHEAD_PNG);
-  const logo = letterhead.scaleToFit(160, 106);
+  const brands = await doc.embedPng(BRANDS_PNG);
+  const slogan = await doc.embedPng(SLOGAN_PNG);
+  const logo = letterhead.scaleToFit(138, 91);
+  const W = 595.28, H = 841.89, L = 40, R = 555, BOTTOM = 118;
+  const pages = [];
   let page, y;
-  const clean = value => [...String(value ?? "").replace(/[\r\t]/g, " ")].map(c => {
-    if (c === "\n") return c;
+  const clean = value => [...String(value ?? "").replace(/[\r\t\n]/g, " ")].map(c => {
     try { font.encodeText(c); return c; } catch { return "?"; }
-  }).join("");
-  const newPage = title => {
-    page = doc.addPage([595.28, 841.89]); y = 690;
-    page.drawImage(letterhead, { x: 40, y: 815 - logo.height, width: logo.width, height: logo.height });
-    const right = (text, size, f, yy, color) => page.drawText(text, { x: 555 - f.widthOfTextAtSize(text, size), y: yy, size, font: f, color });
-    right("UNIDAD BAIFA", 16, bold, 790, blue);
-    const heading = clean(title);
-    right(heading, 11, bold, 770, blue);
-    right(`${number} | ${now.slice(0, 10)} | USD`, 9, font, 754, gray);
-    page.drawLine({ start: { x: 40, y: 815 - logo.height - 8 }, end: { x: 555, y: 815 - logo.height - 8 }, thickness: 1.5, color: blue });
-    page.drawText("Propuesta comercial. No es una factura fiscal ni una aprobación de crédito.", { x: 40, y: 24, size: 8, font, color: gray });
-  };
-  const line = (value, strong = false) => {
-    const words = clean(value).split(/\s+/); let current = "";
-    const rows = [];
-    for (const word of words) {
-      // Split unbroken names/URLs so they cannot run outside the printable area.
-      for (const part of word.match(/.{1,65}/g) || [""]) {
-        if (font.widthOfTextAtSize(`${current} ${part}`, 10) > 505) { rows.push(current); current = part; }
-        else current += `${current ? " " : ""}${part}`;
+  }).join("").trim();
+  const wrap = (value, f, size, width) => {
+    const rows = []; let current = "";
+    for (const word of clean(value).split(/\s+/).filter(Boolean)) {
+      for (const part of word.match(/.{1,60}/g) || [""]) {
+        const next = current ? `${current} ${part}` : part;
+        if (current && f.widthOfTextAtSize(next, size) > width) { rows.push(current); current = part; }
+        else current = next;
       }
     }
-    rows.push(current);
-    for (const row of rows) {
-      if (y < 58) newPage("Cotización Flash · continuación");
-      page.drawText(row, { x: 45, y, size: 10, font: strong ? bold : font, color: blue }); y -= 16;
-    }
+    if (current) rows.push(current);
+    return rows.length ? rows : [""];
   };
-  const box = title => {
-    if (y < 100) newPage("Cotización Flash · continuación");
-    y -= 12;
-    page.drawRectangle({ x: 40, y: y - 7, width: 515, height: 24, color: rgb(.94, .96, .98), borderColor: rgb(.8, .85, .9), borderWidth: .5 });
-    line(title, true); y -= 12;
+  const text = (value, x, yy, size = 9, f = font, color = ink) => page.drawText(clean(value), { x, y: yy, size, font: f, color });
+  const right = (value, x, yy, size = 9, f = font, color = ink) => text(value, x - f.widthOfTextAtSize(clean(value), size), yy, size, f, color);
+  const center = (value, x1, x2, yy, size = 9, f = font, color = ink) => text(value, (x1 + x2 - f.widthOfTextAtSize(clean(value), size)) / 2, yy, size, f, color);
+  const usd = c => (c / 100).toLocaleString("en-US", { style: "currency", currency: "USD" });
+  const ve = iso => /^\d{4}-\d{2}-\d{2}/.test(iso || "") ? `${iso.slice(8, 10)}/${iso.slice(5, 7)}/${iso.slice(0, 4)}` : clean(iso);
+  const dateText = ve(now.slice(0, 10));
+  const newPage = (title, sub) => {
+    page = doc.addPage([W, H]); pages.push(page);
+    page.drawImage(letterhead, { x: L, y: H - 28 - logo.height, width: logo.width, height: logo.height });
+    right(title, R, H - 62, title.length > 14 ? 18 : 24, bold);
+    page.drawRectangle({ x: R - 90, y: H - 74, width: 90, height: 2, color: red });
+    right(`PROFORMA N° ${number}`, R, H - 86, 8.5, bold);
+    right(`FECHA ${dateText}${sub ? `  ·  ${sub}` : ""}`, R, H - 98, 8, font, gray);
+    y = H - 36 - logo.height;
+    // Footer: value statement, brand strip and slogan band on every page.
+    page.drawRectangle({ x: L, y: 76, width: R - L, height: 30, borderColor: ink, borderWidth: .6 });
+    center("CADA GENERADOR QUE ENTREGAMOS REPRESENTA UNA DECISIÓN INTELIGENTE, PORQUE CUANDO ELIGES COPIKON GENERATORS, ELIGES", L, R, 94, 6.3, bold);
+    center("TECNOLOGÍA DE ALTO DESEMPEÑO, RESPALDO TÉCNICO INMEDIATO Y ENERGÍA CONTINUA PARA CRECER SIN LÍMITES", L, R, 85, 6.3, bold);
+    const bw = R - L - 30, bh = bw * brands.height / brands.width;
+    page.drawImage(brands, { x: L + 15, y: 56, width: bw, height: bh });
+    page.drawImage(slogan, { x: L, y: 36, width: R - L, height: (R - L) * slogan.height / slogan.width });
   };
-  const usd = cents => (cents / 100).toLocaleString("en-US", { style: "currency", currency: "USD" });
-  newPage("Proforma · Cotización Flash");
-  box("CLIENTE");
-  line(quote.companyName || quote.contactName, true);
-  if (quote.companyName && quote.contactName) line(`Contacto: ${quote.contactName}`);
-  if (quote.contactPhone) line(`Teléfono: ${quote.contactPhone}`);
-  if (quote.contactEmail) line(`Correo: ${quote.contactEmail}`);
-  if (quote.number) line(`Referencia de cotización: ${quote.number}`);
-  if (quote.validUntil) line(`Válida hasta: ${quote.validUntil}`);
-  y -= 10; box("EQUIPOS Y SERVICIOS");
-  quote.items.forEach((item, i) => { line(`${i + 1}. ${item.concepto}`, true); line(`Cantidad: ${item.qty}   |   Unitario: ${usd(Math.round(item.precio * 100))}   |   Importe: ${usd(item.amount)}`); y -= 6; });
-  box("RESUMEN ECONÓMICO");
-  line(`Subtotal bruto: ${usd(quote.gross)}`);
-  if (quote.discountAmount) line(`Descuento: -${usd(quote.discountAmount)}`);
-  line(`Subtotal neto: ${usd(quote.subtotal)}   |   IVA ${quote.applyTax ? "16%" : "no aplica"}: ${usd(quote.tax)}`);
-  line(`TOTAL PROFORMA: ${usd(quote.total)}`, true);
-  if (quote.notes) { y -= 12; box("CONDICIONES"); line(quote.notes); }
-  y -= 12; box("BRIEFS INCLUIDOS");
-  briefs.forEach(b => line(`${b.sku} · ${b.productName} · ${b.filename}`));
-  const schedule = financingSchedule(quote.total / 100, plan);
-  newPage("Plan de financiamiento / forma de pago");
-  box(plan.mode === "contado" ? "PAGO DE CONTADO" : "PROPUESTA DE FINANCIAMIENTO");
-  line(`Cliente: ${quote.companyName || quote.contactName}`, true);
-  line(`Total proforma: ${usd(quote.total)}`);
-  line(`Pago inicial: ${usd(schedule.initial)}`);
-  line(`Saldo a financiar: ${usd(schedule.principal)}`);
-  if (schedule.method === "amortizacion_mensual") {
-    line("Tasa nominal anual fija: 24% | Tasa mensual: 2% sobre saldo pendiente.", true);
-    line(`Plazo: ${schedule.payments.length} meses | Cuota mensual: ${usd(schedule.installment)}`);
-    line(`Intereses totales: ${usd(schedule.interest)}`);
-  } else line(`Recargo fijo acordado: ${usd(schedule.surcharge)}`);
-  line(`Total a pagar (inicial + cuotas): ${usd(schedule.payable)}`, true);
-  if (schedule.payments.length) {
-    y -= 12; box(`CRONOGRAMA · PERIODICIDAD ${plan.frequency.toUpperCase()}`);
-    schedule.payments.forEach(p => {
-      line(`Cuota ${p.number}   |   ${p.date}   |   Pago: ${usd(p.amount)}`, schedule.method === "amortizacion_mensual");
-      if (schedule.method === "amortizacion_mensual") {
-        line(`Capital: ${usd(p.capital)}   |   Interés: ${usd(p.interest)}   |   Saldo: ${usd(p.balance)}`);
-        y -= 4;
-      }
+  const ensure = (need, title, sub, after) => { if (y - need < BOTTOM) { newPage(title, sub); if (after) after(); } };
+  const sectionTitle = (label, tt, sub) => {
+    ensure(34, tt, sub); y -= 16; text(label, L, y, 9.5, bold); y -= 5;
+    page.drawRectangle({ x: L, y, width: R - L, height: 1.2, color: red }); y -= 4;
+  };
+  const bullets = (items, tt, x1 = L, x2 = R) => items.forEach(item => wrap(item, font, 8.5, x2 - x1 - 12).forEach((row, i) => {
+    ensure(13, tt); y -= 12.5;
+    if (!i) page.drawRectangle({ x: x1 + 1, y: y + 2.5, width: 3, height: 3, color: red });
+    text(row, x1 + 10, y, 8.5);
+  }));
+
+  // ── Página 1: cotización ─────────────────────────────────────────────
+  const TT = "COTIZACIÓN";
+  newPage(TT);
+  // The letterhead already carries razón social, RIF, address and phones.
+  y -= 4;
+  page.drawRectangle({ x: L, y, width: R - L, height: .8, color: ink });
+  const top = y - 14;
+  let cy = top;
+  text("PARA:", L, cy, 8, bold, red); cy -= 12;
+  wrap(quote.companyName || quote.contactName, bold, 10, 290).slice(0, 3).forEach(row => { text(row, L, cy, 10, bold); cy -= 12.5; });
+  const kv = (x, yy, k, v) => { text(`${k}:`, x, yy, 8, bold); text(wrap(v, font, 8.5, 175)[0], x + 62, yy, 8.5); };
+  if (quote.companyName && quote.contactName) { kv(L, cy, "Contacto", quote.contactName); cy -= 11; }
+  if (quote.contactPhone) { kv(L, cy, "Teléfono", quote.contactPhone); cy -= 11; }
+  if (quote.contactEmail) { kv(L, cy, "Correo", quote.contactEmail); cy -= 11; }
+  let ry = top;
+  for (const [k, v] of [["Ciudad", quote.city], ["Estado", quote.state], ["Válida hasta", quote.validUntil && ve(quote.validUntil)], ["Moneda", "USD"], ["Ref.", quote.number]])
+    if (v) { kv(355, ry, k, v); ry -= 11; }
+  y = Math.min(cy, ry) - 4;
+  page.drawRectangle({ x: L, y, width: R - L, height: .8, color: ink }); y -= 8;
+
+  // Items table
+  const kvas = [...new Set(quote.items.filter(i => i.productId && !i.serviceItem)
+    .map(i => (String(i.concepto).match(/(\d+(?:[.,]\d+)?)\s*kva/i) || [])[1]).filter(Boolean))];
+  const tableTitle = kvas.length === 1 ? `GRUPO ELECTRÓGENO ${kvas[0]} KVA` : kvas.length > 1
+    ? `GRUPOS ELECTRÓGENOS ${kvas.join(" KVA · ")} KVA` : "EQUIPOS Y SERVICIOS";
+  const C = { desc: L + 6, qty: 360, price: 470, total: R - 6 };
+  const annexOf = new Map(); quote.items.forEach((it, i) => { if (it.detalle?.length) annexOf.set(i, annexOf.size + 1); });
+  const head = () => {
+    page.drawRectangle({ x: L, y: y - 15, width: R - L, height: 15, color: ink });
+    center(tableTitle, L, R, y - 11, 8.5, bold, rgb(1, 1, 1)); y -= 15;
+    page.drawRectangle({ x: L, y: y - 15, width: R - L, height: 15, color: light });
+    text("DESCRIPCIÓN", C.desc, y - 11, 7.5, bold); center("CANT.", C.qty - 30, C.qty + 30, y - 11, 7.5, bold);
+    right("PRECIO", C.price, y - 11, 7.5, bold); right("TOTAL", C.total, y - 11, 7.5, bold); y -= 15;
+  };
+  head();
+  quote.items.forEach((it, i) => {
+    const strong = !!it.productId && !it.serviceItem;
+    const label = annexOf.has(i) ? `${it.concepto} (ANEXO ${annexOf.get(i)})` : it.concepto;
+    const rows = wrap(label, strong ? bold : font, 8.5, C.qty - 34 - C.desc);
+    const h = rows.length * 10.5 + 8;
+    if (y - h < BOTTOM) { newPage(TT, "continuación"); head(); }
+    const included = it.amount === 0;
+    rows.forEach((row, r) => text(row, C.desc, y - 11 - r * 10.5, 8.5, strong ? bold : font));
+    const my = y - 11;
+    center(String(Number(it.qty).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })), C.qty - 30, C.qty + 30, my, 8.5);
+    right(included ? "INCLUIDO" : usd(Math.round(it.precio * 100)), C.price, my, 8.5, included ? bold : font, included ? red : ink);
+    right(included ? "INCLUIDO" : usd(it.amount), C.total, my, 8.5, bold, included ? red : ink);
+    y -= h; page.drawRectangle({ x: L, y, width: R - L, height: .5, color: line });
+  });
+
+  // Totals (right) + conditions (left)
+  const totals = [["SUBTOTAL", usd(quote.gross)]];
+  if (quote.discountAmount) totals.push(["DESCUENTO", `- ${usd(quote.discountAmount)}`], ["BASE IMPONIBLE", usd(quote.subtotal)]);
+  totals.push(quote.applyTax ? ["IVA 16%", usd(quote.tax)] : ["IVA", "NO INCLUYE"]);
+  const conditions = [...(quote.conditions || [])];
+  const leftRows = conditions.reduce((n, c) => n + wrap(c, font, 8.5, 250).length, 0);
+  ensure(Math.max(totals.length * 15 + 30, leftRows * 12.5 + 30) + 10, TT, "continuación");
+  y -= 8;
+  const tx = 360, startY = y;
+  let ty = y;
+  totals.forEach(([k, v]) => { text(k, tx + 6, ty - 11, 8, bold, gray); right(v, R - 6, ty - 11, 8.5, k === "IVA" ? bold : font); ty -= 15;
+    page.drawRectangle({ x: tx, y: ty, width: R - tx, height: .5, color: line }); });
+  page.drawRectangle({ x: tx, y: ty - 22, width: R - tx, height: 22, color: ink });
+  text("TOTAL USD", tx + 8, ty - 15, 10, bold, rgb(1, 1, 1)); right(usd(quote.total), R - 8, ty - 15, 11, bold, rgb(1, 1, 1));
+  ty -= 22;
+  if (!quote.applyTax) { right("Precios expresados sin IVA.", R, ty - 10, 7, font, gray); ty -= 10; }
+  if (conditions.length) {
+    text("CONDICIONES Y GARANTÍA", L, startY - 11, 9.5, bold); y = startY - 15;
+    page.drawRectangle({ x: L, y, width: 300, height: 1.2, color: red }); y -= 2;
+    bullets(conditions, TT, L, 340);
+  }
+  y = Math.min(y, ty) - 4;
+  if (quote.complements?.length) { sectionTitle("COMPLEMENTOS", TT, "continuación"); bullets(quote.complements, TT); }
+  if (quote.notes) {
+    sectionTitle("OBSERVACIONES", TT, "continuación");
+    wrap(quote.notes, font, 8.5, R - L).forEach(row => { ensure(13, TT, "continuación"); y -= 12.5; text(row, L, y, 8.5); });
+  }
+  if (briefs.length) {
+    ensure(24, TT, "continuación"); y -= 18;
+    wrap(`Fichas técnicas anexas: ${briefs.map(b => b.sku).join(", ")}.`, font, 7.5, R - L).forEach(row => { text(row, L, y, 7.5, font, gray); y -= 10; });
+  }
+  ensure(64, TT, "continuación");
+  y -= 46;
+  for (const [x1, x2, title, sub] of [[L, 280, "Elaborado por", meta.preparedBy || "Copikon Generators"], [315, R, "Aceptado por el cliente", "Nombre, firma y fecha"]]) {
+    page.drawRectangle({ x: x1, y, width: x2 - x1, height: .8, color: ink });
+    center(title, x1, x2, y - 11, 8.5, bold); center(sub, x1, x2, y - 22, 7.5, font, gray);
+  }
+
+  // ── Anexos ───────────────────────────────────────────────────────────
+  quote.items.forEach((it, i) => {
+    if (!annexOf.has(i)) return;
+    const AT = `ANEXO ${annexOf.get(i)}`;
+    newPage(AT);
+    y -= 14;
+    wrap(String(it.concepto).toUpperCase(), bold, 10, R - L).forEach(row => { center(row, L, R, y, 10, bold); y -= 13; });
+    y -= 8;
+    const ahead = () => {
+      page.drawRectangle({ x: L, y: y - 15, width: R - L, height: 15, color: ink });
+      center("DETALLE DE EJECUCIÓN", L + 26, R, y - 11, 8, bold, rgb(1, 1, 1)); text("N°", L + 7, y - 11, 8, bold, rgb(1, 1, 1)); y -= 15;
+    };
+    ahead();
+    it.detalle.forEach((step, n) => {
+      const rows = wrap(step, font, 8.5, R - L - 40);
+      const h = rows.length * 10.5 + 7;
+      if (y - h < BOTTOM) { newPage(AT, "continuación"); ahead(); }
+      center(String(n + 1), L, L + 24, y - 11, 8.5, bold);
+      rows.forEach((row, r) => text(row, L + 32, y - 11 - r * 10.5, 8.5));
+      y -= h;
+      page.drawRectangle({ x: L, y, width: R - L, height: .5, color: line });
+      page.drawRectangle({ x: L + 24, y, width: .5, height: h, color: line });
     });
-    y -= 12;
-    if (schedule.method === "amortizacion_mensual") {
-      line("Método: amortización con cuota mensual constante. Capital = total proforma - inicial; r = 0.24 / 12; cuota = capital x r / (1 - (1 + r)^(-n)).");
-      line("Cada mes: interés = saldo pendiente x 2%; capital amortizado = cuota - interés. Importes redondeados a centavos; la última cuota liquida el saldo.");
-      line("La inicial no genera intereses. Cada cuota corresponde a un mes; las fechas no generan prorrateo diario. Sin recargo fijo adicional.");
-      line("Propuesta sujeta a evaluación y aprobación comercial. Este documento no constituye aprobación de crédito.");
-    } else {
-      line("Cálculo: saldo = total - inicial; cuotas = (saldo + recargo fijo) / número de cuotas. El ajuste de centavos se aplica a la última cuota.");
-      line("No se calcula una tasa de interés. Condiciones sujetas a revisión y aprobación comercial.");
-    }
-  } else line("Pago completo de la proforma; no aplica financiamiento.");
+  });
+
+  // ── Plan de pagos ───────────────────────────────────────────────────
+  const schedule = financingSchedule(quote.total / 100, plan);
+  const PT = "PLAN DE PAGOS";
+  newPage(PT);
+  const models = quote.items.filter(i => i.productId && !i.serviceItem).map(i => clean(i.concepto).split(/\s+/).find(w => /^[A-Z]{2}-[A-Z0-9-]+$/i.test(w))).filter(Boolean);
+  y -= 10;
+  text("PLAN GENERATORS", L, y, 13, bold);
+  if (models.length) right([...new Set(models)].join(" · "), R, y, 11, bold, gray);
+  y -= 14; text(clean(quote.companyName || quote.contactName), L, y, 9, font, gray);
+  y -= 22; center("ESTRUCTURA DE PAGOS", L, R, y, 10, bold); y -= 10;
+  const amort = schedule.method === "amortizacion_mensual";
+  const P = amort
+    ? [["CRONOGRAMA", L + 6, "l"], ["FECHA", 150, "l"], ["CAPITAL", 278, "r"], ["INTERÉS", 350, "r"], ["MONTO", 432, "r"], ["%", 470, "r"], ["SALDO", R - 6, "r"]]
+    : [["CRONOGRAMA", L + 6, "l"], ["FECHA", 170, "l"], ["MONTO", 330, "r"], ["%", 390, "r"], ["OBSERVACIONES", 410, "l"]];
+  const phead = () => {
+    page.drawRectangle({ x: L, y: y - 17, width: R - L, height: 17, color: ink });
+    P.forEach(([k, x, a]) => (a === "r" ? right : text)(k, x, y - 12, 7.5, bold, rgb(1, 1, 1))); y -= 17;
+  };
+  const pct = c => `${(c * 100 / schedule.payable).toFixed(c * 100 % schedule.payable ? 1 : 0)}%`;
+  const prow = (cells, strong = false, shade = false) => {
+    if (y - 16 < BOTTOM) { newPage(PT, "continuación"); phead(); }
+    if (shade) page.drawRectangle({ x: L, y: y - 16, width: R - L, height: 16, color: light });
+    cells.forEach((v, idx) => { if (v == null || v === "") return; const [, x, a] = P[idx]; (a === "r" ? right : text)(v, x, y - 11.5, 8.5, strong ? bold : font); });
+    y -= 16; page.drawRectangle({ x: L, y, width: R - L, height: .5, color: line });
+  };
+  phead();
+  const totalRow = amort ? ["Precio (proforma)", "", "", "", usd(quote.total), "", ""] : ["Precio (proforma)", "", usd(quote.total), "", ""];
+  prow(totalRow, true, true);
+  if (plan.mode === "contado") prow(["Pago único", dateText, usd(schedule.payable), "100%", "Contado, contra orden de compra"]);
+  else {
+    if (schedule.initial > 0) prow(amort ? ["Inicial", dateText, "", "", usd(schedule.initial), pct(schedule.initial), usd(schedule.principal)]
+      : ["Inicial", dateText, usd(schedule.initial), pct(schedule.initial), "Reserva del equipo"], true);
+    schedule.payments.forEach(p => prow(amort
+      ? [`Cuota ${p.number}`, ve(p.date), usd(p.capital), usd(p.interest), usd(p.amount), pct(p.amount), usd(p.balance)]
+      : [`Cuota ${p.number}`, ve(p.date), usd(p.amount), pct(p.amount), ""]));
+    prow(amort ? ["Total a pagar", "", usd(schedule.principal), usd(schedule.interest), usd(schedule.payable), "100%", ""]
+      : ["Total a pagar", "", usd(schedule.payable), "100%", schedule.surcharge ? `Incluye recargo ${usd(schedule.surcharge)}` : ""], true, true);
+  }
+  const obs = plan.mode === "contado" ? ["Pago completo de la proforma; no aplica financiamiento."]
+    : amort ? [
+      `Las cuotas serán ejecutadas a través de pagos mensuales (${schedule.payments.length} meses). Cuota mensual: ${usd(schedule.installment)}.`,
+      "Tasa nominal anual fija 24% (2% mensual sobre saldo pendiente). La inicial no genera intereses.",
+      "Fórmula: cuota = capital x 0,02 / (1 - 1,02^(-n)); interés del mes = saldo x 2%. La última cuota liquida el saldo exacto (ajuste de centavos).",
+      "Propuesta sujeta a evaluación y aprobación comercial. Este documento no constituye aprobación de crédito."]
+    : ["Saldo = total - inicial; cuotas = (saldo + recargo fijo) / número de cuotas. El ajuste de centavos se aplica a la última cuota.",
+      `Periodicidad: ${clean(plan.frequency)}. Condiciones sujetas a revisión y aprobación comercial.`];
+  sectionTitle("OBSERVACIONES", PT, "continuación");
+  bullets(obs, PT);
+
+  const total = pages.length;
+  pages.forEach((p, i) => { const s = `Página ${i + 1} de ${total}`; p.drawText(s, { x: R - font.widthOfTextAtSize(s, 7), y: 22, size: 7, font, color: gray }); });
   for (const brief of briefs) {
     const source = await PDFDocument.load(Buffer.from(brief.dataBase64, "base64"));
-    const pages = await doc.copyPages(source, source.getPageIndices());
-    pages.forEach(p => doc.addPage(p));
+    const copied = await doc.copyPages(source, source.getPageIndices());
+    copied.forEach(p => doc.addPage(p));
   }
   return Buffer.from(await doc.save());
 }
@@ -309,7 +440,8 @@ export function registerSalesDocumentRoutes(app, { sessions, pool, readCol, read
         new Set(briefs.map(b => b.productId)).size !== briefs.length) throw error("Incluye exactamente un brief por modelo cotizado.");
     const id = randomUUID(), now = new Date().toISOString();
     const number = `FLASH-${now.slice(0, 10).replaceAll("-", "")}-${id.slice(0, 8).toUpperCase()}`;
-    const bytes = await runPdfWorker("package", [quote, plan, briefs, number, now]);
+    const preparedBy = String(req.salesUser.name || req.salesUser.fullName || "Copikon Generators").slice(0, 120);
+    const bytes = await runPdfWorker("package", [quote, plan, briefs, number, now, { preparedBy }]);
     if (bytes.length > 30 * 1024 * 1024) throw error("La cotización excede 30 MB.");
     const record = { id, number, filename: `${number}.pdf`, companyName: quote.companyName || quote.contactName, total: quote.total / 100,
       createdAt: now, createdBy: req.salesUser.id, briefIds: ids, quote, plan, size: bytes.length, dataBase64: bytes.toString("base64") };

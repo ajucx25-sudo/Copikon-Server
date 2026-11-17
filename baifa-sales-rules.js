@@ -66,12 +66,18 @@ export function validateQuote(raw) {
   if (!raw || !String(raw.companyName || raw.contactName || "").trim()) fail("Indica el cliente o contacto.");
   if (!Array.isArray(raw.items) || !raw.items.length || raw.items.length > 100) fail("Agrega entre 1 y 100 líneas.");
   const text = (v, max) => String(v || "").trim().slice(0, max);
+  // Cap raw text before splitting so huge payloads cannot cost CPU/memory on the main thread.
+  const rawText = (v, max) => String(v || "").slice(0, max);
+  const lines = v => rawText(v, 8000).split(/\r?\n/).map(s => s.trim().slice(0, 200)).filter(Boolean).slice(0, 20);
   const items = raw.items.map(item => {
     const qty = Number(item.qty);
     if (!Number.isFinite(qty) || qty <= 0 || qty > 100000) fail("Cantidad inválida.");
     const unit = money(item.precio, "Precio unitario");
     if (!text(item.concepto, 500)) fail("Cada línea necesita una descripción.");
-    return { productId: item.productId == null ? null : String(item.productId), concepto: text(item.concepto, 500), qty, precio: unit / 100, amount: Math.round(qty * unit) };
+    // Optional execution detail printed as an annex (one step per line, max 40 steps).
+    const detalle = [...new Set(rawText(item.detalle, 24000).split(/\r?\n/).map(s => s.trim().slice(0, 300)).filter(Boolean))].slice(0, 40);
+    return { productId: item.productId == null ? null : String(item.productId), concepto: text(item.concepto, 500), qty, precio: unit / 100, amount: Math.round(qty * unit),
+      serviceItem: item.serviceItem === true, detalle };
   });
   const discount = Number(raw.globalDiscountPct || 0);
   if (!Number.isFinite(discount) || discount < 0 || discount > 100) fail("Descuento fuera de rango.");
@@ -85,5 +91,7 @@ export function validateQuote(raw) {
   return { companyName: text(raw.companyName, 250), contactName: text(raw.contactName, 250),
     contactPhone: text(raw.contactPhone, 80), contactEmail: text(raw.contactEmail, 250),
     number: text(raw.number, 80), validUntil: text(raw.validUntil, 10), notes: text(raw.notes, 4000),
+    city: text(raw.city, 80), state: text(raw.state, 80),
+    conditions: lines(raw.conditions), complements: lines(raw.complements),
     items, gross, discountAmount, subtotal, tax, total, applyTax: raw.applyTax !== false };
 }
