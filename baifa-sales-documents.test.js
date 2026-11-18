@@ -124,7 +124,7 @@ test("authenticated API stores immutable documents and excludes private payload 
     const listing = await (await request("/briefs")).json(); assert.equal(listing.length, 2); assert.equal(listing[0].dataBase64, undefined);
     assert.equal((await request(`/briefs/${brief.id}/download`, undefined, "")).status, 401);
     const pdf = await request(`/briefs/${brief.id}/download`); assert.equal(pdf.headers.get("cache-control"), "no-store"); assert.equal(pdf.headers.get("content-type"), "application/pdf");
-    assert.equal((await request("/packages", { quote: rawQuote, plan, briefIds: [] })).status, 400);
+    assert.equal((await request("/packages", { quote: rawQuote, plan, briefIds: "x" })).status, 400);
     assert.equal((await request("/packages", { quote: rawQuote, plan, briefIds: [brief.id, second.id] })).status, 400);
     const packed = await request("/packages", { quote: rawQuote, plan: {...plan,annualRate:{ignored:"legacy"}}, briefIds: [brief.id] }); assert.equal(packed.status, 201);
     const record = await packed.json(); assert.equal(record.quote, undefined);
@@ -134,6 +134,10 @@ test("authenticated API stores immutable documents and excludes private payload 
     const two = Buffer.from(await (await request(`/packages/${record.id}/download`)).arrayBuffer());
     assert.deepEqual(one, two); assert.equal((await PDFDocument.load(one)).getPageCount(), 3);
     assert.equal(calls.filter(s => s.startsWith("INSERT")).length, 3);
+    // A model without a loaded brief still produces proforma + plan.
+    const noBrief = await request("/packages", { quote: rawQuote, plan, briefIds: [] }); assert.equal(noBrief.status, 201);
+    const noBriefPdf = Buffer.from(await (await request(`/packages/${(await noBrief.json()).id}/download`)).arrayBuffer());
+    assert.equal((await PDFDocument.load(noBriefPdf)).getPageCount(), 2);
     const annualPlan = {...plan,method:"amortizacion_mensual",annualRate:24,surcharge:"",count:12};
     assert.equal((await request("/packages", {quote:rawQuote,plan:{...annualPlan,annualRate:12},briefIds:[brief.id]})).status,400);
     const financed=await request("/packages", {quote:rawQuote,plan:annualPlan,briefIds:[brief.id]});

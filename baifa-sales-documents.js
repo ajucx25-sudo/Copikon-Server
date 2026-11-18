@@ -428,16 +428,16 @@ export function registerSalesDocumentRoutes(app, { sessions, pool, readCol, read
       else delete plan.annualRate;
     }
     const ids = req.body?.briefIds;
-    if (!Array.isArray(ids) || !ids.length || ids.length > 15 || new Set(ids).size !== ids.length) throw error("Selecciona entre 1 y 15 briefs distintos.");
+    // Briefs are optional: a model without a loaded brief still gets proforma + plan.
+    if (!Array.isArray(ids) || ids.length > 15 || ids.some(id => typeof id !== "string" || !id) || new Set(ids).size !== ids.length) throw error("Selecciona hasta 15 briefs distintos.");
     const briefs = await Promise.all(ids.map(id => load("brief", id)));
     if (briefs.reduce((s, b) => s + b.size, 0) > 25 * 1024 * 1024 || briefs.reduce((s, b) => s + b.pages, 0) > 180)
       throw error("Los briefs juntos exceden 25 MB o 180 páginas. Divide la cotización.");
     const products = await readCol("erpProducts");
     const quoted = products.filter(p => isGenerator(p) && quote.items.some(i => i.productId === String(p.id)));
     if (!quoted.length) throw error("Agrega al menos un grupo electrógeno del catálogo a la cotización.");
-    if (quoted.some(p => !briefs.some(b => b.productId === String(p.id))) ||
-        briefs.some(b => !quoted.some(p => b.productId === String(p.id))) ||
-        new Set(briefs.map(b => b.productId)).size !== briefs.length) throw error("Incluye exactamente un brief por modelo cotizado.");
+    if (briefs.some(b => !quoted.some(p => b.productId === String(p.id))) ||
+        new Set(briefs.map(b => b.productId)).size !== briefs.length) throw error("Incluye como máximo un brief por modelo cotizado.");
     const id = randomUUID(), now = new Date().toISOString();
     const number = `FLASH-${now.slice(0, 10).replaceAll("-", "")}-${id.slice(0, 8).toUpperCase()}`;
     const preparedBy = String(req.salesUser.name || req.salesUser.fullName || "Copikon Generators").slice(0, 120);
