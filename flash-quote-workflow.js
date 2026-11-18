@@ -123,6 +123,10 @@ export function registerFlashWorkflow(router,{pool,handle}) {
   router.delete("/quotes/:id",handle(async(req,res)=>res.json(await tx(async db=>{
     const r=await owned(req,db);if(r.snapshot.status!=="borrador")fail("Solo se pueden eliminar borradores.",409);
     if(String(r.snapshot.version)!==req.query.version)fail("El borrador cambió. Revisa la última versión.",409);
+    await db.query("DELETE FROM kv WHERE key LIKE 'baifa.sales.package:%' AND value->>'flashQuoteId'=$1",[String(r.id)]);
     await db.query("DELETE FROM sales_flash_quotes WHERE id=$1",[r.id]);return {deleted:true};
   }))));
+  return (req,db,link,terms)=>save({salesUser:req.salesUser,params:{id:String(link.id??"")},body:{
+    ...req.body.quote,quoteTerms:terms,status:"borrador",requestId:link.requestId,version:link.version
+  }},db,link.id==null);
 }

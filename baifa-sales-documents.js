@@ -18,7 +18,7 @@ const UUID = /^[a-f0-9-]{36}$/i;
 const error = (message, status = 400) => Object.assign(new Error(message), { status });
 export const canUseSalesDocuments = user => !!user && !user.isPartner && user.level !== "partner_externo" &&
   (isAdministrator(user) || permissionList(user.moduleAccess).includes("generators-ventas"));
-const publicMeta = ({ dataBase64, quote, plan, ...meta }) => meta;
+const publicMeta = ({ dataBase64, quote, plan, flashOwnerId, ...meta }) => meta;
 
 const ACTIVE_PDF_NAMES = new Set(["A", "AA", "OpenAction", "JavaScript", "JS", "Launch",
   "RichMedia", "EmbeddedFiles", "EmbeddedFile", "AcroForm", "XFA", "SubmitForm",
@@ -356,7 +356,7 @@ export function registerSalesDocumentRoutes(app, { sessions, pool, readCol, read
     catch (e) { res.status(e.status || 500).json({ message: e.status ? e.message : "No se pudo procesar el documento. Intenta nuevamente." }); }
   };
   // Sales needs inventory membership, not the inventory module's PO/invoice detail.
-  registerFlashWorkflow(router,{pool,handle});
+  const savePackageDraft=registerFlashWorkflow(router,{pool,handle});
   // Same live reader as Inventario; no writes, brand inference or catalog fallback.
   router.get("/quote-inventory", handle(async (req, res) => {
     if (Object.keys(req.query).length) throw error("Parámetros no permitidos.");
@@ -379,7 +379,7 @@ export function registerSalesDocumentRoutes(app, { sessions, pool, readCol, read
       throw error("No se pudo verificar el inventario. Reintenta antes de agregar productos.", 502);
     }
   }));
-  const save = async (key, value) => {
+  const save = async (key, value, beforeInsert=null) => {
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
@@ -390,6 +390,7 @@ export function registerSalesDocumentRoutes(app, { sessions, pool, readCol, read
         FROM kv WHERE key LIKE 'baifa.sales.%'`, [String(value.createdBy), Date.now() - 86400000]);
       if (Number(rows[0]?.bytes || 0) + value.size > 1024 * 1024 * 1024 ||
           Number(rows[0]?.daily || 0) >= 100) throw error("Se alcanzó el límite de documentos (100 al día por usuario / 1 GB total). Contacta al administrador.", 429);
+      if(beforeInsert)await beforeInsert(client);
       await client.query("INSERT INTO kv(key,value,updated_at) VALUES($1,$2::jsonb,$3)", [key, JSON.stringify(value), Date.now()]);
       await client.query("COMMIT");
     } catch (e) { await client.query("ROLLBACK"); throw e; } finally { client.release(); }
@@ -401,12 +402,13 @@ export function registerSalesDocumentRoutes(app, { sessions, pool, readCol, read
     return result.rows[0].value;
   };
   for (const [route, kind] of [["briefs", "brief"], ["packages", "package"]]) {
-    router.get(`/${route}`, handle(async (_req, res) => {
-      const rows = await pool.query("SELECT value - 'dataBase64' - 'quote' - 'plan' AS value FROM kv WHERE key LIKE $1 ORDER BY updated_at DESC LIMIT 500", [`baifa.sales.${kind}:%`]);
+    router.get(`/${route}`, handle(async (req, res) => {
+      const rows = await pool.query("SELECT value - 'dataBase64' - 'quote' - 'plan' AS value FROM kv WHERE key LIKE $1 AND (NOT (value ? 'flashQuoteId') OR value->>'flashOwnerId'=$2 OR $3) ORDER BY updated_at DESC LIMIT 500", [`baifa.sales.${kind}:%`,String(req.salesUser.id),isAdministrator(req.salesUser)]);
       res.json(rows.rows.map(r => publicMeta(r.value)));
     }));
     router.get(`/${route}/:id/download`, handle(async (req, res) => {
       const value = await load(kind, req.params.id);
+      if(value.flashQuoteId!=null&&String(value.flashOwnerId)!==String(req.salesUser.id)&&!isAdministrator(req.salesUser))throw error("Documento no encontrado.",404);
       res.set({ "Content-Type": "application/pdf", "Content-Disposition": `attachment; filename="${encodeURIComponent(value.filename)}"`, "Content-Security-Policy": "sandbox" });
       res.send(Buffer.from(value.dataBase64, "base64"));
     }));
@@ -466,7 +468,13 @@ export function registerSalesDocumentRoutes(app, { sessions, pool, readCol, read
     if (bytes.length > 30 * 1024 * 1024) throw error("La cotización excede 30 MB.");
     const record = { id, number, filename: `${number}.pdf`, companyName: quote.companyName || quote.contactName, total: quote.total / 100,
       createdAt: now, createdBy: req.salesUser.id, briefIds: ids, quote, plan, size: bytes.length, dataBase64: bytes.toString("base64") };
-    await save(`baifa.sales.package:${id}`, record);
+    const link=req.body.workflow;
+    if(link!=null&&(typeof link!=="object"||Array.isArray(link)))throw error("Vínculo de borrador inválido.");
+    await save(`baifa.sales.package:${id}`, record,link==null?null:async db=>{
+      const choices=Object.fromEntries(quoted.map(p=>[String(p.id),briefs.find(b=>b.productId===String(p.id))?.id||""]));
+      const draft=await savePackageDraft(req,db,link,JSON.stringify({plan,choices}));
+      record.flashQuoteId=draft.id;record.flashQuoteVersion=draft.version;record.flashOwnerId=draft.createdBy;
+    });
     res.status(201).json(publicMeta(record));
   }));
   router.use((err, _req, res, _next) => res.status(err.status === 413 ? 413 : 400).json({ message: "Solicitud inválida o demasiado grande (máximo 10 MB por PDF)." }));
