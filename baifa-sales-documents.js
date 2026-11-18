@@ -19,6 +19,22 @@ const error = (message, status = 400) => Object.assign(new Error(message), { sta
 export const canUseSalesDocuments = user => !!user && !user.isPartner && user.level !== "partner_externo" &&
   (isAdministrator(user) || permissionList(user.moduleAccess).includes("generators-ventas"));
 const publicMeta = ({ dataBase64, quote, plan, flashOwnerId, ...meta }) => meta;
+// Reversible history-only retirement of the 12 reviewed legacy packages.
+// No client details, payload changes, date cutoff or download-route changes.
+const retiredLegacyPackageDigests = `
+e87380030d119f870fc93a89e762d26fa0d36b0d186ba7220117df6ef64da03e
+0011dad5d8e2a09314cc0bc8fb0edb096b861e768c32c63da4102739c19b80bc
+c873b85abaac304d7f1ed71ad28b55f19e6e92b3da52fc7865fef7d229b175d5
+6cef31e51c0f511f05a5d6a5cb3b2f6de39ae99e6dfbf4ccf5cd0d7f05f1a0cc
+c1572d59de1b4ab923e776db174db70117132d64d3ea2df329c13eb2c0f5138e
+422a690c3a4d778587dd4d43c7dcec7a7d0ef6d2823556e61e71c73328a6193d
+b6520f1c91004b2277e640ce1d8bf01e1d6a80da0ccce2f304b04bc4279b26f7
+5debd427abdea1576e8c1a388216d4f792741367a91b22f49a4235fbc638136d
+603b6a0566c52e404c45eee35a56795f123c91262673d846dcc1b40861ef414a
+7d83be72df6962d0ab17e5daad2c9e121b98b5d2cac1b19c9fd838d1aa589ddd
+c53f46ffa512d0fe30e6d00c73ff726058fc0b972a65d35b95d843f82d73dc11
+addff5a2964f1ac05e5c213c27fd9b1f4dc69161f012a96f26f81222cb2ad003
+`.trim().split(/\s+/);
 
 const ACTIVE_PDF_NAMES = new Set(["A", "AA", "OpenAction", "JavaScript", "JS", "Launch",
   "RichMedia", "EmbeddedFiles", "EmbeddedFile", "AcroForm", "XFA", "SubmitForm",
@@ -403,7 +419,10 @@ export function registerSalesDocumentRoutes(app, { sessions, pool, readCol, read
   };
   for (const [route, kind] of [["briefs", "brief"], ["packages", "package"]]) {
     router.get(`/${route}`, handle(async (req, res) => {
-      const rows = await pool.query("SELECT value - 'dataBase64' - 'quote' - 'plan' AS value FROM kv WHERE key LIKE $1 AND (NOT (value ? 'flashQuoteId') OR value->>'flashOwnerId'=$2 OR $3) ORDER BY updated_at DESC LIMIT 500", [`baifa.sales.${kind}:%`,String(req.salesUser.id),isAdministrator(req.salesUser)]);
+      const params=[`baifa.sales.${kind}:%`,String(req.salesUser.id),isAdministrator(req.salesUser)];
+      const historyFilter=kind==="package"?" AND (value ? 'flashQuoteId' OR NOT (encode(sha256(convert_to(coalesce(value->>'number',''),'UTF8')),'hex') = ANY($4::text[])))":"";
+      if(kind==="package")params.push(retiredLegacyPackageDigests);
+      const rows = await pool.query("SELECT value - 'dataBase64' - 'quote' - 'plan' AS value FROM kv WHERE key LIKE $1 AND (NOT (value ? 'flashQuoteId') OR value->>'flashOwnerId'=$2 OR $3)"+historyFilter+" ORDER BY updated_at DESC LIMIT 500", params);
       res.json(rows.rows.map(r => publicMeta(r.value)));
     }));
     router.get(`/${route}/:id/download`, handle(async (req, res) => {
