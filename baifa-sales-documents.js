@@ -167,17 +167,36 @@ export async function createPackagePdf(quote, plan, briefs, number, now, meta = 
   head();
   quote.items.forEach((it, i) => {
     const strong = !!it.productId && !it.serviceItem;
-    const label = annexOf.has(i) ? `${it.concepto} (ANEXO ${annexOf.get(i)})` : it.concepto;
+    const name = it.serviceItem ? `Servicio: ${it.concepto}` : it.concepto;
+    const label = annexOf.has(i) ? `${name} (ANEXO ${annexOf.get(i)})` : name;
     const rows = wrap(label, strong ? bold : font, 8.5, C.qty - 34 - C.desc);
     const h = rows.length * 10.5 + 8;
-    if (y - h < BOTTOM) { newPage(TT, "continuación"); head(); }
+    const inlineSteps = !it.productId || it.serviceItem ? it.detalle || [] : [];
+    if (y - h - (inlineSteps.length ? 30 : 0) < BOTTOM) { newPage(TT, "continuación"); head(); }
     const included = it.amount === 0;
     rows.forEach((row, r) => text(row, C.desc, y - 11 - r * 10.5, 8.5, strong ? bold : font));
     const my = y - 11;
     center(String(Number(it.qty).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })), C.qty - 30, C.qty + 30, my, 8.5);
     right(included ? "INCLUIDO" : usd(Math.round(it.precio * 100)), C.price, my, 8.5, included ? bold : font, included ? red : ink);
     right(included ? "INCLUIDO" : usd(it.amount), C.total, my, 8.5, bold, included ? red : ink);
-    y -= h; page.drawRectangle({ x: L, y, width: R - L, height: .5, color: line });
+    y -= h;
+    if (inlineSteps.length) {
+      text("Anexo de ejecución", C.desc + 7, y - 9, 8, bold, gray); y -= 14;
+      inlineSteps.forEach((step, n) => {
+        wrap(step, font, 8.5, R - C.desc - 38).forEach((row, r) => {
+          if (y - 13 < BOTTOM) {
+            newPage(TT, "continuación"); head();
+            wrap(`${name} · Anexo ${annexOf.get(i)} (continuación)`, bold, 8.5, R - C.desc - 8)
+              .forEach(s => { y -= 12; text(s, C.desc, y, 8.5, bold); });
+            y -= 5;
+          }
+          if (!r) right(`${n + 1}.`, C.desc + 21, y - 9, 8, bold, gray);
+          text(row, C.desc + 27, y - 9, 8.5); y -= 12;
+        });
+      });
+      y -= 2;
+    }
+    page.drawRectangle({ x: L, y, width: R - L, height: .5, color: line });
   });
 
   // Totals (right) + conditions (left)
@@ -223,10 +242,10 @@ export async function createPackagePdf(quote, plan, briefs, number, now, meta = 
     if (!annexOf.has(i)) return;
     const AT = `ANEXO ${annexOf.get(i)}`;
     newPage(AT);
-    y -= 14;
-    wrap(String(it.concepto).toUpperCase(), bold, 10, R - L).forEach(row => { center(row, L, R, y, 10, bold); y -= 13; });
-    y -= 8;
     const ahead = () => {
+      y -= 14;
+      wrap(`${it.serviceItem ? "SERVICIO: " : ""}${it.concepto}`.toUpperCase(), bold, 10, R - L).forEach(row => { center(row, L, R, y, 10, bold); y -= 13; });
+      y -= 8;
       page.drawRectangle({ x: L, y: y - 15, width: R - L, height: 15, color: ink });
       center("DETALLE DE EJECUCIÓN", L + 26, R, y - 11, 8, bold, rgb(1, 1, 1)); text("N°", L + 7, y - 11, 8, bold, rgb(1, 1, 1)); y -= 15;
     };
