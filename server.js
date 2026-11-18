@@ -14,6 +14,9 @@ import pkg from "pg";
 import * as odoo from "./odoo-client.js";
 import { registerPlaybooksRoutes } from "./playbooks.js";
 import { registerSalesDocumentRoutes, SALES_DOCUMENTS_PATH } from "./baifa-sales-documents.js";
+import {workflowSchema,protectPipelineQuotes} from "./flash-quote-workflow.js";
+import {registerDeviceCompat,compatPath,compatSchema} from "./device-compat.js";
+import {visibleLead,authorizeLeadWrite,manageLeads} from "./lead-access.js";
 import { registerPricelistsRoutes } from "./pricelists.js";
 import { registerPreventaRoutes } from "./preventa.js";
 import { registerShipmentsRoutes } from "./shipments.js";
@@ -59,6 +62,8 @@ async function ensureSchema() {
     credential_digest TEXT NOT NULL, expires_at BIGINT NOT NULL
   )`);
   await pool.query("DELETE FROM secure_sessions WHERE expires_at < $1", [Date.now()]);
+  await pool.query(workflowSchema);
+  await pool.query(compatSchema);
 }
 
 async function readCol(key) {
@@ -69,6 +74,10 @@ async function readCol(key) {
 }
 
 async function writeCol(key, arr) {
+  if(key==="erpLeads"){
+    if(!collectionContext.getStore())throw Error("La escritura de pipeline necesita transacción.");
+    protectPipelineQuotes(await readCol(key),arr);
+  }
   if (String(key).startsWith("baifa.sales.")) {
     throw Object.assign(new Error("Los documentos de ventas son inmutables; utiliza sus rutas protegidas."), { status: 403 });
   }
@@ -191,7 +200,7 @@ app.use(cors({
 }));
 const legacyJsonParser = express.json({ limit: "150mb" });
 // Document uploads authenticate before their smaller, route-specific JSON parser.
-app.use((req, res, next) => req.path.toLowerCase().startsWith(SALES_DOCUMENTS_PATH + "/")
+app.use((req, res, next) => [SALES_DOCUMENTS_PATH,compatPath].some(p=>req.path.toLowerCase().startsWith(p+"/"))
   ? next() : legacyJsonParser(req, res, next));
 
 const wrap = (fn) => (req, res) =>
@@ -206,6 +215,7 @@ const wrap = (fn) => (req, res) =>
   });
 
 const sessions = createSessions(pool, readCol, buildPartnerUser);
+registerDeviceCompat(app,{pool,sessions,readCol});
 const readBaifaInventory = createInventoryReader(odoo);
 registerSalesDocumentRoutes(app, { sessions, pool, readCol, readInventory: readBaifaInventory });
 // Require a server-issued session before the exposed legacy families and the
@@ -219,13 +229,14 @@ app.use((req, res, next) => {
   const equipmentDocument = isEquipmentDocumentResource(path);
   const equipmentCreate = /^\/api\/erp\/client-equipment(?:\/|$)/.test(path) && req.method === "POST";
   const protectedPath = isInventoryPath(path) || equipmentRead || equipmentDocument || isPricelistClientMutation(path, req.method) || isClientResource(path) || equipmentCreate || isBaifaSyncPath(path) || clientMutation || equipmentMutation || posventaEquipment || /^\/api\/(?:logistica|employees|sales-partners|admin\/(?:users|sales-partners|providers|technical-providers)|sync)(?:\/|$)/.test(path) ||
-    /^\/api\/erp\/pre-leads(?:\/|$)/.test(path) ||
+    /^\/api\/erp\/(?:pre-leads|leads|sale-orders\/from-lead)(?:\/|$)/.test(path) || /^\/api\/sales\/dashboard-summary\/?$/.test(path) ||
     /^\/api\/generators\/(?:shipments|price-list-settings|price-list-items)(?:\/|$)/.test(path) ||
     /^\/api\/auth\/(?:me|change-password|logout)$/.test(path);
   if (!protectedPath) return next();
   res.setHeader("Cache-Control", "no-store");
   sessions.authenticate(req).then(user => {
     if (!user) return res.status(401).json({ message: "Sesión vencida o no válida. Inicia sesión de nuevo." });
+    if(/^\/api\/sales\/dashboard-summary\/?$/.test(path)&&!manageLeads(user))return res.status(403).json({message:"Sin permiso para el resumen general de ventas."});
     if (!canAccessPath(user, path, req.method)) return res.status(403).json({ message: "No tienes permisos para esta operación." });
     if (equipmentDocument && ["POST","PATCH","PUT"].includes(req.method)) {
       if (!req.body || typeof req.body !== "object" || Array.isArray(req.body) ||
@@ -396,7 +407,7 @@ app.post("/api/sync/migrate", wrap(async (req, res) => {
   const results = {};
   for (const [key, arr] of Object.entries(snapshot)) {
     if (!Array.isArray(arr)) continue;
-    if (["erpClients","erpClientEquipment"].includes(key) || key.startsWith("baifaClientSync") || key.startsWith("baifa.sales.")) {
+    if (["erpClients","erpClientEquipment","erpLeads"].includes(key) || key.startsWith("baifaClientSync") || key.startsWith("baifa.sales.")) {
       results[key] = {skipped:true, reason:"Colección protegida: usar sus formularios o la sincronización dedicada."};
       continue;
     }
@@ -429,7 +440,7 @@ app.post("/api/sync/seed", wrap(async (req, res) => {
   const written = {};
   for (const [key, arr] of Object.entries(seed)) {
     if (!Array.isArray(arr)) continue;
-    if (["erpClients","erpClientEquipment"].includes(key) || key.startsWith("baifaClientSync")) continue;
+    if (["erpClients","erpClientEquipment","erpLeads"].includes(key) || key.startsWith("baifaClientSync")) continue;
     const existing = await readCol(key);
     if (existing.length === 0) {
       await writeCol(key, arr);
@@ -572,7 +583,7 @@ app.get("/api/sales-partners/:id", wrap(async (req, res) => {
 for (const [route, key] of Object.entries(ROUTES)) {
   // Skip GET para sales-partners (ya manejado arriba con sanitización)
   if (route !== "/api/sales-partners") {
-    app.get(route, wrap(async (_req, res) => res.json(await readCol(key))));
+    app.get(route, wrap(async (req, res) => {const all=await readCol(key);res.json(key==="erpLeads"?all.filter(l=>visibleLead(req.verifiedUser,l)):all);}));
   }
 
   if (route !== "/api/sales-partners") {
@@ -582,6 +593,7 @@ for (const [route, key] of Object.entries(ROUTES)) {
       const id = Number(req.params.id);
       const items = await readCol(key);
       const item = items.find((x) => Number(x.id) === id);
+      if(key==="erpLeads"&&!visibleLead(req.verifiedUser,item))return res.status(404).json({message:"not found"});
       if (!item) return res.status(404).json({ message: "not found" });
       res.json(item);
     }));
@@ -590,6 +602,7 @@ for (const [route, key] of Object.entries(ROUTES)) {
   app.post(route, wrap(async (req, res) => {
     const items = await readCol(key);
     const body = req.body || {};
+    if(key==="erpLeads")authorizeLeadWrite(req.verifiedUser,null,body,"POST");
     // Anti-duplicado: si el body trae un id que ya existe, devolver el existente
     // (idempotencia para retries/clicks múltiples). Aplica a TODAS las rutas /api/...
     if (body.id != null) {
@@ -627,6 +640,7 @@ for (const [route, key] of Object.entries(ROUTES)) {
     const items = await readCol(key);
     const idx = items.findIndex((x) => matchId(x, rawId));
     if (idx < 0) return res.status(404).json({ message: "not found" });
+    if(key==="erpLeads")authorizeLeadWrite(req.verifiedUser,items[idx],req.body,"PATCH");
     items[idx] = { ...items[idx], ...(req.body || {}) };
     await writeCol(key, items);
     res.json(items[idx]);
@@ -638,6 +652,7 @@ for (const [route, key] of Object.entries(ROUTES)) {
     const idx = items.findIndex((x) => matchId(x, rawId));
     if (idx < 0) return res.status(404).json({ message: "not found" });
     const preservedId = items[idx].id; // preservar id string tal cual
+    if(key==="erpLeads")authorizeLeadWrite(req.verifiedUser,items[idx],req.body,"PUT");
     items[idx] = { ...items[idx], ...(req.body || {}), id: preservedId };
     await writeCol(key, items);
     res.json(items[idx]);
@@ -649,6 +664,7 @@ for (const [route, key] of Object.entries(ROUTES)) {
     const idx = items.findIndex((x) => matchId(x, rawId));
     if (idx < 0) return res.status(404).json({ message: "not found" });
     const [removed] = items.splice(idx, 1);
+    if(key==="erpLeads")authorizeLeadWrite(req.verifiedUser,removed,null,"DELETE");
     await writeCol(key, items);
     res.json(removed);
   }));
@@ -1387,6 +1403,7 @@ async function resolveOdooUserIdForEmployee(employee) {
 // Body: { leadId: number, confirmOrder?: boolean }
 app.post("/api/erp/sale-orders/from-lead", wrap(async (req, res) => {
   const { leadId, confirmOrder = false } = req.body || {};
+  if(!manageLeads(req.verifiedUser))return res.status(403).json({message:"La creación de la orden requiere autorización comercial."});
   if (!leadId) return res.status(400).json({ ok: false, error: "leadId requerido" });
   if (!odoo.isConfigured()) {
     return res.status(503).json({ ok: false, error: "Odoo no configurado" });
@@ -1598,6 +1615,7 @@ app.get("/api/erp/sale-orders/from-lead/:leadId", wrap(async (req, res) => {
   const idx = leads.findIndex(l => Number(l.id) === leadId);
   if (idx < 0) return res.status(404).json({ ok: false, error: "Lead no encontrado" });
   const lead = leads[idx];
+  if(!visibleLead(req.verifiedUser,lead))return res.status(404).json({message:"Oportunidad no encontrada."});
   if (!lead.odooSaleOrderId) {
     return res.json({ ok: true, exists: false, leadId });
   }

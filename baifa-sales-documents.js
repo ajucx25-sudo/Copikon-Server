@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import { Worker } from "node:worker_threads";
 import { PDFDocument, PDFDict, PDFArray, PDFName, PDFRawStream, StandardFonts, rgb } from "pdf-lib";
 import { isAdministrator, permissionList } from "./secure-access.js";
+import { registerFlashWorkflow } from "./flash-quote-workflow.js";
 import { isGenerator, financingSchedule, validateQuote } from "./baifa-sales-rules.js";
 
 export const SALES_DOCUMENTS_PATH = "/api/generators/sales-documents";
@@ -355,6 +356,7 @@ export function registerSalesDocumentRoutes(app, { sessions, pool, readCol, read
     catch (e) { res.status(e.status || 500).json({ message: e.status ? e.message : "No se pudo procesar el documento. Intenta nuevamente." }); }
   };
   // Sales needs inventory membership, not the inventory module's PO/invoice detail.
+  registerFlashWorkflow(router,{pool,handle});
   // Same live reader as Inventario; no writes, brand inference or catalog fallback.
   router.get("/quote-inventory", handle(async (req, res) => {
     if (Object.keys(req.query).length) throw error("Parámetros no permitidos.");
