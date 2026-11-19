@@ -43,7 +43,12 @@ test("quote lifecycle: permissions, draft revisions, definitive save, rollback a
     assert.equal((await req("PATCH",id,{...draft,version:1},"8")).s,404);
     const change={...draft,companyName:"Cliente corregido",version:1};assert.equal((await req("PATCH",id,change)).v.version,2);
     assert.equal((await req("PATCH",id,change)).s,409);assert.equal((await req("DELETE",id+"?version=1")).s,409);
-    const saved={...change,status:"guardada",version:2};
+    const saved={...change,status:"guardada",version:2,contactName:"Contacto",contactPhone:"04120000000",contactEmail:"qa@example.test",city:"Barcelona",state:"Anzoátegui",classification:"particular",validUntil:"2026-12-31"};
+    for(const key of ["companyName","contactName","contactPhone","contactEmail","city","state","classification","validUntil"]){
+      assert.equal((await req("PATCH",id,{...saved,[key]:"   "})).s,400);
+      assert.equal((await req("POST","",{...saved,[key]:"",requestId:randomUUID()})).s,400);
+    }
+    assert.equal(await count(),0);
     const finals=await Promise.all([req("PATCH",id,saved),req("PATCH",id,saved)]);
     assert.ok(finals.every(r=>r.s===200));assert.equal(finals[0].v.convertedToLeadId,finals[1].v.convertedToLeadId);
     assert.equal(await count(),1);
