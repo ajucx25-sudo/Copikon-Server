@@ -44,6 +44,10 @@ test("cash and existing fixed-surcharge documents keep their original calculatio
 });
 test("24% PDF renders up to 60 months without losing pages", async () => {
   const q=validateQuote({companyName:"PRUEBA FINANCIAMIENTO",items:[{concepto:"Generador QA",qty:1,precio:10000}],applyTax:false,total:10000});
-  const pdf=await PDFDocument.load(await createPackagePdf(q,{...plan,count:60},[],"QA24","2026-11-17"));
-  assert.ok(pdf.getPageCount()>=4);
+  const bytes=await createPackagePdf(q,{...plan,count:60,initialPct:20},[],"QA24","2026-11-17");
+  const pdf=await PDFDocument.load(bytes);
+  assert.ok(pdf.getPageCount()>1);
+  const {default:parse}=await import("pdf-parse/lib/pdf-parse.js");
+  const {text}=await parse(Buffer.from(bytes));assert.match(text,/Inicial: 20%/);
+  for(let i=1;i<=60;i++)assert.match(text,new RegExp(`Cuota ${i}(?!\\d{3})`));
 });

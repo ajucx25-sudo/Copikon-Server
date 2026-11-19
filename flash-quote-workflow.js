@@ -1,5 +1,6 @@
 import { isAdministrator } from "./secure-access.js";
 import {isDeepStrictEqual} from "node:util";
+import {assessFinancing,requireApproval} from "./financing-authorization.js";
 import { financingSchedule, validateQuote } from "./baifa-sales-rules.js";
 
 export const workflowSchema = `CREATE TABLE IF NOT EXISTS sales_flash_quotes (
@@ -20,6 +21,13 @@ function requireClosingFields(q){
 }
 // Pipeline movement and follow-up remain editable; the originating quote does not.
 export function protectPipelineQuotes(previous,next){
+  const prior=new Map(previous.map(x=>[String(x.id),x]));
+  for(const r of next){
+    const old=prior.get(String(r.id));
+    if(r.flashQuoteId!=null||!r.quoteTerms||(r.quoteTerms===old?.quoteTerms&&r.quoteStatus===old?.quoteStatus&&["quoteItems","quoteTotal","quoteSubtotal","quoteTax","companyName","contactName"].every(k=>isDeepStrictEqual(r[k],old?.[k]))))continue;
+    let terms;try{terms=typeof r.quoteTerms==="string"?JSON.parse(r.quoteTerms):r.quoteTerms;}catch{continue;}
+    if(terms?.plan?.mode==="financiado")fail("Gestiona el financiamiento desde Cotización Flash.",409);
+  }
   const sent=new Set(previous.filter(x=>x.quoteStatus==="enviada").map(x=>String(x.id)));
   for(const r of next)if(r.flashQuoteId==null&&r.quoteStatus==="enviada"&&!sent.has(String(r.id)))
     requireClosingFields({...r,classification:r.priceBand||r.classification,validUntil:r.quoteValidUntil});
@@ -73,7 +81,7 @@ function snapshot(body) {
   return {...result,status:body.status,items:JSON.stringify(items),compraProgramada:body.compraProgramada===true,
     quoteTerms:opts,applyTax,globalDiscountPct:discount,subtotal:money(subtotal),tax:money(tax),total:money(subtotal+tax)};
 }
-export function registerFlashWorkflow(router,{pool,handle}) {
+export function registerFlashWorkflow(router,{pool,handle,readCol,readFinanceRows}) {
   const tx=async fn=>{
     const db=await pool.connect();
     try{await db.query("BEGIN");const result=await fn(db);await db.query("COMMIT");return result;}
@@ -84,7 +92,7 @@ export function registerFlashWorkflow(router,{pool,handle}) {
       [String(req.salesUser.id),isAdministrator(req.salesUser)]);
     res.json(r.rows.map(view));
   }));
-  async function save(req,db,create){
+  async function save(req,db,create,issuing=false){
     const user=req.salesUser,owner=String(user.id),data=snapshot(req.body),now=new Date().toISOString();
     let row;
     if(create){
@@ -108,6 +116,17 @@ export function registerFlashWorkflow(router,{pool,handle}) {
     const number=row.snapshot.number||`COT-${now.slice(0,4)}-${String(row.id).padStart(5,"0")}`;
     const saved={...data,number,createdBy:row.snapshot.createdBy??user.id,createdAt:row.snapshot.createdAt||now,
       updatedAt:now,version:(row.snapshot.version||0)+1};
+    const plan=data.quoteTerms?JSON.parse(data.quoteTerms).plan:null;
+    if(plan?.mode==="financiado"){
+      const products=await readCol("erpProducts");
+      let review;
+      try{review=assessFinancing(data,plan,products,await readFinanceRows(req));}catch(e){if(data.status==="guardada"||issuing||![400,503].includes(e.status))throw e;}
+      if(review?.exception){
+        saved.financeRequest=review;
+        if(row.snapshot.financeApproval?.key===review.key)saved.financeApproval=row.snapshot.financeApproval;
+      }
+      if(data.status==="guardada"||issuing)requireApproval(review,saved.financeApproval);
+    }
     if(data.status==="guardada"){
       await db.query("SELECT pg_advisory_xact_lock($1)",[LEAD_LOCK]);
       const prior=(await db.query("SELECT value FROM kv WHERE key='erpLeads' FOR UPDATE")).rows[0];
@@ -132,13 +151,23 @@ export function registerFlashWorkflow(router,{pool,handle}) {
   }
   router.post("/quotes",handle(async(req,res)=>res.json(await tx(db=>save(req,db,true)))));
   router.patch("/quotes/:id",handle(async(req,res)=>res.json(await tx(db=>save(req,db,false)))));
+  router.post("/quotes/:id/finance-approval",handle(async(req,res)=>res.json(await tx(async db=>{
+    if(req.salesUser.level!=="ceo"||req.salesUser.isPartner)fail("Solo el CEO puede aprobar la excepción.",403);
+    const row=await owned(req,db),s=row.snapshot;
+    if(s.status!=="borrador"||s.version!==req.body?.version||!s.financeRequest)fail("Actualiza el historial antes de aprobar.",409);
+    const r=assessFinancing(s,JSON.parse(s.quoteTerms).plan,await readCol("erpProducts"),await readFinanceRows(req));
+    if(!r?.exception||r.key!==s.financeRequest.key||r.key!==req.body.key)fail("La propuesta cambió. Revisa el borrador.",409);
+    const financeApproval={key:r.key,by:req.salesUser.id,at:new Date().toISOString()};
+    await db.query("UPDATE sales_flash_quotes SET snapshot=$2 WHERE id=$1",[row.id,{...s,financeApproval}]);
+    return {approved:true};
+  }))));
   router.delete("/quotes/:id",handle(async(req,res)=>res.json(await tx(async db=>{
     const r=await owned(req,db);if(r.snapshot.status!=="borrador")fail("Solo se pueden eliminar borradores.",409);
     if(String(r.snapshot.version)!==req.query.version)fail("El borrador cambió. Revisa la última versión.",409);
     await db.query("DELETE FROM kv WHERE key LIKE 'baifa.sales.package:%' AND value->>'flashQuoteId'=$1",[String(r.id)]);
     await db.query("DELETE FROM sales_flash_quotes WHERE id=$1",[r.id]);return {deleted:true};
   }))));
-  return (req,db,link,terms)=>save({salesUser:req.salesUser,params:{id:String(link.id??"")},body:{
+  return (req,db,link,terms)=>save({salesUser:req.salesUser,financeRowsPromise:req.financeRowsPromise,params:{id:String(link.id??"")},body:{
     ...req.body.quote,quoteTerms:terms,status:"borrador",requestId:link.requestId,version:link.version
-  }},db,link.id==null);
+  }},db,link.id==null,true);
 }

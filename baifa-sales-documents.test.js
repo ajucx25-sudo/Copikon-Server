@@ -5,8 +5,8 @@ import { PDFDocument, PDFName, PDFString } from "pdf-lib";
 import { canUseSalesDocuments, cleanBrief, createPackagePdf, registerSalesDocumentRoutes, SALES_DOCUMENTS_PATH } from "./baifa-sales-documents.js";
 import { financingSchedule, validateQuote, isGenerator } from "./baifa-sales-rules.js";
 
-const product = { id: 19301, code: "TRPE-QA", brand: "Baifa", name: "Generador QA" };
-const rawQuote = { companyName: "Cliente de prueba", items: [{ productId: product.id, concepto: "Generador de prueba", qty: 2, precio: 1000 }], applyTax: true, total: 2320 };
+const product = { id: 19301, code: "TRPE-QA", brand: "Baifa", name: "Generador QA 77 kVA" };
+const rawQuote = { companyName: "Cliente de prueba", items: [{ productId: product.id, concepto: `${product.name} (${product.code})`, qty: 2, precio: 1000 }], applyTax: true, total: 2320 };
 const plan = { mode: "financiado", initial: 500, surcharge: 25, count: 3, frequency: "mensual", firstDate: "2028-01-31" };
 async function fixture() { const d = await PDFDocument.create(); d.addPage().drawText("BRIEF DE PRUEBA"); return Buffer.from(await d.save()).toString("base64"); }
 test("permission requires internal sales, excludes partners even if admin", () => {
@@ -109,7 +109,7 @@ test("authenticated API stores immutable documents and excludes private payload 
     return { rows: store.has(params[0]) ? [{ value: store.get(params[0]) }] : [] };
   } };
   const app = express();
-  registerSalesDocumentRoutes(app, { pool, readCol: async () => [product], sessions: { authenticate: async req => req.headers.authorization === "QA-sales" ? { id: 1, moduleAccess: ["generators-ventas"] } : req.headers.authorization === "QA-other" ? { id: 2 } : null } });
+  registerSalesDocumentRoutes(app, { pool, readCol: async () => [product],readInventory:async()=>({ok:true,complete:true,source:"odoo-po-invoices",schemaVersion:1,observedAt:new Date().toISOString(),rows:[{...product,productIds:[1],available:1}]}), sessions: { authenticate: async req => req.headers.authorization === "QA-sales" ? { id: 1, moduleAccess: ["generators-ventas"] } : req.headers.authorization === "QA-other" ? { id: 2 } : null } });
   const server = app.listen(0); await new Promise(resolve => server.once("listening", resolve));
   const root = `http://127.0.0.1:${server.address().port}${SALES_DOCUMENTS_PATH}`;
   const request = (path, body, auth = "QA-sales") => fetch(root + path, { method: body === undefined ? "GET" : "POST", headers: { Authorization: auth, "Content-Type": "application/json" }, body: body === undefined ? undefined : JSON.stringify(body) });
@@ -126,19 +126,20 @@ test("authenticated API stores immutable documents and excludes private payload 
     const pdf = await request(`/briefs/${brief.id}/download`); assert.equal(pdf.headers.get("cache-control"), "no-store"); assert.equal(pdf.headers.get("content-type"), "application/pdf");
     assert.equal((await request("/packages", { quote: rawQuote, plan, briefIds: "x" })).status, 400);
     assert.equal((await request("/packages", { quote: rawQuote, plan, briefIds: [brief.id, second.id] })).status, 400);
-    const packed = await request("/packages", { quote: rawQuote, plan: {...plan,annualRate:{ignored:"legacy"}}, briefIds: [brief.id] }); assert.equal(packed.status, 201);
+    assert.equal((await request("/packages",{quote:rawQuote,plan:{...plan,annualRate:{ignored:"legacy"}},briefIds:[brief.id]})).status,400);
+    const packed = await request("/packages", { quote: rawQuote, plan: {...plan,initialPct:30,initial:696,method:"amortizacion_mensual",annualRate:24,surcharge:0}, briefIds: [brief.id] }); assert.equal(packed.status, 201);
     const record = await packed.json(); assert.equal(record.quote, undefined);
-    assert.equal(store.get(`baifa.sales.package:${record.id}`).plan.annualRate,undefined);
+    assert.equal(store.get(`baifa.sales.package:${record.id}`).plan.annualRate,24);
     const archive = await (await request("/packages")).json(); assert.equal(archive.length, 1); assert.equal(archive[0].plan, undefined);
     const one = Buffer.from(await (await request(`/packages/${record.id}/download`)).arrayBuffer());
     const two = Buffer.from(await (await request(`/packages/${record.id}/download`)).arrayBuffer());
     assert.deepEqual(one, two); assert.equal((await PDFDocument.load(one)).getPageCount(), 3);
     assert.equal(calls.filter(s => s.startsWith("INSERT")).length, 3);
     // A model without a loaded brief still produces proforma + plan.
-    const noBrief = await request("/packages", { quote: rawQuote, plan, briefIds: [] }); assert.equal(noBrief.status, 201);
+    const noBrief = await request("/packages", { quote: rawQuote, plan:{mode:"contado"}, briefIds: [] }); assert.equal(noBrief.status, 201);
     const noBriefPdf = Buffer.from(await (await request(`/packages/${(await noBrief.json()).id}/download`)).arrayBuffer());
     assert.equal((await PDFDocument.load(noBriefPdf)).getPageCount(), 2);
-    const annualPlan = {...plan,method:"amortizacion_mensual",annualRate:24,surcharge:"",count:12};
+    const annualPlan = {...plan,method:"amortizacion_mensual",annualRate:24,surcharge:"",count:3,initialPct:30,initial:696};
     assert.equal((await request("/packages", {quote:rawQuote,plan:{...annualPlan,annualRate:12},briefIds:[brief.id]})).status,400);
     const financed=await request("/packages", {quote:rawQuote,plan:annualPlan,briefIds:[brief.id]});
     assert.equal(financed.status,201);

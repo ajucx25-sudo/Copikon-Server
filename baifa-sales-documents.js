@@ -5,6 +5,7 @@ import { Worker } from "node:worker_threads";
 import { PDFDocument, PDFDict, PDFArray, PDFName, PDFRawStream, StandardFonts, rgb } from "pdf-lib";
 import { isAdministrator, permissionList } from "./secure-access.js";
 import { registerFlashWorkflow } from "./flash-quote-workflow.js";
+import {assessFinancing,requireApproval,financeRows,financeName} from "./financing-authorization.js";
 import { isGenerator, financingSchedule, validateQuote } from "./baifa-sales-rules.js";
 
 export const SALES_DOCUMENTS_PATH = "/api/generators/sales-documents";
@@ -319,6 +320,7 @@ export async function createPackagePdf(quote, plan, briefs, number, now, meta = 
   }
   const obs = plan.mode === "contado" ? ["Pago completo de la proforma; no aplica financiamiento."]
     : amort ? [
+      ...(plan.initialPct!=null?[`Inicial: ${Number(plan.initialPct)}% del total de la proforma (${usd(schedule.initial)}).`]:[]),
       `Las cuotas serán ejecutadas a través de pagos mensuales (${schedule.payments.length} meses). Cuota mensual: ${usd(schedule.installment)}.`,
       "Tasa nominal anual fija 24% (2% mensual sobre saldo pendiente). La inicial no genera intereses.",
       "Fórmula: cuota = capital x 0,02 / (1 - 1,02^(-n)); interés del mes = saldo x 2%. La última cuota liquida el saldo exacto (ajuste de centavos).",
@@ -372,7 +374,11 @@ export function registerSalesDocumentRoutes(app, { sessions, pool, readCol, read
     catch (e) { res.status(e.status || 500).json({ message: e.status ? e.message : "No se pudo procesar el documento. Intenta nuevamente." }); }
   };
   // Sales needs inventory membership, not the inventory module's PO/invoice detail.
-  const savePackageDraft=registerFlashWorkflow(router,{pool,handle});
+  const readFinanceRows=async req=>{
+    try{return await (req.financeRowsPromise??=Promise.resolve().then(()=>readInventory()).then(financeRows));}
+    catch{throw error("No se pudo verificar el inventario de Odoo para el financiamiento.",503);}
+  };
+  const savePackageDraft=registerFlashWorkflow(router,{pool,handle,readCol,readFinanceRows});
   // Same live reader as Inventario; no writes, brand inference or catalog fallback.
   router.get("/quote-inventory", handle(async (req, res) => {
     if (Object.keys(req.query).length) throw error("Parámetros no permitidos.");
@@ -387,7 +393,7 @@ export function registerSalesDocumentRoutes(app, { sessions, pool, readCol, read
             ![row.available, row.pending].every(n => typeof n === "number" && Number.isFinite(n) && n >= 0))
           throw Error("Invalid inventory row");
         codes.add(row.code);
-        return { code: row.code, available: row.available, pending: row.pending };
+        return { code: row.code, available: row.available, pending: row.pending,...(financeName(row)?{financeName:financeName(row)}:{}) };
       }).filter(row => row.available > 0 || row.pending > 0);
       res.json({ ok: true, schemaVersion: 1, source: "generators-inventory", complete: true,
         observedAt: snapshot.observedAt, rows });
@@ -458,6 +464,7 @@ export function registerSalesDocumentRoutes(app, { sessions, pool, readCol, read
       mode: inputPlan?.mode, initial: inputPlan?.initial, surcharge: inputPlan?.surcharge,
       count: inputPlan?.count, frequency: inputPlan?.frequency, firstDate: inputPlan?.firstDate,
       method: inputPlan?.method, annualRate: inputPlan?.annualRate,
+      initialPct: inputPlan?.initialPct, customTerms:inputPlan?.customTerms==="yes"?"yes":"no",
     };
     const checkedPlan = financingSchedule(quote.total / 100, plan);
     if (plan.mode === "financiado") {
@@ -477,6 +484,13 @@ export function registerSalesDocumentRoutes(app, { sessions, pool, readCol, read
       throw error("Los briefs juntos exceden 25 MB o 180 páginas. Divide la cotización.");
     const products = await readCol("erpProducts");
     const quoted = products.filter(p => isGenerator(p) && quote.items.some(i => i.productId === String(p.id)));
+    const review=assessFinancing(req.body.quote,plan,products,plan.mode==="financiado"?await readFinanceRows(req):[]);
+    if(review?.exception){
+      const id=req.body.workflow?.id;
+      if(!Number.isSafeInteger(id)||id<1)requireApproval(review,null);
+      const r=await pool.query("SELECT snapshot FROM sales_flash_quotes WHERE id=$1 AND (owner_id=$2 OR $3)",[id,String(req.salesUser.id),isAdministrator(req.salesUser)]);
+      requireApproval(review,r.rows[0]?.snapshot?.financeApproval);
+    }
     if (!quoted.length) throw error("Agrega al menos un grupo electrógeno del catálogo a la cotización.");
     if (briefs.some(b => !quoted.some(p => b.productId === String(p.id))) ||
         new Set(briefs.map(b => b.productId)).size !== briefs.length) throw error("Incluye como máximo un brief por modelo cotizado.");

@@ -25,7 +25,7 @@ test("quote lifecycle: permissions, draft revisions, definitive save, rollback a
     await pool.query(workflowSchema);
     await pool.query("CREATE TABLE kv(key text primary key,value jsonb not null,updated_at bigint not null)");
     const app=express();
-    registerSalesDocumentRoutes(app,{pool,sessions:{authenticate:async req=>{
+    registerSalesDocumentRoutes(app,{pool,readInventory:async()=>({ok:true,complete:true,source:"odoo-po-invoices",schemaVersion:1,observedAt:new Date().toISOString(),rows:[{name:"Generador 77 kVA",code:"TRPE-QA",productIds:[77],available:1}]}),readCol:async()=>[{id:77,code:"TRPE-QA",name:"Generador 77 kVA"}],sessions:{authenticate:async req=>{
       const k=req.headers["x-test-user"];return k?{id:k,level:k==="admin"?"ceo":"vendedor",moduleAccess:k==="otro"?"[]":'["generators-ventas"]'}:null;
     }}});
     server=await new Promise(resolve=>{const s=app.listen(0,"127.0.0.1",()=>resolve(s));});
@@ -56,12 +56,29 @@ test("quote lifecycle: permissions, draft revisions, definitive save, rollback a
     assert.equal(lead.stage,"cotizacion");assert.equal(lead.quoteNumber,finals[0].v.number);assert.equal(lead.quoteTotal,"100.00");
     assert.equal((await req("PATCH",id,{...change,version:3})).s,409);
     assert.equal((await req("DELETE",id+"?version=3")).s,409);
+    const financed={...saved,status:"borrador",items:JSON.stringify([{productId:77,concepto:"Generador 77 kVA (TRPE-QA)",precio:100,qty:1}]),requestId:randomUUID()};
+    const plan={mode:"financiado",method:"amortizacion_mensual",annualRate:24,frequency:"mensual",firstDate:"2027-01-15",initialPct:25,initial:25,count:6,customTerms:"yes"};
+    const ft=(p)=>JSON.stringify({plan:p,choices:{}});
+    const fr=await req("POST","",{...financed,quoteTerms:ft(plan)});assert.equal(fr.s,200);
+    const fid="/"+fr.v.id, approval={key:fr.v.financeRequest.key,version:1};
+    assert.equal((await req("POST",fid+"/finance-approval",approval)).s,403);
+    const final={...financed,status:"guardada",quoteTerms:ft(plan),version:1};
+    assert.equal((await req("PATCH",fid,{...final,financeApproval:approval})).s,403);
+    const pack=async(p,link)=>fetch(url.replace(/quotes$/,"packages"),{method:"POST",headers:{"content-type":"application/json","x-test-user":"7"},body:JSON.stringify({quote:{...financed,items:JSON.parse(financed.items)},plan:p,workflow:link,briefIds:[]})});
+    assert.equal((await pack(plan,{id:fr.v.id,version:1})).status,403);
+    assert.equal((await req("POST",fid+"/finance-approval",{...approval,key:"stale"},"admin")).s,409);
+    assert.equal((await req("POST",fid+"/finance-approval",approval,"admin")).s,200);
+    assert.equal((await pack({...plan,count:5},{id:fr.v.id,version:1})).status,403);
+    assert.equal((await pack(plan,undefined)).status,403);
+    assert.equal((await pack(plan,{id:fr.v.id,version:1})).status,201);
+    assert.equal((await req("PATCH",fid,{...final,version:2,quoteTerms:ft({...plan,initialPct:24,initial:24})})).s,403);
+    const approved=await req("PATCH",fid,{...final,version:2});assert.equal(approved.s,200);assert.equal(approved.v.financeApproval.by,"admin");
     const b=(await req("POST","",{...draft,requestId:randomUUID()})).v;
-    assert.equal((await req("DELETE",`/${b.id}?version=1`)).s,200);assert.equal(await count(),1);
+    assert.equal((await req("DELETE",`/${b.id}?version=1`)).s,200);assert.equal(await count(),2);
     const direct={...saved,requestId:randomUUID()};
-    const both=await Promise.all([req("POST","",direct),req("POST","",direct)]);assert.equal(both[0].v.id,both[1].v.id);assert.equal(await count(),2);
-    await pool.query("ALTER TABLE kv ADD CHECK(jsonb_array_length(value)<=2)");
+    const both=await Promise.all([req("POST","",direct),req("POST","",direct)]);assert.equal(both[0].v.id,both[1].v.id);assert.equal(await count(),3);
+    await pool.query("ALTER TABLE kv ADD CHECK(key <> 'erpLeads' OR jsonb_array_length(value)<=3) NOT VALID");
     assert.equal((await req("POST","",{...direct,requestId:randomUUID()})).s,500);
-    assert.equal((await req("GET")).v.length,2);assert.equal(await count(),2);
+    assert.equal((await req("GET")).v.length,3);assert.equal(await count(),3);
   }finally{if(server)await new Promise(r=>server.close(r));await pool.end();await admin.query(`DROP SCHEMA ${schema} CASCADE`);await admin.end();}
 });
