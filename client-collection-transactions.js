@@ -9,7 +9,7 @@ export const isPricelistClientMutation = (path, method) =>
 const leadWriter=(path,method)=>(/^\/api\/erp\/leads(?:\/|$)/i.test(path)&&["POST","PATCH","PUT","DELETE"].includes(method))||
   /^\/api\/erp\/sale-orders\/from-lead(?:\/|$)/i.test(path)&&["GET","POST"].includes(method);
 export const requiresCollectionTransaction = (path, method) => leadWriter(path,method)||["POST","PATCH","PUT","DELETE"].includes(method) &&
-  (isEquipmentDocumentResource(path) || /^\/api\/erp\/(?:clients|client-equipment)(?:\/|$)/i.test(path) ||
+  (isEquipmentDocumentResource(path) || /^\/api\/(?:technical-providers|technical-certifications|erp\/(?:infra-maintenance-orders|infra-maintenance-plans|maintenance-orders|maintenance-plans|service-orders|rental-maintenance|visits|service-contracts|rental-contracts|operating-expenses|clients|client-equipment))(?:\/|$)/i.test(path) ||
    /^\/api\/generators\/posventa\/equipment(?:\/|$)/i.test(path) ||
    /^\/api\/pricelists(?:\/|$)/i.test(path) ||
    /^\/api\/sync\/(?:migrate|seed)$/i.test(path));
@@ -22,6 +22,7 @@ export async function runCollectionTransaction(pool, req, res, fn) {
   res.json = function(body) {response = body; hasResponse = true; return this;};
   try {
     await db.query("BEGIN");
+    await db.query("SELECT pg_advisory_xact_lock(41577113)");
     if(!leadWriter(req.path,req.method))await db.query("SELECT pg_advisory_xact_lock($1)", [CLIENT_LOCK]);
     if(leadWriter(req.path,req.method)||/^\/api\/sync\/(?:seed|migrate)\/?$/i.test(req.path))await db.query("SELECT pg_advisory_xact_lock($1)",[LEAD_LOCK]);
     await collectionContext.run(db, () => fn(req, res));

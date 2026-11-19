@@ -16,6 +16,7 @@ import { registerPlaybooksRoutes } from "./playbooks.js";
 import { registerSalesDocumentRoutes, SALES_DOCUMENTS_PATH } from "./baifa-sales-documents.js";
 import {workflowSchema,protectPipelineQuotes} from "./flash-quote-workflow.js";
 import {registerDeviceCompat,compatPath,compatSchema} from "./device-compat.js";
+import {dossierPath,dossierSchema,registerDossiers,requiredProviders,guardedWork,statuses,dossierRights} from "./technician-dossier.js";
 import {visibleLead,authorizeLeadWrite,manageLeads} from "./lead-access.js";
 import { registerPricelistsRoutes } from "./pricelists.js";
 import { registerPreventaRoutes } from "./preventa.js";
@@ -64,6 +65,7 @@ async function ensureSchema() {
   await pool.query("DELETE FROM secure_sessions WHERE expires_at < $1", [Date.now()]);
   await pool.query(workflowSchema);
   await pool.query(compatSchema);
+  await pool.query(dossierSchema);
 }
 
 async function readCol(key) {
@@ -74,6 +76,15 @@ async function readCol(key) {
 }
 
 async function writeCol(key, arr) {
+  if(guardedWork.has(key)){
+    const needed=requiredProviders(key,await readCol(key),arr,await readCol("employees"));
+    if(needed.length){
+      const states=await statuses(collectionContext.getStore()||pool,readCol);
+      for(const id of needed){const state=states.find(s=>String(s.providerId)===id);
+        if(!state?.authorized)throw Object.assign(Error("Técnico no autorizado para realizar trabajos. Revisa su habilitación en el directorio."),{status:409});
+      }
+    }
+  }
   if(key==="erpLeads"){
     if(!collectionContext.getStore())throw Error("La escritura de pipeline necesita transacción.");
     protectPipelineQuotes(await readCol(key),arr);
@@ -200,7 +211,7 @@ app.use(cors({
 }));
 const legacyJsonParser = express.json({ limit: "150mb" });
 // Document uploads authenticate before their smaller, route-specific JSON parser.
-app.use((req, res, next) => [SALES_DOCUMENTS_PATH,compatPath].some(p=>req.path.toLowerCase().startsWith(p+"/"))
+app.use((req, res, next) => [SALES_DOCUMENTS_PATH,compatPath,dossierPath].some(p=>req.path.toLowerCase().startsWith(p+"/"))
   ? next() : legacyJsonParser(req, res, next));
 
 const wrap = (fn) => (req, res) =>
@@ -215,6 +226,37 @@ const wrap = (fn) => (req, res) =>
   });
 
 const sessions = createSessions(pool, readCol, buildPartnerUser);
+registerDossiers(app,{pool,sessions,readCol});
+app.use((req,res,next)=>{
+  if(["GET","HEAD","OPTIONS"].includes(req.method)||!Object.entries(ROUTES).some(([route,key])=>guardedWork.has(key)&&(req.path.toLowerCase()===route||req.path.toLowerCase().startsWith(route+"/"))))return next();
+  sessions.authenticate(req).then(async u=>{
+    if(!u)return res.status(401).json({message:"Inicia sesión."});
+    // Leads have their own seller / assigned field technician policy.
+    const rights=dossierRights(u,await readCol("departments"));
+    if(!/^\/api\/erp\/leads(?:\/|$)/i.test(req.path)&&!(req.path.toLowerCase().includes("/infra-")?rights.infra:rights.generators))return res.status(403).json({message:"Sin permiso para gestionar estos trabajos."});
+    next();
+  }).catch(()=>res.status(503).json({message:"No se pudo verificar el acceso."}));
+});
+app.use(["/api/technical-providers","/api/technical-certifications","/api/technical-certification-templates"],(req,res,next)=>{
+  if(req.method==="OPTIONS")return next();
+  Promise.resolve().then(async()=>{
+    const u=await sessions.authenticate(req);
+    if(!u)return res.status(401).json({message:"Inicia sesión."});
+    const rights=dossierRights(u,await readCol("departments"));res.set("Cache-Control","private, no-store");
+    if(["GET","HEAD"].includes(req.method)){
+      if(!rights.status)return res.status(403).json({message:"Sin permiso para consultar el directorio."});
+      if(!rights.manager&&req.baseUrl.toLowerCase().includes("providers")){
+        const send=res.json.bind(res),summary=p=>Object.fromEntries(["id","name","companyName","type","region","specialties","active","city","yearsExperience"].filter(k=>Object.hasOwn(p,k)).map(k=>[k,p[k]]));res.json=body=>send(res.statusCode>=400?body:Array.isArray(body)?body.map(summary):summary(body));
+      }
+      return next();
+    }
+    if(!rights.manager)return res.status(403).json({message:"Se requiere CEO o coordinación de Generators."});
+    if(req.baseUrl.toLowerCase().includes("templates"))return next();
+    if(req.method==="DELETE"||req.body?.id!=null||req.baseUrl.toLowerCase().replace(/\/$/,"").endsWith("certifications")&&req.method!=="POST")return res.status(409).json({message:"Se conserva la identidad y el historial. Inactiva el técnico o emite una nueva certificación."});
+    if(req.baseUrl.toLowerCase().includes("certifications")&&(!req.body?.providerId||!(await readCol("technicalProviders")).some(p=>p.id===req.body.providerId)||!Array.isArray(req.body.answers)||!req.body.answers.length||!Array.isArray(req.body.competenciesCertified)||!Number.isFinite(req.body.globalScore)||!(Date.parse(req.body.expiresAt)>Date.parse(req.body.evaluatedAt))))return res.status(400).json({message:"Evaluación o vigencia del certificado inválida."});
+    next();
+  }).catch(()=>res.status(503).json({message:"No se pudo verificar la autorización."}));
+});
 registerDeviceCompat(app,{pool,sessions,readCol});
 const readBaifaInventory = createInventoryReader(odoo);
 registerSalesDocumentRoutes(app, { sessions, pool, readCol, readInventory: readBaifaInventory });
@@ -406,6 +448,7 @@ app.post("/api/sync/migrate", wrap(async (req, res) => {
   }
   const results = {};
   for (const [key, arr] of Object.entries(snapshot)) {
+    if(["technicalProviders","technicalCertifications","technicalCertificationTemplates","departments"].includes(key)||guardedWork.has(key))continue;
     if (!Array.isArray(arr)) continue;
     if (["erpClients","erpClientEquipment","erpLeads"].includes(key) || key.startsWith("baifaClientSync") || key.startsWith("baifa.sales.")) {
       results[key] = {skipped:true, reason:"Colección protegida: usar sus formularios o la sincronización dedicada."};
@@ -439,6 +482,7 @@ app.post("/api/sync/seed", wrap(async (req, res) => {
   }
   const written = {};
   for (const [key, arr] of Object.entries(seed)) {
+    if(["technicalProviders","technicalCertifications","technicalCertificationTemplates","departments"].includes(key)||guardedWork.has(key))continue;
     if (!Array.isArray(arr)) continue;
     if (["erpClients","erpClientEquipment","erpLeads"].includes(key) || key.startsWith("baifaClientSync")) continue;
     const existing = await readCol(key);
@@ -619,7 +663,8 @@ for (const [route, key] of Object.entries(ROUTES)) {
         return res.status(200).json(existing);
       }
     }
-    const nextId = items.reduce((m, it) => Math.max(m, Number(it?.id) || 0), 0) + 1;
+    const historicalMax=key==="technicalProviders"?(await readCol("technicalCertifications")).reduce((m,c)=>Math.max(m,Number(c.providerId)||0),0):0;
+    const nextId = items.reduce((m, it) => Math.max(m, Number(it?.id) || 0), historicalMax) + 1;
     const created = { ...body, id: body.id ?? nextId };
     items.push(created);
     await writeCol(key, items);
