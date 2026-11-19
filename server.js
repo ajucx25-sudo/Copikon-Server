@@ -16,6 +16,7 @@ import { registerPlaybooksRoutes } from "./playbooks.js";
 import { registerSalesDocumentRoutes, SALES_DOCUMENTS_PATH } from "./baifa-sales-documents.js";
 import {workflowSchema,protectPipelineQuotes} from "./flash-quote-workflow.js";
 import {registerDeviceCompat,compatPath,compatSchema} from "./device-compat.js";
+import {registerCorrectiveCalendar} from "./corrective-calendar.js";
 import {dossierPath,dossierSchema,registerDossiers,requiredProviders,guardedWork,statuses,dossierRights} from "./technician-dossier.js";
 import {visibleLead,authorizeLeadWrite,manageLeads} from "./lead-access.js";
 import { registerPricelistsRoutes } from "./pricelists.js";
@@ -226,6 +227,7 @@ const wrap = (fn) => (req, res) =>
   });
 
 const sessions = createSessions(pool, readCol, buildPartnerUser);
+registerCorrectiveCalendar(app,{sessions,readCol});
 registerDossiers(app,{pool,sessions,readCol});
 app.use((req,res,next)=>{
   if(["GET","HEAD","OPTIONS"].includes(req.method)||!Object.entries(ROUTES).some(([route,key])=>guardedWork.has(key)&&(req.path.toLowerCase()===route||req.path.toLowerCase().startsWith(route+"/"))))return next();
