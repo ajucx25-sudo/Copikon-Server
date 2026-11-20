@@ -15,10 +15,13 @@ export function assessFinancing(raw,plan,products,rows=[]){
   const pct=Number(plan.initialPct);
   if(plan.initialPct==null||String(plan.initialPct).trim()===""||!Number.isFinite(pct)||pct<0||pct>=100||Math.abs(pct*100-Math.round(pct*100))>1e-7||downCents(q.total,pct)!==schedule.initial)fail("Revisa el porcentaje de inicial y el monto calculado.");
   const band=quotedBand(q.items,products,rows), count=Number(plan.count);
+  if(plan.selectedBand!=null && plan.selectedBand!=="" &&
+    (!["30","40","50"].includes(String(plan.selectedBand)) || (band && String(band.pct)!==String(plan.selectedBand))))
+    fail("La banda seleccionada no corresponde a la potencia del equipo del inventario.");
   // Never trust approval metadata from the browser. Bind the decision to this draft's commercial terms.
   const key=createHash("sha256").update(JSON.stringify([q.companyName,q.contactName,q.contactPhone,q.contactEmail,q.total,
     q.items.map(i=>[i.productId,i.concepto,i.qty,i.precio]),band,pct,count,plan.firstDate,...(q.companyRif?[q.companyRif]:[])])).digest("hex");
-  return {key,pct,count,initial:schedule.initial/100,band,exception:!band||band.pct!==pct||band.count!==count};
+  return {key,pct,count,initial:schedule.initial/100,band,exception:!band||pct<band.pct||count>band.count};
 }
 export function requireApproval(review,approval){
   if(review?.exception&&review.key!==approval?.key)throw Object.assign(Error("Esta excepción de financiamiento requiere aprobación del CEO. Guarda el borrador para solicitarla."),{status:403});

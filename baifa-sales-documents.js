@@ -466,6 +466,7 @@ export function registerSalesDocumentRoutes(app, { sessions, pool, readCol, read
       count: inputPlan?.count, frequency: inputPlan?.frequency, firstDate: inputPlan?.firstDate,
       method: inputPlan?.method, annualRate: inputPlan?.annualRate,
       initialPct: inputPlan?.initialPct, customTerms:inputPlan?.customTerms==="yes"?"yes":"no",
+      selectedBand: inputPlan?.selectedBand,
     };
     const checkedPlan = financingSchedule(quote.total / 100, plan);
     if (plan.mode === "financiado") {
