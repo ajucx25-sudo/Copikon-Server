@@ -10,6 +10,8 @@ const rawQuote = { companyName: "Cliente de prueba", items: [{ productId: produc
 const plan = { mode: "financiado", initial: 500, surcharge: 25, count: 3, frequency: "mensual", firstDate: "2028-01-31" };
 async function fixture() { const d = await PDFDocument.create(); d.addPage().drawText("BRIEF DE PRUEBA"); return Buffer.from(await d.save()).toString("base64"); }
 test("permission requires internal sales, excludes partners even if admin", () => {
+  for(const external of [{isExternal:true},{isExternalProvider:true},{providerId:9},{level:"tecnico_externo"}])
+    assert.equal(canUseSalesDocuments({username:"admin",moduleAccess:["generators-ventas"],...external}),false);
   for (const u of [null, {}, { level: "coordinador" }, { moduleAccess: ["generators-inventario"] }, { username: "admin", isPartner: true }, { level: "partner_externo", moduleAccess: ["generators-ventas"] }]) assert.equal(canUseSalesDocuments(u), false);
   for (const u of [{ username: "admin" }, { level: "ceo" }, { moduleAccess: '["generators-ventas"]' }]) assert.equal(canUseSalesDocuments(u), true);
 });

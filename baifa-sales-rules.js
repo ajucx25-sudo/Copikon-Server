@@ -88,10 +88,17 @@ export function validateQuote(raw) {
   const total = subtotal + tax;
   if (total <= 0) fail("El total debe ser mayor que cero.");
   if (raw.total == null || raw.total === "" || !Number.isFinite(Number(raw.total)) || Math.abs(cents(raw.total) - total) > 2) fail("Los importes cambiaron. Revisa el total antes de generar.");
-  return { companyName: text(raw.companyName, 250), contactName: text(raw.contactName, 250),
+  return { companyName: text(raw.companyName, 250), companyRif:quoteIdentity(raw.companyRif), contactName: text(raw.contactName, 250),
     contactPhone: text(raw.contactPhone, 80), contactEmail: text(raw.contactEmail, 250),
     number: text(raw.number, 80), validUntil: text(raw.validUntil, 10), notes: text(raw.notes, 4000),
     city: text(raw.city, 80), state: text(raw.state, 80),
     conditions: lines(raw.conditions), complements: lines(raw.complements),
     items, gross, discountAmount, subtotal, tax, total, applyTax: raw.applyTax !== false };
+}
+export function quoteIdentity(input){
+  if(input==null||input==="")return "";
+  if(typeof input!=="string")throw Object.assign(Error("Revisa el RIF o cédula de identidad."),{status:400});
+  const s=input.trim().toUpperCase();
+  if(s&&(s.length>24||! /^(?:[A-Z][ .-]?)?\d(?:[\d .-]*\d)?$/.test(s)))throw Object.assign(Error("Revisa el RIF o cédula de identidad."),{status:400});
+  return s;
 }

@@ -17,7 +17,7 @@ export function assessFinancing(raw,plan,products,rows=[]){
   const band=quotedBand(q.items,products,rows), count=Number(plan.count);
   // Never trust approval metadata from the browser. Bind the decision to this draft's commercial terms.
   const key=createHash("sha256").update(JSON.stringify([q.companyName,q.contactName,q.contactPhone,q.contactEmail,q.total,
-    q.items.map(i=>[i.productId,i.concepto,i.qty,i.precio]),band,pct,count,plan.firstDate])).digest("hex");
+    q.items.map(i=>[i.productId,i.concepto,i.qty,i.precio]),band,pct,count,plan.firstDate,...(q.companyRif?[q.companyRif]:[])])).digest("hex");
   return {key,pct,count,initial:schedule.initial/100,band,exception:!band||band.pct!==pct||band.count!==count};
 }
 export function requireApproval(review,approval){

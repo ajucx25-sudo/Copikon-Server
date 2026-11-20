@@ -43,8 +43,8 @@ test("quote lifecycle: permissions, draft revisions, definitive save, rollback a
     assert.equal((await req("PATCH",id,{...draft,version:1},"8")).s,404);
     const change={...draft,companyName:"Cliente corregido",version:1};assert.equal((await req("PATCH",id,change)).v.version,2);
     assert.equal((await req("PATCH",id,change)).s,409);assert.equal((await req("DELETE",id+"?version=1")).s,409);
-    const saved={...change,status:"guardada",version:2,contactName:"Contacto",contactPhone:"04120000000",contactEmail:"qa@example.test",city:"Barcelona",state:"Anzoátegui",classification:"particular",validUntil:"2026-12-31"};
-    for(const key of ["companyName","contactName","contactPhone","contactEmail","city","state","classification","validUntil"]){
+    const saved={...change,status:"guardada",version:2,companyRif:"v-00123456",contactName:"Contacto",contactPhone:"04120000000",contactEmail:"qa@example.test",city:"Barcelona",state:"Anzoátegui",classification:"particular",validUntil:"2026-12-31"};
+    for(const key of ["companyName","companyRif","contactName","contactPhone","contactEmail","city","state","classification","validUntil"]){
       assert.equal((await req("PATCH",id,{...saved,[key]:"   "})).s,400);
       assert.equal((await req("POST","",{...saved,[key]:"",requestId:randomUUID()})).s,400);
     }
@@ -54,6 +54,7 @@ test("quote lifecycle: permissions, draft revisions, definitive save, rollback a
     assert.equal(await count(),1);
     const lead=(await pool.query("SELECT value FROM kv WHERE key='erpLeads'")).rows[0].value[0];
     assert.equal(lead.stage,"cotizacion");assert.equal(lead.quoteNumber,finals[0].v.number);assert.equal(lead.quoteTotal,"100.00");
+    assert.equal(lead.companyRif,undefined);assert.equal(finals[0].v.companyRif,"V-00123456");
     assert.equal((await req("PATCH",id,{...change,version:3})).s,409);
     assert.equal((await req("DELETE",id+"?version=3")).s,409);
     const financed={...saved,status:"borrador",items:JSON.stringify([{productId:77,concepto:"Generador 77 kVA (TRPE-QA)",precio:100,qty:1}]),requestId:randomUUID()};
@@ -68,6 +69,7 @@ test("quote lifecycle: permissions, draft revisions, definitive save, rollback a
     assert.equal((await pack(plan,{id:fr.v.id,version:1})).status,403);
     assert.equal((await req("POST",fid+"/finance-approval",{...approval,key:"stale"},"admin")).s,409);
     assert.equal((await req("POST",fid+"/finance-approval",approval,"admin")).s,200);
+    assert.equal((await req("PATCH",fid,{...final,companyRif:"V-00999999"})).s,403);
     assert.equal((await pack({...plan,count:5},{id:fr.v.id,version:1})).status,403);
     assert.equal((await pack(plan,undefined)).status,403);
     assert.equal((await pack(plan,{id:fr.v.id,version:1})).status,201);

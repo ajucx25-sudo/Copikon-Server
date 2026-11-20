@@ -1,4 +1,5 @@
 import { isAdministrator } from "./secure-access.js";
+import {quoteIdentity} from "./baifa-sales-rules.js";
 import {isDeepStrictEqual} from "node:util";
 import {assessFinancing,requireApproval} from "./financing-authorization.js";
 import { financingSchedule, validateQuote } from "./baifa-sales-rules.js";
@@ -11,11 +12,12 @@ const fail = (message,status=400) => {throw Object.assign(new Error(message),{st
 const view = r => ({...r.snapshot,id:r.id});
 const same = (a,b) => Object.keys(b).every(k=>JSON.stringify(a[k])===JSON.stringify(b[k]));
 const money = c => (c/100).toFixed(2);
-function requireClosingFields(q){
-  const fields={companyName:"Empresa o referencia",contactName:"Nombre de contacto",contactPhone:"Teléfono",
+function requireClosingFields(q,flash=true){
+  const fields={companyName:"Empresa o referencia",...(flash?{companyRif:"RIF o cédula de identidad"}:{}),contactName:"Nombre de contacto",contactPhone:"Teléfono",
     contactEmail:"Email",city:"Ciudad",state:"Estado",classification:"Clasificación del cliente",validUntil:"Válida hasta"};
   const missing=Object.entries(fields).filter(([k])=>typeof q[k]!=="string"||!q[k].trim()).map(([,name])=>name);
   if(missing.length)fail("Falta completar: "+missing.join(", ")+".");
+  if(flash)quoteIdentity(q.companyRif);
   const date=new Date(q.validUntil+"T00:00:00Z");
   if(!/^\d{4}-\d{2}-\d{2}$/.test(q.validUntil)||!Number.isFinite(+date)||date.toISOString().slice(0,10)!==q.validUntil)fail("Revisa la fecha Válida hasta.");
 }
@@ -30,7 +32,7 @@ export function protectPipelineQuotes(previous,next){
   }
   const sent=new Set(previous.filter(x=>x.quoteStatus==="enviada").map(x=>String(x.id)));
   for(const r of next)if(r.flashQuoteId==null&&r.quoteStatus==="enviada"&&!sent.has(String(r.id)))
-    requireClosingFields({...r,classification:r.priceBand||r.classification,validUntil:r.quoteValidUntil});
+    requireClosingFields({...r,classification:r.priceBand||r.classification,validUntil:r.quoteValidUntil},false);
   const locked=new Map(previous.filter(x=>x.flashQuoteId!=null).map(x=>[String(x.id),x]));
   for(const row of next){
     const old=locked.get(String(row.id));
@@ -44,7 +46,7 @@ export function protectPipelineQuotes(previous,next){
 }
 function snapshot(body) {
   if (!body || !["borrador","guardada"].includes(body.status)) fail("Estado inválido.");
-  const result={};
+  const result={companyRif:quoteIdentity(body.companyRif)};
   for(const [k,max] of Object.entries({companyName:250,contactName:250,contactEmail:250,contactPhone:80,
     classification:64,validUntil:10,notes:4000,city:80,state:80,conditions:8000,complements:8000})){
     const v=body[k]??"";if(typeof v!=="string"||v.length>max) fail(`Revisa el campo ${k}.`);

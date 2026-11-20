@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { PDFDocument } from "pdf-lib";
 import { createPackagePdf } from "./baifa-sales-documents.js";
 import { validateQuote } from "./baifa-sales-rules.js";
+import pdfParse from "pdf-parse/lib/pdf-parse.js";
 
 const base = { companyName: "CLIENTE QA", city: "Barcelona", state: "Anzoátegui", applyTax: false,
   conditions: "Garantía 18 meses o 1.200 horas\n\nIncluye traslado", complements: "Cargador de batería",
@@ -25,6 +26,15 @@ test("quote text inputs are bounded", () => {
   assert.equal(q.conditions.length, 20);
   assert.equal(q.items[1].detalle.length, 40);
   assert.ok(q.items[1].detalle.every(s => s.length <= 300));
+});
+
+test("RIF and cedula retain leading zeros on the printed client block",async()=>{
+  for(const id of ["J-00012345-6","V-00123456","00123456"]){
+    const q=validateQuote({...base,companyRif:id.toLowerCase()});
+    const {text}=await pdfParse(await createPackagePdf(q,{mode:"contado"},[],"FLASH-QA-ID","2026-11-20T12:00:00Z"));
+    assert.ok(text.includes(id));assert.match(text,/RIF\s*\/\s*Cédula/i);
+  }
+  for(const value of ["<script>",{}, "V-123\n45"])assert.throws(()=>validateQuote({...base,companyRif:value}));
 });
 
 test("package PDF: quotation, one annex page and payment plan share the proforma number", async () => {

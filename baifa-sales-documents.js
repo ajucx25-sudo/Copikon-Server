@@ -17,7 +17,7 @@ const BRANDS_PNG = readFileSync(new URL("./assets/copikon-generators-marcas.png"
 const SLOGAN_PNG = readFileSync(new URL("./assets/copikon-generators-eslogan.png", import.meta.url));
 const UUID = /^[a-f0-9-]{36}$/i;
 const error = (message, status = 400) => Object.assign(new Error(message), { status });
-export const canUseSalesDocuments = user => !!user && !user.isPartner && user.level !== "partner_externo" &&
+export const canUseSalesDocuments = user => !!user && !user.isPartner && !user.isExternal && !user.isExternalProvider && user.providerId==null && !["partner_externo","tecnico_externo"].includes(user.level) &&
   (isAdministrator(user) || permissionList(user.moduleAccess).includes("generators-ventas"));
 const publicMeta = ({ dataBase64, quote, plan, flashOwnerId, ...meta }) => meta;
 // Reversible history-only retirement of the 12 reviewed legacy packages.
@@ -159,6 +159,7 @@ export async function createPackagePdf(quote, plan, briefs, number, now, meta = 
   text("PARA:", L, cy, 8, bold, red); cy -= 12;
   wrap(quote.companyName || quote.contactName, bold, 10, 290).slice(0, 3).forEach(row => { text(row, L, cy, 10, bold); cy -= 12.5; });
   const kv = (x, yy, k, v) => { text(`${k}:`, x, yy, 8, bold); text(wrap(v, font, 8.5, 175)[0], x + 62, yy, 8.5); };
+  if (quote.companyRif) { kv(L, cy, "RIF / Cédula", quote.companyRif); cy -= 11; }
   if (quote.companyName && quote.contactName) { kv(L, cy, "Contacto", quote.contactName); cy -= 11; }
   if (quote.contactPhone) { kv(L, cy, "Teléfono", quote.contactPhone); cy -= 11; }
   if (quote.contactEmail) { kv(L, cy, "Correo", quote.contactEmail); cy -= 11; }
@@ -428,12 +429,12 @@ export function registerSalesDocumentRoutes(app, { sessions, pool, readCol, read
       const params=[`baifa.sales.${kind}:%`,String(req.salesUser.id),isAdministrator(req.salesUser)];
       const historyFilter=kind==="package"?" AND (value ? 'flashQuoteId' OR NOT (encode(sha256(convert_to(coalesce(value->>'number',''),'UTF8')),'hex') = ANY($4::text[])))":"";
       if(kind==="package")params.push(retiredLegacyPackageDigests);
-      const rows = await pool.query("SELECT value - 'dataBase64' - 'quote' - 'plan' AS value FROM kv WHERE key LIKE $1 AND (NOT (value ? 'flashQuoteId') OR value->>'flashOwnerId'=$2 OR $3)"+historyFilter+" ORDER BY updated_at DESC LIMIT 500", params);
+      const rows = await pool.query("SELECT value - 'dataBase64' - 'quote' - 'plan' AS value FROM kv WHERE key LIKE $1 AND (NOT (value ? 'flashQuoteId' OR value ? 'flashOwnerId') OR value->>'flashOwnerId'=$2 OR $3)"+historyFilter+" ORDER BY updated_at DESC LIMIT 500", params);
       res.json(rows.rows.map(r => publicMeta(r.value)));
     }));
     router.get(`/${route}/:id/download`, handle(async (req, res) => {
       const value = await load(kind, req.params.id);
-      if(value.flashQuoteId!=null&&String(value.flashOwnerId)!==String(req.salesUser.id)&&!isAdministrator(req.salesUser))throw error("Documento no encontrado.",404);
+      if((value.flashQuoteId!=null||value.flashOwnerId!=null)&&String(value.flashOwnerId)!==String(req.salesUser.id)&&!isAdministrator(req.salesUser))throw error("Documento no encontrado.",404);
       res.set({ "Content-Type": "application/pdf", "Content-Disposition": `attachment; filename="${encodeURIComponent(value.filename)}"`, "Content-Security-Policy": "sandbox" });
       res.send(Buffer.from(value.dataBase64, "base64"));
     }));
@@ -502,6 +503,7 @@ export function registerSalesDocumentRoutes(app, { sessions, pool, readCol, read
     const record = { id, number, filename: `${number}.pdf`, companyName: quote.companyName || quote.contactName, total: quote.total / 100,
       createdAt: now, createdBy: req.salesUser.id, briefIds: ids, quote, plan, size: bytes.length, dataBase64: bytes.toString("base64") };
     const link=req.body.workflow;
+    if(quote.companyRif)record.flashOwnerId=req.salesUser.id;
     if(link!=null&&(typeof link!=="object"||Array.isArray(link)))throw error("Vínculo de borrador inválido.");
     await save(`baifa.sales.package:${id}`, record,link==null?null:async db=>{
       const choices=Object.fromEntries(quoted.map(p=>[String(p.id),briefs.find(b=>b.productId===String(p.id))?.id||""]));
