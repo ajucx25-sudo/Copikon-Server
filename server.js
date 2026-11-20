@@ -30,6 +30,7 @@ import { registerBaifaClientSync, isBaifaSyncPath } from "./baifa-client-sync.js
 import { registerMonthlyClose } from "./baifa-monthly-close.js";
 import { registerInventory, isInventoryPath } from "./generators-inventory.js";
 import { registerInventory as registerBaifaInventory, createInventoryReader } from "./baifa-inventory.js";
+import {registerInventoryComparison} from "./inventory-comparison.js";
 import { registerPosventaClientSync, POSVENTA_SYNC_POLICY } from "./posventa-client-sync.js";
 import {isEquipmentResource, isEquipmentDocumentResource, EQUIPMENT_DOCUMENT_KEYS, validateEquipmentDocuments} from "./equipment-reference-access.js";
 import { randomBytes } from "node:crypto";
@@ -320,6 +321,7 @@ registerBaifaClientSync(app, {odoo, readCol, pool, wrap});
 registerMonthlyClose(app, {odoo, wrap});
 registerInventory(app, {odoo, wrap});
 registerBaifaInventory(app, {odoo, wrap, readInventory: readBaifaInventory});
+registerInventoryComparison(app,{odoo,readCol,readInventory:readBaifaInventory});
 registerPosventaClientSync(app, {readCol, writeCol, wrap});
 
 app.patch("/api/generators/posventa/equipment/:id", wrap(async (req,res) => {
