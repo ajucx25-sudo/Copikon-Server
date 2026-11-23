@@ -327,7 +327,7 @@ registerMonthlyClose(app, {odoo, wrap});
 registerInventory(app, {odoo, wrap});
 registerBaifaInventory(app, {odoo, wrap, readInventory: readBaifaInventory});
 registerInventoryComparison(app,{odoo,readCol,readInventory:readBaifaInventory});
-registerInventorySheet(app,{readCol,pool,inInventory:async code=>(await comparison({odoo,readCol,readInventory:readBaifaInventory})).rows.some(r=>r.code===code)});
+registerInventorySheet(app,{readCol,pool,inInventory:async code=>(await comparison({odoo,readCol,readInventory:readBaifaInventory})).rows.find(r=>r.code===code)});
 registerPosventaClientSync(app, {readCol, writeCol, wrap});
 
 app.patch("/api/generators/posventa/equipment/:id", wrap(async (req,res) => {
@@ -887,7 +887,7 @@ function mapOdooProduct(op, existingByOdooId = new Map(), existingBySku = new Ma
 
   // Modelo
   const modelRaw = toStrOrEmpty(op.x_studio_modelo);
-  if (modelRaw) base.model = modelRaw;
+  if (modelRaw&&!base.modelManual) base.model = modelRaw;
 
   // Garantía (selection Odoo)
   if (Array.isArray(op.x_studio_garantia) && op.x_studio_garantia.length >= 2) {
@@ -905,7 +905,7 @@ function mapOdooProduct(op, existingByOdooId = new Map(), existingBySku = new Ma
 
   // Descripción corta
   const desc = toStrOrEmpty(op.description_sale) || toStrOrEmpty(op.description);
-  if (desc) base.description = desc;
+  if (desc&&!base.descriptionManual) base.description = desc;
 
   return base;
 }

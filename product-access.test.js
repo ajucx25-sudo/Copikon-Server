@@ -32,7 +32,8 @@ test("Servidor completo: permisos sobre catálogo compartido, ficha, importació
       assert.equal((await request(route,role,method,body)).status,403);
     }
     const initial=await(await request(sheet,boss)).json();assert.equal(initial.editable,true);
-    const [price,stock]=await Promise.all([request(sheet,boss,"PATCH",{revision:initial.product.revision,changes:{priceExpress:35,imageUrl:"https://example.org/manual.jpg"}}),request(item,wms,"PATCH",{stock:9})]);assert.equal(price.status,200);assert.equal(stock.status,200);
+    const [price,stock]=await Promise.all([request(sheet,boss,"PATCH",{revision:initial.product.revision,changes:{priceExpress:35,imageUrl:"https://example.org/manual.jpg",gallery:["https://example.org/lado.jpg"],motorBrand:"Motor persistido",model:"Serie QA",description:"Descripción QA"}}),request(item,wms,"PATCH",{stock:9})]);assert.equal(price.status,200);assert.equal(stock.status,200);
+    const reopened=(await(await request(sheet,boss)).json()).product;assert.equal(reopened.technical.motorBrand,"Motor persistido");assert.deepEqual(reopened.gallery,["https://example.org/lado.jpg"]);assert.equal(reopened.priceExpress,35);assert.equal(reopened.imageUrl,"https://example.org/manual.jpg");
     const updated=await(await request(item,boss)).json();assert.equal(updated.priceExpress,35);assert.equal(updated.imageSource,"manual");assert.equal(updated.stock,9);
   }finally{if(child&&child.exitCode===null&&child.signalCode===null){const ended=once(child,"exit");child.kill();await ended;}await pool.end();await admin.query(`DROP DATABASE ${db}`);await admin.end();}
 });
