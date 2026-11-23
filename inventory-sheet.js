@@ -6,6 +6,7 @@ import {photoFromEdit} from "./catalog-photo.js";
 const path="/api/generators/inventory/product-sheet";
 const amounts=["priceExpress","priceDirect","priceAllies"];
 const fields=["imageUrl","salePrice",...amounts,...amounts.map(k=>k+"Pct")];
+const technicalFields="brand model category description shortDescription kva kvaNumeric kw voltage phases frequency controlPanel motorBrand motorModel motorType motorCylinders motorRpm motorDisplacement alternatorBrand alternatorModel alternatorType fuelCapacity fuelConsumption runtime towerHeight lightPower lightType coverageArea dimensions weight noiseLevel enclosure".split(" ");
 const fail=(status,message)=>{throw Object.assign(Error(message),{status});};
 function find(items,code){
   const matches=items.filter(p=>String(p.code||p.sku||"").trim()===code);
@@ -16,6 +17,9 @@ function find(items,code){
 function project(p){
   if(!p)return null;
   const product=Object.fromEntries(fields.map(k=>[k,p[k]??null]));
+  const scalar=v=>(typeof v==="string"&&v.trim()!=="")||Number.isFinite(v);
+  product.technical=Object.fromEntries(technicalFields.filter(k=>scalar(p[k])).map(k=>[k,p[k]]));
+  if(scalar(p.rentalPrice))product.rentalPrice=p.rentalPrice;
   return {...product,revision:createHash("sha256").update(JSON.stringify([p.id,product])).digest("hex")};
 }
 function update(items,code,body){
