@@ -18,6 +18,13 @@ test("Despacho: ocho rutas exactas menos reservas; sin RMA, sububicaciones ni tr
  assert.equal(freeForDispatch(locations),8);
 });
 const sku="BF-C90SAE-60";
+test("el tablero recibe solo campos de valoración de la ficha; los duplicados no se valoran",async()=>{
+ const {deps}=fixture(),p={code:sku,priceExpress:100,priceDirect:90,priceAlliesPct:-15,costPrice:80};
+ deps.readCol=async()=>[p];
+ const get=async()=>(await comparison(deps)).rows.find(x=>x.code===sku).sheetPrices;
+ assert.deepEqual(await get(),{priceExpress:100,priceDirect:90,priceAlliesPct:-15});
+ deps.readCol=async()=>[p,p];assert.equal(await get(),null);
+});
 function fixture(){
  const products=[{id:51,default_code:sku,uom_id:[1,"Unidades"]},{id:52,default_code:sku,uom_id:[1,"Unidades"]},{id:53,default_code:"ATS-BAIFA",uom_id:[1,"Unidades"]}];
  const locations=[{id:1,complete_name:"ATR/Stock",warehouse_id:[4,"Atrium"],company_id:[7,"Compañía"]},{id:2,complete_name:"GEN/Stock",warehouse_id:[5,"Generators"],company_id:[7,"Compañía"]}];

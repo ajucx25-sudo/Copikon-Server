@@ -55,6 +55,9 @@ export async function comparison({odoo,readCol,readInventory}){
     const r=map.get(code);if(!r.catalogName&&p.name)r.catalogName=p.name;
     if(p.kva||p.kvaNumeric)r.power=String(p.kva||`${p.kvaNumeric} kVA`);}
   const original=[...map.values()];
+  // Only the inventory comparison carries all three commercial tiers. Never add
+  // these fields to the separate seller-catalog projection or return cost fields.
+  const tierKeys=["salePrice","priceExpress","priceExpressPct","priceDirect","priceDirectPct","priceAllies","priceAlliesPct"];
   try{
     const fields=await odoo.execute("product.product","fields_get",[],{attributes:["type"]});
     const clauses=[["name","ilike","BAIFA"],["default_code","=ilike","TRPE%"],["default_code","=ilike","VTM%"],
@@ -63,6 +66,13 @@ export async function comparison({odoo,readCol,readInventory}){
     const candidates=await all(odoo,"product.product",[...scop,...Array(clauses.length-1).fill("|"),...clauses],["id","default_code","name"],50000,context);
     for(const p of candidates)if(typeof p.default_code==="string"&&p.default_code.trim()&&!map.has(p.default_code))map.set(p.default_code,{code:p.default_code,name:p.name,commercial:null,pending:null,credits:null,locations:null,physicalOnly:true});
     const codes=[...map.keys()],rows=[...map.values()];
+    const seenSheets=new Set();
+    for(const p of catalog){
+      const code=String(p.code||p.sku||"").trim(),r=map.get(code);
+      if(!r)continue;
+      r.sheetPrices=seenSheets.has(code)?null:Object.fromEntries(tierKeys.filter(k=>typeof p[k]==="number"||typeof p[k]==="string").map(k=>[k,p[k]]));
+      seenSheets.add(code);
+    }
     const priceFields=["list_price","currency_id","company_id"];
     const withPrices=priceFields.every(k=>Object.hasOwn(fields,k));
     const prods=[], seen=new Set();
