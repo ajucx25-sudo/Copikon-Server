@@ -6,6 +6,9 @@
   "scripts": {
     "start": "node server.js"
   },
+  "overrides": {
+    "proxy-addr": "2.0.8"
+  },
   "dependencies": {
     "compression": "^1.8.1",
     "cors": "^2.8.5",
