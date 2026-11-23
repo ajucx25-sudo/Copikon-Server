@@ -1,6 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import express from "express";
+import compression from "compression";
+import {gzipSync} from "node:zlib";
 import {comparison,registerInventoryComparison,freeForDispatch} from "./inventory-comparison.js";
 test("Despacho: ocho rutas exactas menos reservas; sin RMA, sububicaciones ni tránsito",()=>{
  const locations=["ccs/stock","BTO/Stock","TDA-B/Stock","INV/Stock","ATR/Stock","VAL/Stock","MCY/Stock","GEN/Stock"].map(name=>({name,quantity:2,reserved:1}));
@@ -62,4 +64,32 @@ test("Catálogo de solo lectura para ventas: no concede acceso a campos de inven
  const row=(await resp.json()).products.find(p=>p.code===sku);assert.ok(row);
  for(const k of ["costPrice","locations","orders","commercial","pending","credits"])assert.equal(k in row,false);
  }finally{s.close();}
+});
+
+test("JSON sin comprimir y con gzip; Inventario y Catálogo conservan contenido y permisos con gzip",async()=>{
+ const {deps}=fixture(),app=express();
+ const readCol=deps.readCol;
+ deps.readCol=async(...args)=>[...await readCol(...args),{code:sku,name:"Equipo de prueba ".repeat(120),brand:"BAIFA",category:"generador"}];
+ app.use(compression({level:6,threshold:1024}));
+ app.use(express.json({limit:"150mb"}));
+ app.post("/qa/echo",(req,res)=>res.json(req.body));
+ app.use((req,res,next)=>{if(req.headers.role)req.verifiedUser={level:"vendedor",moduleAccess:JSON.stringify([req.headers.role])};next()});
+ registerInventoryComparison(app,deps);
+ const s=app.listen(0,"127.0.0.1");await new Promise(r=>s.once("listening",r));
+ try{const base=`http://127.0.0.1:${s.address().port}`,payload={producto:"Prueba",unidades:2};
+   for(const zipped of [false,true]){
+     const body=JSON.stringify(payload),r=await fetch(base+"/qa/echo",{method:"POST",headers:{"Content-Type":"application/json",...(zipped?{"Content-Encoding":"gzip"}:{})},body:zipped?gzipSync(body):body});
+     assert.equal(r.status,200);assert.deepEqual(await r.json(),payload);
+   }
+   for(const [route,role,key] of [["inventory/comparison","generators-inventario","rows"],["seller-catalog","generators-ventas","products"]]){
+     const url=`${base}/api/generators/${route}`; assert.equal((await fetch(url,{headers:{"Accept-Encoding":"gzip"}})).status,401);
+     let reference;
+     for(const encoding of ["identity","gzip"]){
+       const r=await fetch(url,{headers:{role,"Accept-Encoding":encoding}});assert.equal(r.status,200);
+       assert.equal(r.headers.get("content-encoding"),encoding==="gzip"?"gzip":null);
+       const rows=(await r.json())[key];assert.ok(rows.some(x=>x.code===sku));
+       if(reference)assert.deepEqual(rows,reference);else reference=rows;
+     }
+   }
+ }finally{await new Promise(resolve=>s.close(resolve));}
 });
