@@ -30,7 +30,10 @@ import { registerBaifaClientSync, isBaifaSyncPath } from "./baifa-client-sync.js
 import { registerMonthlyClose } from "./baifa-monthly-close.js";
 import { registerInventory, isInventoryPath } from "./generators-inventory.js";
 import { registerInventory as registerBaifaInventory, createInventoryReader } from "./baifa-inventory.js";
-import {registerInventoryComparison} from "./inventory-comparison.js";
+import {comparison,registerInventoryComparison} from "./inventory-comparison.js";
+import {registerInventorySheet} from "./inventory-sheet.js";
+import {photoFromSync,photoFromEdit,withCatalogLock} from "./catalog-photo.js";
+import {productAccess,productRead,productCollectionWrite} from "./product-access.js";
 import { registerPosventaClientSync, POSVENTA_SYNC_POLICY } from "./posventa-client-sync.js";
 import {isEquipmentResource, isEquipmentDocumentResource, EQUIPMENT_DOCUMENT_KEYS, validateEquipmentDocuments} from "./equipment-reference-access.js";
 import { randomBytes } from "node:crypto";
@@ -217,7 +220,8 @@ app.use((req, res, next) => [SALES_DOCUMENTS_PATH,compatPath,dossierPath].some(p
   ? next() : legacyJsonParser(req, res, next));
 
 const wrap = (fn) => (req, res) =>
-  Promise.resolve(requiresCollectionTransaction(req.path, req.method)
+  Promise.resolve(productCollectionWrite(req.path,req.method)
+    ? runCollectionTransaction(pool,req,res,fn,true) : requiresCollectionTransaction(req.path, req.method)
     ? runCollectionTransaction(pool, req, res, fn) : fn(req, res)).catch((err) => {
     console.error("[handler]", err);
     const status = Number(err?.status);
@@ -228,6 +232,7 @@ const wrap = (fn) => (req, res) =>
   });
 
 const sessions = createSessions(pool, readCol, buildPartnerUser);
+app.use(productAccess(sessions));
 registerCorrectiveCalendar(app,{sessions,readCol});
 registerDossiers(app,{pool,sessions,readCol});
 app.use((req,res,next)=>{
@@ -322,6 +327,7 @@ registerMonthlyClose(app, {odoo, wrap});
 registerInventory(app, {odoo, wrap});
 registerBaifaInventory(app, {odoo, wrap, readInventory: readBaifaInventory});
 registerInventoryComparison(app,{odoo,readCol,readInventory:readBaifaInventory});
+registerInventorySheet(app,{readCol,pool,inInventory:async code=>(await comparison({odoo,readCol,readInventory:readBaifaInventory})).rows.some(r=>r.code===code)});
 registerPosventaClientSync(app, {readCol, writeCol, wrap});
 
 app.patch("/api/generators/posventa/equipment/:id", wrap(async (req,res) => {
@@ -631,7 +637,7 @@ app.get("/api/sales-partners/:id", wrap(async (req, res) => {
 for (const [route, key] of Object.entries(ROUTES)) {
   // Skip GET para sales-partners (ya manejado arriba con sanitización)
   if (route !== "/api/sales-partners") {
-    app.get(route, wrap(async (req, res) => {const all=await readCol(key);res.json(key==="erpLeads"?all.filter(l=>visibleLead(req.verifiedUser,l)):all);}));
+    app.get(route, wrap(async (req, res) => {const all=await readCol(key);res.json(key==="erpLeads"?all.filter(l=>visibleLead(req.verifiedUser,l)):key==="erpProducts"?all.map(p=>productRead(p,req.verifiedUser)):all);}));
   }
 
   if (route !== "/api/sales-partners") {
@@ -643,7 +649,7 @@ for (const [route, key] of Object.entries(ROUTES)) {
       const item = items.find((x) => Number(x.id) === id);
       if(key==="erpLeads"&&!visibleLead(req.verifiedUser,item))return res.status(404).json({message:"not found"});
       if (!item) return res.status(404).json({ message: "not found" });
-      res.json(item);
+      res.json(key==="erpProducts"?productRead(item,req.verifiedUser):item);
     }));
   }
 
@@ -670,6 +676,7 @@ for (const [route, key] of Object.entries(ROUTES)) {
     const historicalMax=key==="technicalProviders"?(await readCol("technicalCertifications")).reduce((m,c)=>Math.max(m,Number(c.providerId)||0),0):0;
     const nextId = items.reduce((m, it) => Math.max(m, Number(it?.id) || 0), historicalMax) + 1;
     const created = { ...body, id: body.id ?? nextId };
+    if(key==="erpProducts")Object.assign(created,photoFromEdit(null,body));
     items.push(created);
     await writeCol(key, items);
     res.status(201).json(created);
@@ -690,9 +697,9 @@ for (const [route, key] of Object.entries(ROUTES)) {
     const idx = items.findIndex((x) => matchId(x, rawId));
     if (idx < 0) return res.status(404).json({ message: "not found" });
     if(key==="erpLeads")authorizeLeadWrite(req.verifiedUser,items[idx],req.body,"PATCH");
-    items[idx] = { ...items[idx], ...(req.body || {}) };
+    items[idx] = { ...items[idx], ...(req.body || {}), ...(key==="erpProducts"?photoFromEdit(items[idx],req.body||{}):{}) };
     await writeCol(key, items);
-    res.json(items[idx]);
+    res.json(key==="erpProducts"?productRead(items[idx],req.verifiedUser):items[idx]);
   }));
 
   app.put(`${route}/:id`, wrap(async (req, res) => {
@@ -702,7 +709,7 @@ for (const [route, key] of Object.entries(ROUTES)) {
     if (idx < 0) return res.status(404).json({ message: "not found" });
     const preservedId = items[idx].id; // preservar id string tal cual
     if(key==="erpLeads")authorizeLeadWrite(req.verifiedUser,items[idx],req.body,"PUT");
-    items[idx] = { ...items[idx], ...(req.body || {}), id: preservedId };
+    items[idx] = { ...items[idx], ...(req.body || {}), ...(key==="erpProducts"?photoFromEdit(items[idx],req.body||{}):{}), id: preservedId };
     await writeCol(key, items);
     res.json(items[idx]);
   }));
@@ -811,12 +818,6 @@ function toStrOrEmpty(v) {
   return String(v).trim();
 }
 
-function odooBinaryToDataUrl(b64) {
-  if (!b64 || typeof b64 !== "string") return "";
-  // Odoo devuelve la imagen como base64 sin prefijo
-  return `data:image/jpeg;base64,${b64}`;
-}
-
 // Mapea un product.product de Odoo al shape de erpProducts en Copikon
 function mapOdooProduct(op, existingByOdooId = new Map(), existingBySku = new Map()) {
   const sku = toStrOrEmpty(op.default_code) || toStrOrEmpty(op.barcode);
@@ -900,25 +901,7 @@ function mapOdooProduct(op, existingByOdooId = new Map(), existingBySku = new Ma
   base.syncStatus = "odoo";
   base.lastSyncAt = new Date().toISOString();
 
-  // Imagen: PRESERVA la imagen manual del usuario (data URL o http subido).
-  // Solo sobreescribe si viene inline de Odoo, o si el producto no tenía ninguna
-  // imagen previa (en cuyo caso apunta al endpoint on-demand de Odoo).
-  //
-  // Se considera "imagen manual" cualquier data URL (data:image/...) o URL http/https
-  // — el usuario la subió desde el módulo Inventario y NO debe perderse en el sync.
-  const existingImg = String(base.imageUrl || "");
-  const isManualImage = existingImg.startsWith("data:image/") || /^https?:\/\//i.test(existingImg);
-  if (op.image_128) {
-    // Si Odoo trae imagen inline, la usa (fuente autoritativa cuando existe en ERP)
-    base.imageUrl = odooBinaryToDataUrl(op.image_128);
-  } else if (isManualImage) {
-    // PRESERVAR imagen manual subida por el usuario — no pisarla con el proxy
-  } else if (op.id) {
-    // Sin imagen manual ni imagen inline: proxy on-demand a Odoo
-    base.imageUrl = `/api/erp/products/odoo-image/${op.id}`;
-  } else if (!base.imageUrl) {
-    base.imageUrl = "";
-  }
+  Object.assign(base,photoFromSync(existing,op));
 
   // Descripción corta
   const desc = toStrOrEmpty(op.description_sale) || toStrOrEmpty(op.description);
@@ -1042,7 +1025,8 @@ async function syncOdooCatalog({ limit = 25000, includeImages = false } = {}) {
   const dedupedRows = [...bySku.values(), ...noSku];
   console.log(`[syncOdooCatalog] dedup por SKU: ${odooRows.length} → ${dedupedRows.length} (removidos ${dedupedOut} duplicados de company alt)`);
 
-  // 2. Cargar productos manuales existentes
+  const {total,created,updated,purged}=await withCatalogLock(pool,collectionContext,async()=>{
+  // 2. Leer la última foto manual después de obtener el bloqueo.
   const manual = await readCol("erpProducts");
   const existingByOdooId = new Map();
   const existingBySku = new Map();
@@ -1114,19 +1098,21 @@ async function syncOdooCatalog({ limit = 25000, includeImages = false } = {}) {
 
   // 4. Guardar en kv.erpProducts
   await writeCol("erpProducts", finalArr);
+  return {total:finalArr.length,created,updated,purged};
+  });
 
   // 5. Registrar la sincronización
   const meta = {
     lastSyncAt: new Date().toISOString(),
     odooCount: odooRows.length,
     odooDeduped: dedupedRows.length,
-    total: finalArr.length,
+    total,
     created,
     updated,
     purged,
     companyId: copikonCompanyId,
     language: catalogLang,
-    manualPreserved: finalArr.length - created - updated,
+    manualPreserved: total - created - updated,
   };
   await pool.query(
     `INSERT INTO kv (key, value, updated_at) VALUES ($1, $2::jsonb, $3)

@@ -14,7 +14,7 @@ export const requiresCollectionTransaction = (path, method) => leadWriter(path,m
    /^\/api\/pricelists(?:\/|$)/i.test(path) ||
    /^\/api\/sync\/(?:migrate|seed)$/i.test(path));
 
-export async function runCollectionTransaction(pool, req, res, fn) {
+export async function runCollectionTransaction(pool, req, res, fn, lockProducts=false) {
   const db = await pool.connect();
   const originalJson = res.json;
   let response, hasResponse = false;
@@ -24,6 +24,10 @@ export async function runCollectionTransaction(pool, req, res, fn) {
     await db.query("BEGIN");
     await db.query("SELECT pg_advisory_xact_lock(41577113)");
     if(!leadWriter(req.path,req.method))await db.query("SELECT pg_advisory_xact_lock($1)", [CLIENT_LOCK]);
+    if(lockProducts){
+      await db.query("INSERT INTO kv(key,value,updated_at) VALUES($1,'[]'::jsonb,$2) ON CONFLICT(key) DO NOTHING",["erpProducts",Date.now()]);
+      await db.query("SELECT key FROM kv WHERE key=$1 FOR UPDATE",["erpProducts"]);
+    }
     if(leadWriter(req.path,req.method)||/^\/api\/sync\/(?:seed|migrate)\/?$/i.test(req.path))await db.query("SELECT pg_advisory_xact_lock($1)",[LEAD_LOCK]);
     await collectionContext.run(db, () => fn(req, res));
     if (!hasResponse) throw Error("La operación no generó una respuesta.");

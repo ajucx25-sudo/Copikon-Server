@@ -33,6 +33,7 @@ function fixture({ lang = "es_VE", contextError = false, pages = [[]] } = {}) {
     },
   };
   const sandbox = {
+    collectionContext:{},withCatalogLock:async(_pool,_context,merge)=>merge(),
     odoo,
     getOdooProductAvailableFields: async () => new Set(),
     getCopikonCompanyId: async () => 12,

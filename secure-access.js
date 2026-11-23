@@ -42,6 +42,7 @@ export function permissionList(value) {
 }
 export const isAdministrator = user => user?.level === "ceo" || user?.username === "admin";
 export function canAccessPath(user, path, method) {
+  if(path==="/api/generators/inventory/product-sheet"&&method==="PATCH")return !!user&&!user.isPartner&&user.level!=="partner_externo"&&isAdministrator(user);
   if (/^\/api\/generators\/seller-catalog\/?$/.test(path)) return !!user && ["GET","HEAD"].includes(method) &&
     !user.isPartner && user.level!=="partner_externo" && (isAdministrator(user) ||
     permissionList(user.moduleAccess).some(m=>["generators-inventario","generators-ventas"].includes(m)));
