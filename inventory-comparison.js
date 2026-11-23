@@ -6,6 +6,28 @@ export function freeForDispatch(locations){return Math.max(0,locations.filter(l=
 const id=v=>Array.isArray(v)?v[0]:v;
 const positive=v=>Number.isSafeInteger(v)&&v>0;
 const requireValue=v=>{if(!v)throw Error("Lectura de inventario incompleta");};
+// Compare dispatch paths only, not balances: equal numbers can be genuine stock.
+// Within the RIF-verified companies the current company is COPIKON C.A.;
+// the historical COPIKON VENEZUELA C.A. can have an identically named location.
+const companyKey=n=>String(n||"").toUpperCase().replace(/[^A-Z0-9]/g,"").replace(/J294654568$/,"");
+function dispatchReadings(buckets,locations,companies){
+  const current=companies.filter(c=>companyKey(c.name)==="COPIKONCA");
+  const operative=current.length===1?current[0].id:null;
+  const others=[],groups=new Map();
+  for(const [lid,v] of buckets||[]){
+    const key=v.name.trim().toUpperCase();
+    if(!dispatchPaths.has(key)){others.push(v);continue;}
+    if(!groups.has(key))groups.set(key,[]);
+    groups.get(key).push({value:v,company:id(locations.get(lid).company_id)});
+  }
+  for(const group of groups.values()){
+    if(group.length===1){others.push(group[0].value);continue;}
+    const live=group.filter(g=>g.company===operative);
+    if(live.length!==1||!group.every(g=>g.company===operative||companies.some(c=>c.id===g.company&&companyKey(c.name)==="COPIKONVENEZUELACA")))return null;
+    others.push(live[0].value);
+  }
+  return others.sort((a,b)=>a.name.localeCompare(b.name));
+}
 export const localScope=p=>/^(TRPE|VTM)/i.test(p.code||p.sku||"")||
   (!["service","servicio"].includes(String(p.type||p.category||"").trim().toLowerCase())&&
     (["baifa","copikon_gen"].includes(String(p.brand||"").trim().toLowerCase())||
@@ -49,7 +71,7 @@ export async function comparison({odoo,readCol,readInventory}){
         seen.add(q.id);if(!q.quantity&&!q.reserved_quantity)continue;if(!totals.has(code))totals.set(code,new Map());const buckets=totals.get(code);
         const v=buckets.get(lid)||{name:l.complete_name,warehouse:l.warehouse_id?.[1]||"Sin almacén asignado",quantity:0,reserved:0};v.quantity+=q.quantity;v.reserved+=q.reserved_quantity;buckets.set(lid,v);}
     }
-    for(const r of rows)if(units.has(r.code)&&!conflict.has(r.code))r.locations=[...(totals.get(r.code)?.values()||[])].sort((a,b)=>a.name.localeCompare(b.name));
+    for(const r of rows)if(units.has(r.code)&&!conflict.has(r.code))r.locations=dispatchReadings(totals.get(r.code),locations,c.companies);
     return {rows:rows.filter(r=>!r.physicalOnly||r.locations===null||r.locations.some(l=>l.quantity||l.reserved)),commercialAt:c.observedAt,physicalAt:new Date().toISOString()};
   }catch{return {rows:original.map(r=>({...r,locations:null})),commercialAt:c.observedAt,physicalAt:null};}
 }

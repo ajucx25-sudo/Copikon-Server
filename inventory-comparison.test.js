@@ -17,13 +17,24 @@ function fixture(){
  const quants=[{id:1,product_id:51,location_id:1,quantity:1,reserved_quantity:0},{id:2,product_id:52,location_id:2,quantity:2,reserved_quantity:1},{id:3,product_id:53,location_id:2,quantity:8,reserved_quantity:0}];
  const odoo={execute:async()=>({}),searchRead:async(m,d)=>{assert.ok(d.some(x=>x[0]==="company_id"));return m==="stock.quant"?quants:m==="stock.location"?locations:products;}};
  const deps={odoo,readInventory:async()=>({source:"odoo-po-invoices",complete:true,observedAt:new Date().toISOString(),companies:[{id:7}],rows:[{code:sku,name:"Generador",uomId:1,uomLabel:"Unidades",productIds:[51,52],balance:-2,pending:0,creditUnits:5}]}),readCol:async()=>[{code:"SIN-VINCULO",brand:"BAIFA",category:"generador"}]};
- return {deps,products,quants};
+ return {deps,products,quants,locations};
 }
 test("3 físicas en dos almacenes, una reservada, sin sumar saldo −2 ni cinco NC; incluye existencia sin PO",async()=>{
  const {deps}=fixture(),r=await comparison(deps);assert.ok(r.physicalAt);
  const p=r.rows.find(r=>r.code===sku);assert.equal(p.commercial,-2);assert.deepEqual(p.locations.map(l=>[l.name,l.quantity,l.reserved]),[["ATR/Stock",1,0],["GEN/Stock",2,1]]);
  assert.equal(r.rows.find(r=>r.code==="ATS-BAIFA").commercial,null);assert.equal(r.rows.find(r=>r.code==="ATS-BAIFA").locations[0].quantity,8);
  assert.equal(r.rows.find(r=>r.code==="SIN-VINCULO").locations,null);
+});
+test("CTMQ4-400: BTO operativo no duplica el BTO histórico; conserva quants y reservas legítimos",async()=>{
+ const {deps,locations,quants,products}=fixture(),code="CTMQ4-400";
+ products[0].default_code=products[1].default_code=code;
+ const prev=deps.readInventory;deps.readInventory=async()=>{const c=await prev();c.rows[0].code=code;c.companies=[{id:7,name:"COPIKON C.A."},{id:8,name:"COPIKON VENEZUELA, C.A."}];return c;};
+ locations[0].complete_name=locations[1].complete_name="BTO/Stock";locations[0].company_id=[8,"Histórica"];
+ quants[0].quantity=2;quants[1].reserved_quantity=0;
+ const read=async()=>(await comparison(deps)).rows.find(r=>r.code===code);
+ let r=await read();assert.equal(r.locations.length,1);assert.equal(freeForDispatch(r.locations),2);assert.equal(r.commercial,-2);
+ quants.push({id:8,product_id:52,location_id:2,quantity:3,reserved_quantity:1});r=await read();assert.equal(freeForDispatch(r.locations),4);
+ locations[0].company_id=locations[1].company_id;r=await read();assert.equal(r.locations,null);
 });
 test("incluye repuestos de generadores sin marca y conserva GEN y RMA por separado",async()=>{
  const code="CUM-BOMAGUA4BT",{deps}=fixture();
