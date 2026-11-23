@@ -69,7 +69,8 @@ export function reconcileInventory({products, orders, purchaseLines, invoices, i
     const pending = o.state === "purchase" ? Math.max(0, ordered - received) : 0;
     g.received += received;
     g.pending += pending;
-    g.orders.push({orderId:o.id, lineId:l.id, orderName:o.name, state:o.state,
+    const stage=l.purchaseStage??o.purchaseStage;
+    g.orders.push({orderId:o.id, lineId:l.id, orderName:o.name, ...(["transit","production"].includes(stage)?{purchaseStage:stage}:{}), state:o.state,
       qtyOrdered:ordered, qtyReceived:received, qtyPending:pending, datePlanned:l.date_planned || null});
   }
   for (const l of unique(invoiceLines)) {
@@ -91,6 +92,15 @@ export function reconcileInventory({products, orders, purchaseLines, invoices, i
   return {rows, reviewCount:rows.filter(r=>r.review).length};
 }
 
+// Read only explicit selection labels on the purchase itself. Never infer the
+// logistics stage from PO confirmation, its date, a picking or another module.
+export function purchaseStageField(metadata){
+  const labelStage=s=>({ENTRANSITO:"transit",INTRANSIT:"transit",ENPRODUCCION:"production",INPRODUCTION:"production"})[norm(s)];
+  const candidates=Object.entries(metadata||{}).filter(([k,v])=>k.startsWith("x_")&&v.type==="selection"&&Array.isArray(v.selection)&&
+    ["transit","production"].every(s=>v.selection.some(([,label])=>labelStage(label)===s)));
+  if(candidates.length!==1)return null;
+  const [field,v]=candidates[0];return {field,decode:value=>labelStage(v.selection.find(([key])=>key===value)?.[1])||null};
+}
 export async function loadInventory(odoo, now = new Date()) {
   assert(odoo.isConfigured(),"Odoo no configurado.");
   const until = new Intl.DateTimeFormat("en-CA", {timeZone:"America/Caracas",year:"numeric",month:"2-digit",day:"2-digit"}).format(now);
@@ -98,6 +108,9 @@ export async function loadInventory(odoo, now = new Date()) {
     norm(c.vat)==="J294654568" && /^(?:COPIKONCA|COPIKONVENEZUELACA)(?:J294654568)?$/.test(norm(c.name)));
   assert(companies.length > 0,"Compañía no verificable.");
   const companyIds = companies.map(c=>c.id), context = {allowed_company_ids:companyIds};
+  const [headerStage,lineStage]=await Promise.all(["purchase.order","purchase.order.line"].map(async model=>{
+    try{return purchaseStageField(await odoo.execute(model,"fields_get",[],{attributes:["type","selection"],context}));}catch{return null;}
+  }));
   const fields = await odoo.execute("product.product","fields_get",[],{attributes:["type"]});
   const brands = ["x_studio_marca","x_studio_marca_1"].filter(f=>fields[f]);
   const clauses = [["name","ilike","BAIFA"], ...brands.map(f=>[f,"ilike","BAIFA"]),
@@ -114,7 +127,8 @@ export async function loadInventory(odoo, now = new Date()) {
   assert(seedLines.every(l=>seedIds.has(id(l.product_id)) && validId(id(l.order_id))),"PO fuera del alcance.");
   const orderIds = new Set(seedLines.map(l=>id(l.order_id)));
   const orders = await byIds(odoo,"purchase.order",[...orderIds],
-    ["id","name","state","company_id"],context);
+    ["id","name","state","company_id",...(headerStage?[headerStage.field]:[])],context);
+  for(const o of orders)if(headerStage)o.purchaseStage=headerStage.decode(o[headerStage.field]);
   assert(orders.every(o=>companyIds.includes(id(o.company_id)) && ["purchase","done"].includes(o.state)),
     "PO no confirmada o fuera de compañía.");
   // Include every physical line of the identified BAIFA POs, not just generators.
@@ -122,7 +136,8 @@ export async function loadInventory(odoo, now = new Date()) {
   const wholeLines = orderIds.size ? unique(await all(odoo,"purchase.order.line",[
     ["company_id","in",companyIds],["order_id","in",[...orderIds]],
     ["order_id.state","in",["purchase","done"]],["product_id","!=",false],
-  ],["id","order_id","product_id","product_qty","qty_received","product_uom","date_planned"],50000,context)) : [];
+  ],["id","order_id","product_id","product_qty","qty_received","product_uom","date_planned",...(lineStage?[lineStage.field]:[])],50000,context)) : [];
+  for(const l of wholeLines)if(lineStage&&l[lineStage.field])l.purchaseStage=lineStage.decode(l[lineStage.field])||"unknown";
   assert(wholeLines.every(l=>orderIds.has(id(l.order_id)) && validId(id(l.product_id))),"Línea fuera de las PO BAIFA.");
   const completeLineIds = new Set(wholeLines.map(l=>l.id));
   assert(seedLines.every(l=>completeLineIds.has(l.id)),"Lectura de PO incompleta.");

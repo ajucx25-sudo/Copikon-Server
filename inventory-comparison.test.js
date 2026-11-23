@@ -1,7 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import express from "express";
-import {comparison,registerInventoryComparison} from "./inventory-comparison.js";
+import {comparison,registerInventoryComparison,freeForDispatch} from "./inventory-comparison.js";
+test("Despacho: ocho rutas exactas menos reservas; sin RMA, sububicaciones ni tránsito",()=>{
+ const locations=["ccs/stock","BTO/Stock","TDA-B/Stock","INV/Stock","ATR/Stock","VAL/Stock","MCY/Stock","GEN/Stock"].map(name=>({name,quantity:2,reserved:1}));
+ for(const l of locations)assert.equal(freeForDispatch([l]),1);
+ for(const name of ["RMA-G/Stock","CCS/Stock/RMA","TDA/Stock","GEN/Tránsito","PROD/Stock","OTRA/Stock"])assert.equal(freeForDispatch([{name,quantity:50,reserved:0}]),0);
+ assert.equal(freeForDispatch(locations),8);
+});
 const sku="BF-C90SAE-60";
 function fixture(){
  const products=[{id:51,default_code:sku,uom_id:[1,"Unidades"]},{id:52,default_code:sku,uom_id:[1,"Unidades"]},{id:53,default_code:"ATS-BAIFA",uom_id:[1,"Unidades"]}];
@@ -42,5 +48,18 @@ test("la consulta no se ejecuta sin acceso a Inventario",async()=>{
  const app=express();app.use((req,res,next)=>{if(req.headers.testuser)req.verifiedUser={level:"vendedor",moduleAccess:"[]"};next();});registerInventoryComparison(app,{});
  const s=app.listen(0,"127.0.0.1");await new Promise(r=>s.once("listening",r));try{
  const url=`http://127.0.0.1:${s.address().port}/api/generators/inventory/comparison`;assert.equal((await fetch(url)).status,401);assert.equal((await fetch(url,{headers:{testuser:"1"}})).status,403);
+ }finally{s.close();}
+});
+test("Catálogo de solo lectura para ventas: no concede acceso a campos de inventario",async()=>{
+ const {deps}=fixture();const app=express();
+ app.use((req,res,next)=>{if(req.headers.role)req.verifiedUser={level:"vendedor",moduleAccess:JSON.stringify([req.headers.role])};next()});
+ registerInventoryComparison(app,deps);
+ const s=app.listen(0,"127.0.0.1");await new Promise(r=>s.once("listening",r));
+ try{const base=`http://127.0.0.1:${s.address().port}/api/generators`,opt={headers:{role:"generators-ventas"}};
+ assert.equal((await fetch(`${base}/seller-catalog`)).status,401);assert.equal((await fetch(`${base}/seller-catalog`,{headers:{role:"otro"}})).status,403);
+ assert.equal((await fetch(`${base}/inventory/comparison`,opt)).status,403);
+ const resp=await fetch(`${base}/seller-catalog`,opt);assert.equal(resp.status,200);
+ const row=(await resp.json()).products.find(p=>p.code===sku);assert.ok(row);
+ for(const k of ["costPrice","locations","orders","commercial","pending","credits"])assert.equal(k in row,false);
  }finally{s.close();}
 });

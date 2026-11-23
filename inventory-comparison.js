@@ -1,6 +1,8 @@
 import {all} from "./baifa-client-sync.js";
 import {canAccessPath} from "./secure-access.js";
 const path="/api/generators/inventory/comparison";
+const dispatchPaths=new Set(["CCS/STOCK","BTO/STOCK","TDA-B/STOCK","INV/STOCK","ATR/STOCK","VAL/STOCK","MCY/STOCK","GEN/STOCK"]);
+export function freeForDispatch(locations){return Math.max(0,locations.filter(l=>dispatchPaths.has(String(l.name??"").trim().toUpperCase())).reduce((n,l)=>n+l.quantity-l.reserved,0));}
 const id=v=>Array.isArray(v)?v[0]:v;
 const positive=v=>Number.isSafeInteger(v)&&v>0;
 const requireValue=v=>{if(!v)throw Error("Lectura de inventario incompleta");};
@@ -53,10 +55,28 @@ export async function comparison({odoo,readCol,readInventory}){
 }
 export function registerInventoryComparison(app,deps){
   let running;
+  const load=()=>running??=comparison(deps).finally(()=>{running=undefined;});
+  app.get("/api/generators/seller-catalog",async(req,res)=>{
+    res.set("Cache-Control","private, no-store");
+    if(!req.verifiedUser)return res.sendStatus(401);
+    if(!canAccessPath(req.verifiedUser,"/api/generators/seller-catalog","GET"))return res.sendStatus(403);
+    try{const [inventory,catalog]=await Promise.all([load(),deps.readCol("erpProducts")]);
+      if(!inventory.physicalAt)throw Error();
+      const byCode=new Map(catalog.map(p=>[String(p.code||p.sku||"").trim(),p]));
+      const products=inventory.rows.flatMap(r=>{
+        const p=byCode.get(r.code)||{};
+        if(["inactivo","archived"].includes(p.status)||!Array.isArray(r.locations))return [];
+        const stock=freeForDispatch(r.locations);
+        const out={id:r.code,code:r.code,name:r.catalogName||r.name||r.code,stock,unit:r.unit||"",_catalogDispatch:true};
+        for(const k of ["brand","category","model","kva","kw","imageUrl","priceExpress","priceExpressPct","salePrice"])if(["number","string"].includes(typeof p[k]))out[k]=p[k];
+        return [out];
+      });res.json({physicalAt:inventory.physicalAt,products});
+    }catch{res.status(503).json({message:"No se pudo verificar el catálogo."});}
+  });
   app.get(path,async(req,res)=>{res.set("Cache-Control","private, no-store");
     if(!req.verifiedUser)return res.status(401).json({message:"Inicia sesión."});
     if(!canAccessPath(req.verifiedUser,path,"GET"))return res.status(403).json({message:"Se requiere acceso a Inventario."});
     if(Object.keys(req.query).length)return res.status(400).json({message:"Consulta no permitida."});
-    try{running??=comparison(deps).finally(()=>{running=undefined;});res.json(await running);}catch{res.status(503).json({message:"No se pudo verificar el inventario."});}
+    try{res.json(await load());}catch{res.status(503).json({message:"No se pudo verificar el inventario."});}
   });
 }

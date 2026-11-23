@@ -275,7 +275,7 @@ app.use((req, res, next) => {
   const equipmentCreate = /^\/api\/erp\/client-equipment(?:\/|$)/.test(path) && req.method === "POST";
   const protectedPath = isInventoryPath(path) || equipmentRead || equipmentDocument || isPricelistClientMutation(path, req.method) || isClientResource(path) || equipmentCreate || isBaifaSyncPath(path) || clientMutation || equipmentMutation || posventaEquipment || /^\/api\/(?:logistica|employees|sales-partners|admin\/(?:users|sales-partners|providers|technical-providers)|sync)(?:\/|$)/.test(path) ||
     /^\/api\/erp\/(?:pre-leads|leads|sale-orders\/from-lead)(?:\/|$)/.test(path) || /^\/api\/sales\/dashboard-summary\/?$/.test(path) ||
-    /^\/api\/generators\/(?:shipments|price-list-settings|price-list-items)(?:\/|$)/.test(path) ||
+    /^\/api\/generators\/(?:shipments|seller-catalog|price-list-settings|price-list-items)(?:\/|$)/.test(path) ||
     /^\/api\/auth\/(?:me|change-password|logout)$/.test(path);
   if (!protectedPath) return next();
   res.setHeader("Cache-Control", "no-store");

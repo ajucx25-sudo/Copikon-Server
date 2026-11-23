@@ -112,7 +112,7 @@ function mockOdoo() {
 test("Loader: complete historical read, confirmed/posted, company and product scope, read-only",async()=>{
   const o=mockOdoo(),result=await loadInventory(o,new Date("2026-11-10T12:00:00Z"));
   assert.equal(result.rows[0].available,4);assert.equal(result.source,"odoo-po-invoices");
-  const po=o.calls.find(c=>c[0]==="purchase.order.line")[1], inv=o.calls.find(c=>c[0]==="account.move.line")[1];
+  const po=o.calls.find(c=>c[0]==="purchase.order.line"&&Array.isArray(c[1]))[1], inv=o.calls.find(c=>c[0]==="account.move.line")[1];
   assert.ok(po.some(c=>c[0]==="order_id.state" && c[2].includes("done")));
   assert.ok(inv.some(c=>c[0]==="move_id.state"&&c[2]==="posted"));
   assert.ok(!inv.some(c=>c[0]==="move_id.invoice_date"&&c[1]===">="));
@@ -221,4 +221,11 @@ test("Safe validation reason never echoes upstream errors or arbitrary details",
   assert.equal(safeInventoryReason({inventoryReason:"untrusted detail"}),"UPSTREAM_READ_FAILED");
   assert.equal(safeInventoryReason({inventoryReason:"SKU_MISSING"}),"SKU_MISSING");
   assert.equal(INVENTORY_PATH,"/api/generators/inventory/baifa-stock");
+});
+import {purchaseStageField} from "./baifa-inventory.js";
+test("Solo etapas explícitas en selección inequívoca de compra",()=>{
+ const meta={type:"selection",selection:[["a","En producción"],["b","En tránsito"],["c","Otra"]]};
+ assert.equal(purchaseStageField({state:meta}),null);
+ assert.equal(purchaseStageField({x_stage:meta,x_other:meta}),null);
+ const x=purchaseStageField({x_stage:meta});assert.equal(x.decode("a"),"production");assert.equal(x.decode("b"),"transit");assert.equal(x.decode("c"),null);
 });
