@@ -17,6 +17,23 @@ test("3 físicas en dos almacenes, una reservada, sin sumar saldo −2 ni cinco 
  assert.equal(r.rows.find(r=>r.code==="ATS-BAIFA").commercial,null);assert.equal(r.rows.find(r=>r.code==="ATS-BAIFA").locations[0].quantity,8);
  assert.equal(r.rows.find(r=>r.code==="SIN-VINCULO").locations,null);
 });
+test("incluye repuestos de generadores sin marca y conserva GEN y RMA por separado",async()=>{
+ const code="CUM-BOMAGUA4BT",{deps}=fixture();
+ deps.readCol=async()=>[{code,brand:"",category:"repuestos_de_generadores",stock:99},
+   {code:"NO-GEN",category:"repuestos_de_vehiculos"},{code:"SERV",category:"repuestos_de_generadores",type:"service"}];
+ const base=deps.odoo.searchRead;
+ deps.odoo.searchRead=async(m,d,...args)=>{
+  const rows=await base(m,d,...args);
+  if(m==="product.product"&&d.some(x=>Array.isArray(x)&&x[0]==="default_code"&&x[1]==="in"&&x[2].includes(code)))
+    return [...rows,{id:54,default_code:code,uom_id:[1,"Unidades"]}];
+  if(m==="stock.location")return [...rows,{id:3,complete_name:"RMA-G/Stock",warehouse_id:[6,"RMA"],company_id:[7,"Compañía"]}];
+  if(m==="stock.quant")return [...rows,{id:4,product_id:54,location_id:2,quantity:2,reserved_quantity:1},{id:5,product_id:54,location_id:3,quantity:4,reserved_quantity:0}];
+  return rows;
+ };
+ const {rows}=await comparison(deps),pump=rows.find(r=>r.code===code);
+ assert.deepEqual(pump.locations.map(l=>[l.name,l.quantity,l.reserved]),[["GEN/Stock",2,1],["RMA-G/Stock",4,0]]);
+ assert.equal(pump.commercial,null);assert.ok(!rows.some(r=>["NO-GEN","SERV"].includes(r.code)));
+});
 test("unidades incompatibles no se agregan; error de Odoo no se interpreta como cero",async()=>{
  const {deps,products,quants}=fixture();products[1].uom_id=[2,"Metros"];assert.equal((await comparison(deps)).rows.find(r=>r.code===sku).locations,null);
  quants.push(quants[0]);const failed=await comparison(deps);assert.equal(failed.physicalAt,null);assert.equal(failed.rows[0].commercial,-2);assert.equal(failed.rows[0].locations,null);

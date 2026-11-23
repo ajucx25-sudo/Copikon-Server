@@ -4,7 +4,10 @@ const path="/api/generators/inventory/comparison";
 const id=v=>Array.isArray(v)?v[0]:v;
 const positive=v=>Number.isSafeInteger(v)&&v>0;
 const requireValue=v=>{if(!v)throw Error("Lectura de inventario incompleta");};
-const localScope=p=>/^(TRPE|VTM)/i.test(p.code||p.sku||"")||(["baifa","copikon_gen"].includes(String(p.brand||"").trim().toLowerCase())&&!["service","servicio"].includes(String(p.type||p.category||"").toLowerCase()));
+const localScope=p=>/^(TRPE|VTM)/i.test(p.code||p.sku||"")||
+  (!["service","servicio"].includes(String(p.type||p.category||"").trim().toLowerCase())&&
+    (["baifa","copikon_gen"].includes(String(p.brand||"").trim().toLowerCase())||
+     String(p.category||"").trim().toLowerCase()==="repuestos_de_generadores"));
 export async function comparison({odoo,readCol,readInventory}){
   const [c,catalog]=await Promise.all([readInventory(),readCol("erpProducts")]);
   requireValue(c?.complete&&c.source==="odoo-po-invoices"&&Array.isArray(catalog)&&Array.isArray(c.rows));
