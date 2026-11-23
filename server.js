@@ -31,7 +31,7 @@ import { registerMonthlyClose } from "./baifa-monthly-close.js";
 import { registerInventory, isInventoryPath } from "./generators-inventory.js";
 import { registerInventory as registerBaifaInventory, createInventoryReader } from "./baifa-inventory.js";
 import {comparison,registerInventoryComparison} from "./inventory-comparison.js";
-import {registerInventorySheet} from "./inventory-sheet.js";
+import {registerInventorySheet,gallerySchema} from "./inventory-sheet.js";
 import {photoFromSync,photoFromEdit,withCatalogLock} from "./catalog-photo.js";
 import {productAccess,productRead,productCollectionWrite} from "./product-access.js";
 import { registerPosventaClientSync, POSVENTA_SYNC_POLICY } from "./posventa-client-sync.js";
@@ -71,6 +71,7 @@ async function ensureSchema() {
   await pool.query(workflowSchema);
   await pool.query(compatSchema);
   await pool.query(dossierSchema);
+  await pool.query(gallerySchema);
 }
 
 async function readCol(key) {
