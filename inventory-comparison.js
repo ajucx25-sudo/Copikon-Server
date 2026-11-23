@@ -10,6 +10,17 @@ const requireValue=v=>{if(!v)throw Error("Lectura de inventario incompleta");};
 // Within the RIF-verified companies the current company is COPIKON C.A.;
 // the historical COPIKON VENEZUELA C.A. can have an identically named location.
 const companyKey=n=>String(n||"").toUpperCase().replace(/[^A-Z0-9]/g,"").replace(/J294654568$/,"");
+// Price is source data, independent of manual Express and of physical quantities.
+export function inventoryOdooSale(variants,companies){
+  const ops=companies.filter(c=>companyKey(c.name)==="COPIKONCA");
+  if(ops.length!==1)return null;
+  const own=variants.filter(p=>id(p.company_id)===ops[0].id);
+  const candidates=own.length?own:variants.filter(p=>p.company_id===false);
+  if(candidates.length!==1)return null;
+  const p=candidates[0],currency=p.currency_id?.[1];
+  if(!Number.isFinite(p.list_price)||p.list_price<0||typeof currency!=="string"||!/^[A-Z]{3}$/.test(currency))return null;
+  return {amount:p.list_price,currency};
+}
 function dispatchReadings(buckets,locations,companies){
   const current=companies.filter(c=>companyKey(c.name)==="COPIKONCA");
   const operative=current.length===1?current[0].id:null;
@@ -36,7 +47,8 @@ export async function comparison({odoo,readCol,readInventory}){
   const [c,catalog]=await Promise.all([readInventory(),readCol("erpProducts")]);
   requireValue(c?.complete&&c.source==="odoo-po-invoices"&&Array.isArray(catalog)&&Array.isArray(c.rows));
   const companies=c.companies.map(x=>x.id);requireValue(companies.length&&companies.every(positive));
-  const context={allowed_company_ids:companies},map=new Map();
+  const operative=c.companies.filter(x=>companyKey(x.name)==="COPIKONCA");
+  const context={allowed_company_ids:operative.length===1?[operative[0].id,...companies.filter(i=>i!==operative[0].id)]:companies},map=new Map();
   for(const r of c.rows)map.set(r.code,{code:r.code,name:r.name,unit:r.uomLabel,commercial:r.balance,pending:r.pending,credits:r.creditUnits,locations:null});
   for(const p of catalog){const code=String(p.code||p.sku||"").trim();if(!code||(!map.has(code)&&!localScope(p)))continue;
     if(!map.has(code))map.set(code,{code,name:p.name||code,commercial:null,pending:null,credits:null,locations:null});
@@ -51,10 +63,15 @@ export async function comparison({odoo,readCol,readInventory}){
     const candidates=await all(odoo,"product.product",[...scop,...Array(clauses.length-1).fill("|"),...clauses],["id","default_code","name"],50000,context);
     for(const p of candidates)if(typeof p.default_code==="string"&&p.default_code.trim()&&!map.has(p.default_code))map.set(p.default_code,{code:p.default_code,name:p.name,commercial:null,pending:null,credits:null,locations:null,physicalOnly:true});
     const codes=[...map.keys()],rows=[...map.values()];
+    const priceFields=["list_price","currency_id","company_id"];
+    const withPrices=priceFields.every(k=>Object.hasOwn(fields,k));
     const prods=[], seen=new Set();
     for(let n=0;n<codes.length;n+=300)prods.push(...await all(odoo,"product.product",[
       ["default_code","in",codes.slice(n,n+300)],["type","in",["product","consu"]],"|",["company_id","=",false],["company_id","in",companies]],
-      ["id","default_code","uom_id"],50000,context));
+      ["id","default_code","uom_id",...(withPrices?priceFields:[])],50000,context));
+    const priceVariants=new Map();
+    for(const p of prods){if(!priceVariants.has(p.default_code))priceVariants.set(p.default_code,[]);priceVariants.get(p.default_code).push(p);}
+    for(const r of rows)r.odooSale=withPrices?inventoryOdooSale(priceVariants.get(r.code)||[],c.companies):null;
     const byId=new Map(),units=new Map(),conflict=new Set();
     for(const p of prods){const code=p.default_code,u=id(p.uom_id);requireValue(map.has(code)&&positive(p.id)&&positive(u)&&!byId.has(p.id));byId.set(p.id,code);
       if(units.has(code)&&units.get(code)!==u)conflict.add(code);units.set(code,u);

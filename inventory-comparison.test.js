@@ -3,7 +3,14 @@ import assert from "node:assert/strict";
 import express from "express";
 import compression from "compression";
 import {gzipSync} from "node:zlib";
-import {comparison,registerInventoryComparison,freeForDispatch} from "./inventory-comparison.js";
+import {comparison,registerInventoryComparison,freeForDispatch,inventoryOdooSale} from "./inventory-comparison.js";
+test("Odoo sale: importe y moneda de la variante operativa; cero no equivale a sin verificar",()=>{
+ const companies=[{id:12,name:"Copikon C.A."},{id:1,name:"Copikon Venezuela C.A."}],p={sale_ok:true,list_price:540,currency_id:[2,"USD"],company_id:[12,"Copikon"]};
+ assert.deepEqual(inventoryOdooSale([{...p,company_id:[1,"Histórica"],list_price:400},p],companies),{amount:540,currency:"USD"});
+ assert.deepEqual(inventoryOdooSale([{...p,company_id:false,list_price:0}],companies),{amount:0,currency:"USD"});
+ assert.deepEqual(inventoryOdooSale([{...p,sale_ok:false}],companies),{amount:540,currency:"USD"});
+ for(const a of [[p,p],[{...p,list_price:null}],[{...p,currency_id:false}],[{...p,company_id:[1,"Histórica"]}],[]])assert.equal(inventoryOdooSale(a,companies),null);
+});
 test("Despacho: ocho rutas exactas menos reservas; sin RMA, sububicaciones ni tránsito",()=>{
  const locations=["ccs/stock","BTO/Stock","TDA-B/Stock","INV/Stock","ATR/Stock","VAL/Stock","MCY/Stock","GEN/Stock"].map(name=>({name,quantity:2,reserved:1}));
  for(const l of locations)assert.equal(freeForDispatch([l]),1);
