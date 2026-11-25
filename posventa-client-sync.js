@@ -1,5 +1,6 @@
 import {createHash, randomUUID} from "node:crypto";
 import {EQUIPMENT_DOCUMENT_KEYS} from "./equipment-reference-access.js";
+import {recordWelcomes} from "./posventa-welcome.js";
 
 export const POSVENTA_SYNC_PATH = "/api/generators/posventa/equipment/sync-from-clients";
 export const POSVENTA_SYNC_POLICY = "clients-to-posventa-append-v1";
@@ -155,6 +156,7 @@ export function registerPosventaClientSync(app, {readCol, writeCol, wrap}) {
         collect(await readCol(key));
       }
       const {additions,result} = planPosventaClientSync(clients,equipment,{actorId:req.verifiedUser?.id ?? null,reservedIds});
+      await recordWelcomes(additions,readCol,writeCol,result.syncedAt);
       if (additions.length) {
         // Private audit collection, not exposed by the generic REST route map.
         const receipt = `adminMaintenance:posventaClientSync:${randomUUID()}`;

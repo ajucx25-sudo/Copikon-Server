@@ -27,6 +27,7 @@ import { isClientMutation, isClientResource, validateClientCreate, validateClien
 import {collectionContext, requiresCollectionTransaction, runCollectionTransaction, isPricelistClientMutation} from "./client-collection-transactions.js";
 import { isEquipmentMutation, isPosventaEquipmentPath, validateEquipmentEdit } from "./equipment-edit-access.js";
 import {isLocationContactPath,planLocationContact} from "./posventa-location-contact.js";
+import {registerWelcomes} from "./posventa-welcome.js";
 import { registerBaifaClientSync, isBaifaSyncPath } from "./baifa-client-sync.js";
 import { registerMonthlyClose } from "./baifa-monthly-close.js";
 import { registerInventory, isInventoryPath } from "./generators-inventory.js";
@@ -331,6 +332,7 @@ registerBaifaInventory(app, {odoo, wrap, readInventory: readBaifaInventory});
 registerInventoryComparison(app,{odoo,readCol,readInventory:readBaifaInventory});
 registerInventorySheet(app,{readCol,pool,inInventory:async code=>(await comparison({odoo,readCol,readInventory:readBaifaInventory})).rows.find(r=>r.code===code)});
 registerPosventaClientSync(app, {readCol, writeCol, wrap});
+registerWelcomes(app,{readCol,writeCol,wrap});
 
 app.patch("/api/generators/posventa/equipment/:id/location-contact",wrap(async(req,res)=>{
   const eq=await readCol("erpClientEquipment"),clients=await readCol("erpClients");

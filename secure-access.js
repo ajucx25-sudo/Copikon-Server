@@ -43,6 +43,10 @@ export function permissionList(value) {
 }
 export const isAdministrator = user => user?.level === "ceo" || user?.username === "admin";
 export function canAccessPath(user, path, method) {
+  if(/^\/api\/generators\/posventa\/equipment\/welcomes(?:\/|$)/i.test(path)){
+    const allowed=!!user&&!user.isPartner&&!user.isExternal&&!user.isExternalProvider&&user.providerId==null&&!["partner_externo","tecnico_externo"].includes(user.level)&&(isAdministrator(user)||permissionList(user.moduleAccess).includes("generators-posventa")||user.level==="coordinador");
+    return allowed&&(method==="GET"&&/\/welcomes\/?$/i.test(path)||method==="POST"&&/\/welcomes\/[0-9a-f]{64}\/(claim|release|done)\/?$/i.test(path));
+  }
   if(isLocationContactPath(path))return method==="PATCH" && !!user && !user.isPartner && user.level!=="partner_externo" &&
     (isAdministrator(user)||user.level==="coordinador"||permissionList(user.moduleAccess).includes("generators-posventa"));
   if(path==="/api/generators/inventory/product-sheet"&&method==="PATCH")return !!user&&!user.isPartner&&user.level!=="partner_externo"&&isAdministrator(user);

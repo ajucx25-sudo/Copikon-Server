@@ -1,0 +1,20 @@
+import test from "node:test";import assert from "node:assert/strict";
+import {recordWelcomes,registerWelcomes,welcomePath} from "./posventa-welcome.js";
+import {canAccessPath} from "./secure-access.js";
+import {requiresCollectionTransaction} from "./client-collection-transactions.js";
+test("historical imports, grouped multi-unit sale, replays, later units and operator ownership",async()=>{
+ const store=new Map(),handlers=new Map(),now="2026-11-25T16:00:00Z";
+ const readCol=async k=>structuredClone(store.get(k)||[]),writeCol=async(k,r)=>store.set(k,structuredClone(r));
+ const unit=id=>({id,source:"odoo-baifa-sales",clientId:5,odooUnitKey:`unit-${id}`,odooSource:{invoiceId:33,companyId:1},invoiceDate:"2026-11-25",invoiceNumber:"DEMO"});
+ await recordWelcomes([],readCol,writeCol,now);
+ await recordWelcomes([unit(1),unit(2),{...unit(3),invoiceDate:"2025-01-01"}],readCol,writeCol,now);
+ await recordWelcomes([unit(2),unit(4)],readCol,writeCol,now);
+ registerWelcomes({get:(k,h)=>handlers.set("get",h),post:(k,h)=>handlers.set("post",h)},{readCol,writeCol,wrap:x=>x});
+ const call=async(method,action,user,id)=>{let status=200,body;await handlers.get(method)({params:{id,action},verifiedUser:{id:user}},{json:b=>body=b,status(n){status=n;return this}});return {status,body}};
+ store.set("erpClients",[{id:5,name:"Prueba",phone:"000",contact:"Prueba"}]);
+ const rows=(await call("get")).body.items;assert.equal(rows.length,1);assert(!("phone" in rows[0]));assert.deepEqual(rows[0].equipment.map(e=>e.id),[1,2,4]);
+ const {id}=rows[0],path=`${welcomePath}/${id}/claim`;
+ assert(requiresCollectionTransaction(path,"POST"));assert(!canAccessPath({level:"employee"},path,"POST"));assert(canAccessPath({moduleAccess:["generators-posventa"]},path,"POST"));assert(!canAccessPath({level:"ceo",isPartner:true},welcomePath,"GET"));
+ assert.equal((await call("post","claim",1,id)).status,200);assert.equal((await call("get",null,1)).body.items[0].phone,"000");assert(!("contact" in (await call("get",null,2)).body.items[0]));assert.equal((await call("post","claim",2,id)).status,409);assert.equal((await call("post","done",2,id)).status,409);assert.equal((await call("post","done",1,id)).status,200);
+ await recordWelcomes([unit(1)],readCol,writeCol,now);assert.equal((await call("get")).body.items.length,0);
+});
