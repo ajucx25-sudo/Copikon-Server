@@ -28,6 +28,7 @@ import {collectionContext, requiresCollectionTransaction, runCollectionTransacti
 import { isEquipmentMutation, isPosventaEquipmentPath, validateEquipmentEdit } from "./equipment-edit-access.js";
 import {isLocationContactPath,planLocationContact} from "./posventa-location-contact.js";
 import {registerWelcomes} from "./posventa-welcome.js";
+import {registerReceivables,base as receivablesPath,assertNoGeneratorsPlan} from "./generators-receivables.js";
 import { registerBaifaClientSync, isBaifaSyncPath } from "./baifa-client-sync.js";
 import { registerMonthlyClose } from "./baifa-monthly-close.js";
 import { registerInventory, isInventoryPath } from "./generators-inventory.js";
@@ -219,7 +220,7 @@ app.use(cors({
 }));
 const legacyJsonParser = express.json({ limit: "150mb" });
 // Document uploads authenticate before their smaller, route-specific JSON parser.
-app.use((req, res, next) => [SALES_DOCUMENTS_PATH,compatPath,dossierPath].some(p=>req.path.toLowerCase().startsWith(p+"/"))
+app.use((req, res, next) => req.path.toLowerCase()===receivablesPath||[receivablesPath,SALES_DOCUMENTS_PATH,compatPath,dossierPath].some(p=>req.path.toLowerCase().startsWith(p+"/"))
   ? next() : legacyJsonParser(req, res, next));
 
 const wrap = (fn) => (req, res) =>
@@ -235,6 +236,7 @@ const wrap = (fn) => (req, res) =>
   });
 
 const sessions = createSessions(pool, readCol, buildPartnerUser);
+registerReceivables(app,{sessions,odoo,readCol,writeCol,wrap});
 app.use(productAccess(sessions));
 registerCorrectiveCalendar(app,{sessions,readCol});
 registerDossiers(app,{pool,sessions,readCol});
@@ -5356,6 +5358,7 @@ app.post("/api/admin/finanzas/payment-promises", wrap(async (req, res) => {
   if (!b.move_id || !b.kind || (b.kind !== "ar" && b.kind !== "ap")) {
     return res.status(400).json({ ok: false, error: "move_id y kind (ar|ap) requeridos" });
   }
+  await assertNoGeneratorsPlan(readCol,{kind:b.kind,move_id:b.move_id});
   const mode = b.mode === "installments" ? "installments" : "single";
   if (mode === "single" && (!b.promise_date || !b.promise_amount)) {
     return res.status(400).json({ ok: false, error: "promise_date y promise_amount requeridos para modo simple" });
@@ -5428,6 +5431,7 @@ app.patch("/api/admin/finanzas/payment-promises/:id", wrap(async (req, res) => {
   }
   p.updated_at = nowMs();
   p.status = computePromiseStatus(p, todayIsoUtc());
+  await assertNoGeneratorsPlan(readCol,p);
   promises[idx] = p;
   await writeCol("paymentPromises", promises);
   res.json({ ok: true, promise: p });
