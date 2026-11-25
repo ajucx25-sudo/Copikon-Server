@@ -26,6 +26,7 @@ import { createSessions, safeUser, canAccessPath, verifyPassword, protectCredent
 import { isClientMutation, isClientResource, validateClientCreate, validateClientEdit } from "./client-edit-access.js";
 import {collectionContext, requiresCollectionTransaction, runCollectionTransaction, isPricelistClientMutation} from "./client-collection-transactions.js";
 import { isEquipmentMutation, isPosventaEquipmentPath, validateEquipmentEdit } from "./equipment-edit-access.js";
+import {isLocationContactPath,planLocationContact} from "./posventa-location-contact.js";
 import { registerBaifaClientSync, isBaifaSyncPath } from "./baifa-client-sync.js";
 import { registerMonthlyClose } from "./baifa-monthly-close.js";
 import { registerInventory, isInventoryPath } from "./generators-inventory.js";
@@ -306,7 +307,7 @@ app.use((req, res, next) => {
       if (error) return res.status(400).json({message:error});
       req.body = patch;
     }
-    if ((equipmentMutation || posventaEquipment) && ["PATCH","PUT"].includes(req.method)) {
+    if ((equipmentMutation || posventaEquipment) && !isLocationContactPath(path) && ["PATCH","PUT"].includes(req.method)) {
       const {patch,error} = validateEquipmentEdit(req.body, equipmentMutation);
       if (error) return res.status(400).json({message:error});
       req.body = patch;
@@ -331,6 +332,15 @@ registerInventoryComparison(app,{odoo,readCol,readInventory:readBaifaInventory})
 registerInventorySheet(app,{readCol,pool,inInventory:async code=>(await comparison({odoo,readCol,readInventory:readBaifaInventory})).rows.find(r=>r.code===code)});
 registerPosventaClientSync(app, {readCol, writeCol, wrap});
 
+app.patch("/api/generators/posventa/equipment/:id/location-contact",wrap(async(req,res)=>{
+  const eq=await readCol("erpClientEquipment"),clients=await readCol("erpClients");
+  const plan=planLocationContact(req.body,eq,clients,req.params.id);
+  if(plan.status!==200)return res.status(plan.status).json({message:plan.message});
+  const {result}=plan;
+  if(Object.hasOwn(result,"location"))await writeCol("erpClientEquipment",eq.map(r=>r.id===result.equipmentId?{...r,location:result.location}:r));
+  if(Object.hasOwn(result,"contact"))await writeCol("erpClients",clients.map(c=>c.id===result.clientId?{...c,contact:result.contact}:c));
+  res.json(result);
+}));
 app.patch("/api/generators/posventa/equipment/:id", wrap(async (req,res) => {
   const rows = await readCol("erpClientEquipment");
   const index = rows.findIndex(row => String(row.id) === req.params.id);
