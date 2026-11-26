@@ -23,6 +23,7 @@ import { registerPricelistsRoutes } from "./pricelists.js";
 import { registerPreventaRoutes } from "./preventa.js";
 import { registerShipmentsRoutes } from "./shipments.js";
 import { createSessions, safeUser, canAccessPath, verifyPassword, protectCredentials } from "./secure-access.js";
+import { generalAccess, financeGuard, ownsNotice, daysToDate, noticeForBell } from "./general-collections-access.js";
 import { isClientMutation, isClientResource, validateClientCreate, validateClientEdit } from "./client-edit-access.js";
 import {collectionContext, requiresCollectionTransaction, runCollectionTransaction, isPricelistClientMutation} from "./client-collection-transactions.js";
 import { isEquipmentMutation, isPosventaEquipmentPath, validateEquipmentEdit } from "./equipment-edit-access.js";
@@ -199,7 +200,6 @@ const ROUTES = {
   // Pre-Leads (carga masiva antes de convertir a lead)
   "/api/erp/pre-leads": "preLeads",
   // Notificaciones in-app y reportes semanales de bitácora
-  "/api/notifications": "notifications",
   "/api/bitacora-reports": "bitacoraReports",
   // Lista de precios BAIFA (Generators) - CRUD + endpoint público para website
   // (settings es un singleton, se maneja con handlers explícitos más abajo)
@@ -237,6 +237,32 @@ const wrap = (fn) => (req, res) =>
   });
 
 const sessions = createSessions(pool, readCol, buildPartnerUser);
+app.use("/api/admin/finanzas", financeGuard(sessions));
+app.use("/api/notifications", wrap(async (req,res,next) => {
+  res.set("Cache-Control","private, no-store");
+  const user = await sessions.authenticate(req);
+  if(!user) return res.status(401).json({message:"Inicia sesión."});
+  const path=req.path.replace(/\/$/, "");
+  if(["GET","HEAD"].includes(req.method)){
+    const mine=(await readCol("notifications")).filter(n=>ownsNotice(user,n)).map(n=>noticeForBell(user,n));
+    if(!path)return res.json(mine);
+    const n=mine.find(n=>"/"+n.id===path);
+    return n?res.json(n):res.sendStatus(404);
+  }
+  if(req.method==="POST" && (path==="/read-all" || /^\/[^/]+\/read$/.test(path))){
+    const result=await withNoticeLock(async()=>{
+    const all=await readCol("notifications");
+    const mine=all.filter(n=>ownsNotice(user,n) && (path==="/read-all" || "/"+n.id+"/read"===path));
+    if(!mine.length && path!=="/read-all")return null;
+    const unread=mine.filter(n=>!n.readAt);
+    for(const n of unread)n.readAt=new Date().toISOString();
+    if(unread.length)await writeCol("notifications",all);
+    return path==="/read-all"?{ok:true,updated:unread.length}:mine[0];
+    });
+    return result?res.json(result):res.sendStatus(404);
+  }
+  return res.sendStatus(405);
+}));
 registerReceivables(app,{sessions,odoo,readCol,writeCol,wrap});
 registerPayables(app,{sessions,odoo,wrap});
 app.use(productAccess(sessions));
@@ -475,6 +501,7 @@ app.post("/api/sync/migrate", wrap(async (req, res) => {
   }
   const results = {};
   for (const [key, arr] of Object.entries(snapshot)) {
+    if(["notifications","generalAlertScanDay"].includes(key))continue;
     if(["technicalProviders","technicalCertifications","technicalCertificationTemplates","departments"].includes(key)||guardedWork.has(key))continue;
     if (!Array.isArray(arr)) continue;
     if (["erpClients","erpClientEquipment","erpLeads"].includes(key) || key.startsWith("baifaClientSync") || key.startsWith("baifa.sales.")) {
@@ -509,6 +536,7 @@ app.post("/api/sync/seed", wrap(async (req, res) => {
   }
   const written = {};
   for (const [key, arr] of Object.entries(seed)) {
+    if(["notifications","generalAlertScanDay"].includes(key))continue;
     if(["technicalProviders","technicalCertifications","technicalCertificationTemplates","departments"].includes(key)||guardedWork.has(key))continue;
     if (!Array.isArray(arr)) continue;
     if (["erpClients","erpClientEquipment","erpLeads"].includes(key) || key.startsWith("baifaClientSync")) continue;
@@ -4265,6 +4293,7 @@ async function getBitacoraRecipients(managerDeptId = null) {
 
 async function pushNotification({ userId, title, message, type = "info", link = null }) {
   if (!userId) return null;
+  return withNoticeLock(async()=>{
   const items = await readCol("notifications");
   const nextId = items.reduce((m, it) => Math.max(m, Number(it?.id) || 0), 0) + 1;
   const notif = {
@@ -4281,6 +4310,7 @@ async function pushNotification({ userId, title, message, type = "info", link = 
   const trimmed = items.length > 500 ? items.slice(-500) : items;
   await writeCol("notifications", trimmed);
   return notif;
+  });
 }
 
 // Endpoint genérico parametrizado por área: /api/bitacora/:area/check-daily
@@ -4471,31 +4501,6 @@ async function bitacoraWeeklyReportHandler(areaKey, res) {
 app.post("/api/generators/bitacora/generate-weekly-report", wrap((_req, res) => bitacoraWeeklyReportHandler("generators", res)));
 app.post("/api/bitacora/:area/generate-weekly-report", wrap((req, res) => bitacoraWeeklyReportHandler(req.params.area, res)));
 
-app.post("/api/notifications/:id/read", wrap(async (req, res) => {
-  const id = Number(req.params.id);
-  const items = await readCol("notifications");
-  const idx = items.findIndex((x) => Number(x.id) === id);
-  if (idx < 0) return res.status(404).json({ message: "not found" });
-  items[idx] = { ...items[idx], readAt: new Date().toISOString() };
-  await writeCol("notifications", items);
-  res.json(items[idx]);
-}));
-
-app.post("/api/notifications/read-all", wrap(async (req, res) => {
-  const userId = Number(req.body?.userId);
-  if (!userId) return res.status(400).json({ message: "userId requerido" });
-  const items = await readCol("notifications");
-  const now = new Date().toISOString();
-  let updated = 0;
-  for (let i = 0; i < items.length; i++) {
-    if (Number(items[i].userId) === userId && !items[i].readAt) {
-      items[i] = { ...items[i], readAt: now };
-      updated++;
-    }
-  }
-  await writeCol("notifications", items);
-  res.json({ ok: true, updated });
-}));
 
 // ============================================================
 // MÓDULO ADMINISTRACIÓN — Endpoints Odoo (P&L, Balance, AR/AP, Cashflow)
@@ -5321,11 +5326,7 @@ app.get("/api/admin/finanzas/payment-promises/alerts", wrap(async (req, res) => 
   const promises = await readCol("paymentPromises");
   const today = new Date();
   const todayIso = today.toISOString().slice(0, 10);
-  const daysDiff = (dateIso) => {
-    if (!dateIso) return null;
-    const d = new Date(dateIso + "T00:00:00Z");
-    return Math.round((d.getTime() - today.getTime()) / 86400000);
-  };
+  const daysDiff = dateIso => daysToDate(dateIso, todayIso);
   const alerts = [];
   for (const p of promises) {
     if (p.status === "cancelled" || p.status === "paid") continue;
@@ -5450,25 +5451,22 @@ app.delete("/api/admin/finanzas/payment-promises/:id", wrap(async (req, res) => 
 }));
 
 // POST /api/admin/finanzas/payment-promises/scan-alerts — genera notificaciones in-app (llamado por cron)
-app.post("/api/admin/finanzas/payment-promises/scan-alerts", wrap(async (req, res) => {
+async function scanGeneralAlerts(){
   const promises = await readCol("paymentPromises");
   const today = new Date();
   const todayIso = today.toISOString().slice(0, 10);
-  const daysDiff = (dateIso) => {
-    const d = new Date(dateIso + "T00:00:00Z");
-    return Math.round((d.getTime() - today.getTime()) / 86400000);
-  };
+  const daysDiff = dateIso => daysToDate(dateIso, todayIso);
   // Cargar usuarios para saber quién es CEO y quién Coordinador Admin
-  const users = await readCol("users");
+  const users = await readCol("employees");
   const recipients = users.filter(u => {
+    if(!generalAccess(u)||["inactive","disabled","inactivo"].includes(u.status)||[false,0,"false"].includes(u.canLogin))return false;
     const lvl = (u.level || "").toLowerCase();
     const role = (u.role || u.cargo || "").toLowerCase();
-    if (lvl === "ceo") return true;
+    if (lvl === "ceo" || u.username === "admin") return true;
     if (/coordinador.*administr|administraci.*coord|jefe.*administr/i.test(role)) return true;
     return false;
   }).map(u => u.username || u.email).filter(Boolean);
-  // Fallback: siempre incluir admin
-  if (!recipients.includes("admin")) recipients.push("admin");
+  if(promises.some(p=>!["cancelled","paid"].includes(p.status)) && !recipients.length)throw Error("No hay destinatarios habilitados para las alertas.");
 
   const notifications = await readCol("notifications");
   let created = 0;
@@ -5535,8 +5533,32 @@ app.post("/api/admin/finanzas/payment-promises/scan-alerts", wrap(async (req, re
     }
   }
 
-  await writeCol("notifications", notifications);
-  res.json({ ok: true, notifications_created: created, recipients, promises_scanned: promises.length });
+  if(created) await writeCol("notifications", notifications);
+  return { ok: true, notifications_created: created, recipients, promises_scanned: promises.length };
+}
+async function lockedGeneralScan(scheduled=false){
+  return withNoticeLock(async()=>{
+      const day=new Date().toISOString().slice(0,10);
+      if(scheduled && (await readCol("generalAlertScanDay"))[0]===day)return;
+      const summary=await scanGeneralAlerts();
+      if(scheduled)await writeCol("generalAlertScanDay",[day]);
+      return summary;
+  });
+}
+async function withNoticeLock(fn){
+  const db=collectionContext.getStore() || await pool.connect(),nested=!!collectionContext.getStore();
+  try{
+    if(!nested)await db.query("BEGIN");
+    await db.query("SELECT pg_advisory_xact_lock(812565)");
+    const result=await collectionContext.run(db,fn);
+    if(nested)return result;
+    await db.query("COMMIT");
+    return result;
+  }catch(e){if(!nested)await db.query("ROLLBACK");throw e;}finally{if(!nested)db.release();}
+}
+app.post("/api/admin/finanzas/payment-promises/scan-alerts",wrap(async(req,res)=>res.json(await lockedGeneralScan())));
+app.get("/api/health/general-alerts",wrap(async(req,res)=>{
+  res.set("Cache-Control","no-store").json({last_completed_utc:(await readCol("generalAlertScanDay"))[0]||null});
 }));
 
 // GET /api/admin/finanzas/ar-ap/diag/aged-html — Devuelve el HTML crudo del reporte Aged
@@ -8306,5 +8328,11 @@ registerShipmentsRoutes(app, pool, wrap);
   }
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`[copikon-server] listening on http://0.0.0.0:${PORT}`);
+    let lastDay="", busy=false;
+    setInterval(async()=>{
+      const now=new Date(), day=now.toISOString().slice(0,10);
+      if(busy||now.getUTCHours()<12||lastDay===day)return;
+      busy=true;try{await lockedGeneralScan(true);lastDay=day;}catch{console.error("[collections] daily alert scan pending");}finally{busy=false;}
+    },30000).unref();
   });
 })();
