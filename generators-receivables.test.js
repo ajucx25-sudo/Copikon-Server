@@ -20,7 +20,7 @@ test("acceso interno y escritura transaccional",()=>{assert(allowed({moduleAcces
 test("consulta facturas en Odoo de la compañía y rama fijadas, conserva moneda y vendedor; no permite guardar dos revisiones iguales",async()=>{
  const r={id:9,name:"F-DEMO",partner_id:[2,"Demo"],invoice_user_id:[3,"Vendedor de prueba"],amount_residual:100,currency_id:[1,"USD"],company_id:[12,"Operativa"],branch_id:[41,"Generadores"],move_type:"out_invoice",state:"posted",payment_state:"partial"};
  const odoo={searchRead:async(model,domain,fields,options)=>{assert.deepEqual(options.context.allowed_company_ids,[12]);if(model==="res.currency")return [{id:1,name:"USD",decimal_places:2}];assert(domain.some(([k,,v])=>k==="branch_id"&&v===41));assert(fields.includes("invoice_user_id"));return [r]}};
- assert.equal((await invoices(odoo))[0].seller,"Vendedor de prueba");r.invoice_user_id=false;assert.equal((await invoices(odoo))[0].seller,"Sin asignar");
+ assert.equal((await invoices(odoo))[0].seller,"Vendedor de prueba");assert.equal((await invoices(odoo))[0].sellerId,3);r.invoice_user_id=false;assert.equal((await invoices(odoo))[0].seller,"Sin asignar");assert.equal((await invoices(odoo))[0].sellerId,null);
  assert.equal((await invoices(odoo))[0].clientId,2);r.partner_id=[8,"Demo"];assert.equal((await invoices(odoo))[0].clientId,8);
  let put,store=[];registerReceivables({use(){},get(){},put(_p,f){put=f}},{sessions:{},odoo,readCol:async k=>k==="paymentPromises"?[]:store,writeCol:async(_k,v)=>store=v,wrap:f=>f});
  const req={params:{id:"9"},verifiedUser:{id:3},body:{revision:0,currency:"USD",balance:100,rows:[{date:i.due,amount:100}]}};await put(req,{json:r=>assert.equal(r.revision,1)});await assert.rejects(put(req,{}),e=>e.status===409);
