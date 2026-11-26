@@ -41,6 +41,7 @@ import {photoFromSync,photoFromEdit,withCatalogLock} from "./catalog-photo.js";
 import {productAccess,productRead,productCollectionWrite} from "./product-access.js";
 import { registerPosventaClientSync, POSVENTA_SYNC_POLICY } from "./posventa-client-sync.js";
 import {soldParkRefresh} from "./sold-park-refresh.js";
+import {applyApprovedWelcomesOnce} from "./welcome-backfill-once.js";
 import {isEquipmentResource, isEquipmentDocumentResource, EQUIPMENT_DOCUMENT_KEYS, validateEquipmentDocuments} from "./equipment-reference-access.js";
 import { randomBytes } from "node:crypto";
 import XLSX from "xlsx";
@@ -8331,6 +8332,7 @@ registerShipmentsRoutes(app, pool, wrap);
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`[copikon-server] listening on http://0.0.0.0:${PORT}`);
     soldPark.start();
+    applyApprovedWelcomesOnce(pool,odoo).catch(()=>console.error("[posventa] No se completó la carga puntual de bienvenidas."));
     let lastDay="", busy=false;
     setInterval(async()=>{
       const now=new Date(), day=now.toISOString().slice(0,10);
