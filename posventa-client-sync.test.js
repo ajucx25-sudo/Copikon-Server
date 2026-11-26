@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import {planPosventaClientSync,POSVENTA_SYNC_PATH} from "./posventa-client-sync.js";
+import {planPosventaClientSync,POSVENTA_SYNC_PATH,persistSoldPark} from "./posventa-client-sync.js";
 import {canAccessPath} from "./secure-access.js";
 import {requiresCollectionTransaction} from "./client-collection-transactions.js";
 import {isPosventaEquipmentPath} from "./equipment-edit-access.js";
@@ -12,6 +12,18 @@ const client = ({sales=[sale()],credits=[],...overrides}={}) => ({id:1,name:"Cli
   odooBaifaSales:JSON.stringify({since:"2022-01-01",invoiceCount:1,policyVersion:"rif-consolidation-2026-10-29",
     observedAt:now,sales,credits}),...overrides});
 const plan = (c=[client()],e=[],options={}) => planPosventaClientSync(c,e,{now,...options});
+
+test("live operating sales only, preview without writes, one shared unit per sale and preserved history",async()=>{
+  const historic=client({name:"Anterior",id:5,rif:"J123456789",odooId:21});
+  const old={id:42,serial:"INST-42",location:"Sitio original",clientId:5,odooUnitKey:"odoo:1:42:42:1"};
+  const db={erpClients:[historic],erpClientEquipment:[old]},writes=[];
+  const source={companies:[{id:12}],observedAt:now,customers:[{partner:{id:21,name:"Cliente",vat:"J123456789"},sales:[sale()],credits:[]}]};
+  const opts={source,readCol:async k=>db[k]||[],writeCol:async(k,v)=>{writes.push(k);db[k]=v}};
+  const prev=await persistSoldPark({...opts,preview:true});assert.equal(prev.created,2);assert.equal(writes.length,0);
+  assert.equal((await persistSoldPark(opts)).created,2);assert.deepEqual(db.erpClients,[historic]);assert.deepEqual(db.erpClientEquipment[0],old);
+  assert.equal((await persistSoldPark(opts)).created,0);
+  source.customers[0].sales.push(sale({companyId:1}));await assert.rejects(persistSoldPark(opts),/Compañía/);
+});
 
 test("quantity two creates two distinct units without operational guesses",()=>{
   const p=plan(); assert.equal(p.additions.length,2);

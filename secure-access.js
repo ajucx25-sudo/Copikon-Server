@@ -74,6 +74,7 @@ export function canAccessPath(user, path, method) {
     return canAccessPath(user,path,"PATCH");
   }
   if (isPosventaEquipmentPath(path)) {
+    if (/\/sync-from-clients\/?$/i.test(path) && (method!=="POST"||!user||user.isExternal||user.isExternalProvider||user.providerId!=null||user.level==="tecnico_externo"))return false;
     return !user?.isPartner && user?.level !== "partner_externo" && (isAdministrator(user) || user?.level === "coordinador");
   }
   if (isEquipmentMutation(path, method)) {

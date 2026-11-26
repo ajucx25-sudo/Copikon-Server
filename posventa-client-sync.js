@@ -135,12 +135,7 @@ export function planPosventaClientSync(clients, equipment, {now = new Date().toI
     eligibleClients,sourceUnits,pendingCreditUnits,pendingConflictUnits,issues,pending}};
 }
 
-export function registerPosventaClientSync(app, {readCol, writeCol, wrap}) {
-  app.post(POSVENTA_SYNC_PATH, wrap(async (req,res) => {
-    if (req.body != null && (typeof req.body !== "object" || Array.isArray(req.body) || Object.keys(req.body).length)) {
-      return res.status(400).json({message:"Esta operación no acepta datos de clientes ni equipos en la solicitud."});
-    }
-    try {
+export async function persistSoldPark({readCol, writeCol, source, actorId=null,preview=false}) {
       const clients = await readCol("erpClients"), equipment = await readCol("erpClientEquipment");
       // Do not reuse IDs already referenced by historical service documents.
       const reservedIds = [];
@@ -155,20 +150,39 @@ export function registerPosventaClientSync(app, {readCol, writeCol, wrap}) {
       for (const key of EQUIPMENT_DOCUMENT_KEYS) {
         collect(await readCol(key));
       }
-      const {additions,result} = planPosventaClientSync(clients,equipment,{actorId:req.verifiedUser?.id ?? null,reservedIds});
+      const {buildPlan}=await import("./baifa-client-sync.js");
+      if(source.companies.length!==1||source.companies[0].id!==12||
+        source.customers.some(c=>[...c.sales,...c.credits].some(s=>s.companyId!==12)))throw Error("Compañía de origen no válida.");
+      const matched=buildPlan(clients,source,equipment.map(e=>e.clientId));
+      const currentIds=new Set(clients.map(c=>Number(c.id))),included=new Set(matched.actions.map(a=>a.id));
+      const verified=matched.next.filter(c=>included.has(c.id));
+      const {additions,result}=planPosventaClientSync(verified,equipment,{actorId,reservedIds});
+      result.source="odoo";result.upstream="odoo";result.companyId=12;result.observedAt=source.observedAt;
+      for(const p of [...matched.conflicts,...matched.pending])result.issues.push({reason:p.reason||"Identidad de cliente pendiente de revisión."});
+      // Do not replace the sales directory or truncate historical sales evidence.
+      // Create only missing client references that have new, validated equipment.
+      const needs=new Set(additions.map(e=>e.clientId));
+      const newClients=verified.filter(c=>!currentIds.has(c.id)&&needs.has(c.id));
+      if(preview)return {...result,preview:true,newClients:newClients.length};
+      if(newClients.length)await writeCol(`adminMaintenance:soldParkClientBackup:${randomUUID()}`,clients);
+      if(newClients.length)await writeCol("erpClients",[...clients,...newClients]);
       await recordWelcomes(additions,readCol,writeCol,result.syncedAt);
       if (additions.length) {
         // Private audit collection, not exposed by the generic REST route map.
         const receipt = `adminMaintenance:posventaClientSync:${randomUUID()}`;
         await writeCol(`${receipt}:backup`,equipment);
         await writeCol("erpClientEquipment",[...equipment,...additions]);
-        await writeCol(receipt,[{...result,actorId:req.verifiedUser?.id,createdIds:additions.map(row=>row.id),
-          sourceHash:hash(clients),beforeHash:hash(equipment),afterHash:hash([...equipment,...additions])}]);
+        await writeCol(receipt,[{...result,actorId,createdIds:additions.map(row=>row.id),newClientIds:newClients.map(c=>c.id),
+          sourceHash:hash(verified),beforeHash:hash(equipment),afterHash:hash([...equipment,...additions])}]);
       }
-      res.json(result);
-    } catch (error) {
-      if (error.status === 409) return res.status(409).json({message:error.message});
-      throw error;
-    }
-  }));
+      return result;
+}
+
+export function registerPosventaClientSync(app,{sync}){
+  app.post(POSVENTA_SYNC_PATH,async(req,res)=>{
+    if(req.body!=null&&(typeof req.body!=="object"||Array.isArray(req.body)||Object.keys(req.body).length))
+      return res.status(400).json({message:"La actualización no acepta datos de clientes ni equipos."});
+    try{res.json(await sync(req.verifiedUser.id));}
+    catch(e){res.status(e.status===409?409:502).json({message:e.status===409?e.message:"No se completó la actualización desde Odoo. El parque anterior se conserva."});}
+  });
 }

@@ -91,10 +91,10 @@ export async function byIds(odoo, model, ids, fields, context = {}) {
   return result;
 }
 
-export async function loadBaifaCustomers(odoo) {
+export async function loadBaifaCustomers(odoo,{operatingOnly=false}={}) {
   if (!odoo.isConfigured()) throw Error("Odoo no está configurado en el servidor.");
   const companies = (await all(odoo, "res.company", [], ["id", "name", "vat"], 100))
-    .filter(c => tax(c.vat) === "J294654568" && /^(?:COPIKONCA|COPIKONVENEZUELACA)(?:J294654568)?$/.test(tax(c.name)));
+    .filter(c => (!operatingOnly || c.id===12) && tax(c.vat) === "J294654568" && /^(?:COPIKONCA|COPIKONVENEZUELACA)(?:J294654568)?$/.test(tax(c.name)));
   if (!companies.length) throw Error("No se pudo identificar la compañía Copikon en Odoo.");
   const context = {allowed_company_ids: companies.map(c => c.id)};
   const until = new Intl.DateTimeFormat("en-CA", {timeZone: "America/Caracas", year: "numeric", month: "2-digit", day: "2-digit"}).format(new Date());

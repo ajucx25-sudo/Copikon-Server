@@ -40,6 +40,7 @@ import {registerInventorySheet,gallerySchema} from "./inventory-sheet.js";
 import {photoFromSync,photoFromEdit,withCatalogLock} from "./catalog-photo.js";
 import {productAccess,productRead,productCollectionWrite} from "./product-access.js";
 import { registerPosventaClientSync, POSVENTA_SYNC_POLICY } from "./posventa-client-sync.js";
+import {soldParkRefresh} from "./sold-park-refresh.js";
 import {isEquipmentResource, isEquipmentDocumentResource, EQUIPMENT_DOCUMENT_KEYS, validateEquipmentDocuments} from "./equipment-reference-access.js";
 import { randomBytes } from "node:crypto";
 import XLSX from "xlsx";
@@ -361,7 +362,8 @@ registerInventory(app, {odoo, wrap});
 registerBaifaInventory(app, {odoo, wrap, readInventory: readBaifaInventory});
 registerInventoryComparison(app,{odoo,readCol,readInventory:readBaifaInventory});
 registerInventorySheet(app,{readCol,pool,inInventory:async code=>(await comparison({odoo,readCol,readInventory:readBaifaInventory})).rows.find(r=>r.code===code)});
-registerPosventaClientSync(app, {readCol, writeCol, wrap});
+const soldPark=soldParkRefresh({pool,odoo,readCol,writeCol});
+registerPosventaClientSync(app,{sync:soldPark.sync});
 registerWelcomes(app,{readCol,writeCol,wrap});
 
 app.patch("/api/generators/posventa/equipment/:id/location-contact",wrap(async(req,res)=>{
@@ -8328,6 +8330,7 @@ registerShipmentsRoutes(app, pool, wrap);
   }
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`[copikon-server] listening on http://0.0.0.0:${PORT}`);
+    soldPark.start();
     let lastDay="", busy=false;
     setInterval(async()=>{
       const now=new Date(), day=now.toISOString().slice(0,10);
