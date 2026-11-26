@@ -41,7 +41,8 @@ import {photoFromSync,photoFromEdit,withCatalogLock} from "./catalog-photo.js";
 import {productAccess,productRead,productCollectionWrite} from "./product-access.js";
 import { registerPosventaClientSync, POSVENTA_SYNC_POLICY } from "./posventa-client-sync.js";
 import {soldParkRefresh} from "./sold-park-refresh.js";
-import {applyApprovedWelcomesOnce} from "./welcome-backfill-once.js";
+import {applyApprovedWelcomesOnce,verifyWelcomeRelease} from "./welcome-backfill-once.js";
+let releaseCheck="pending";
 import {isEquipmentResource, isEquipmentDocumentResource, EQUIPMENT_DOCUMENT_KEYS, validateEquipmentDocuments} from "./equipment-reference-access.js";
 import { randomBytes } from "node:crypto";
 import XLSX from "xlsx";
@@ -392,6 +393,7 @@ app.patch("/api/generators/posventa/equipment/:id", wrap(async (req,res) => {
 app.get("/api/health", wrap(async (_req, res) => {
   await pool.query("SELECT 1");
   res.json({ ok: true, time: Date.now(), version: "1.1", db: "postgres",
+    releaseCheck,
     posventaClientSyncPolicy: POSVENTA_SYNC_POLICY,
     revision: /^[a-f0-9]{40}$/i.test(process.env.RENDER_GIT_COMMIT || "") ? process.env.RENDER_GIT_COMMIT : undefined,
   });
@@ -8332,7 +8334,7 @@ registerShipmentsRoutes(app, pool, wrap);
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`[copikon-server] listening on http://0.0.0.0:${PORT}`);
     soldPark.start();
-    applyApprovedWelcomesOnce(pool,odoo).catch(()=>console.error("[posventa] No se completó la carga puntual de bienvenidas."));
+    applyApprovedWelcomesOnce(pool,odoo).then(()=>verifyWelcomeRelease(pool)).then(ok=>{releaseCheck=ok?"verified":"review"}).catch(()=>{releaseCheck="review";console.error("[posventa] No se completó la verificación de la carga puntual de bienvenidas.")});
     let lastDay="", busy=false;
     setInterval(async()=>{
       const now=new Date(), day=now.toISOString().slice(0,10);

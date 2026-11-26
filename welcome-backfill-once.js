@@ -51,3 +51,17 @@ export async function applyApprovedWelcomesOnce(pool,odoo){
    await write(marker,[{now,created:additions.map(n=>n.id),skipped}]);await db.query("COMMIT");
  }catch(e){await db.query("ROLLBACK");throw e}finally{db.release()}
 }
+
+// Post-commit release check. Fetch only the private receipt and welcome collection;
+// expose no invoices, counts, client identifiers, or notification contents.
+export function receiptIsVerified(receipt,rows){
+ const r=Array.isArray(receipt)&&receipt.length===1&&receipt[0];
+ if(!r||!Array.isArray(r.created)||!Array.isArray(r.skipped)||!Array.isArray(rows))return false;
+ const ids=[...r.created,...r.skipped];
+ return ids.length===approved.length&&new Set(ids).size===ids.length&&ids.every(id=>
+   /^[a-f0-9]{64}$/.test(id)&&rows.filter(n=>n.id===id&&["pending","claimed","done"].includes(n.status)).length===1);
+}
+export async function verifyWelcomeRelease(pool){
+ const {rows}=await pool.query("SELECT r.value AS receipt, w.value AS history FROM kv r JOIN kv w ON w.key=$2 WHERE r.key=$1",[marker,key]);
+ return rows.length===1&&receiptIsVerified(rows[0].receipt,rows[0].history);
+}

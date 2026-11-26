@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import {fingerprintWelcome,planApprovedWelcomes} from "./welcome-backfill-once.js";
+import {fingerprintWelcome,planApprovedWelcomes,receiptIsVerified} from "./welcome-backfill-once.js";
 const l={companyId:12,invoiceId:123,lineId:456,product:"[QA] Generador",invoice:"QA/42",date:"2026-11-17",quantity:1};
 function fixture(){return {customers:[{rif:"J123456789",sales:[{...l}],credits:[]}],clients:[{id:50,rif:"J-12345678-9"}],equipment:[{id:60,clientId:50,active:true,source:"odoo-baifa-sales",odooUnitKey:"odoo:12:123:456:1",productCode:"QA",invoiceNumber:l.invoice,invoiceDate:l.date,odooSource:{...l}}],history:[],now:"2026-11-26T18:00:00Z",manifest:[fingerprintWelcome(12,l.invoice,l.date,"QA")]}}
 test("only listed units are added pending; all existing statuses and owners stay untouched",()=>{
@@ -11,4 +11,9 @@ test("only listed units are added pending; all existing statuses and owners stay
 });
 test("credit, inactive unit, ambiguity or different evidence blocks writes",()=>{
  for(const mutate of [x=>x.customers[0].credits.push({}),x=>x.equipment[0].active=false,x=>x.clients.push({...x.clients[0]}),x=>x.equipment[0].invoiceDate="2026-01-01",x=>x.customers[0].sales[0].companyId=1]){const data=fixture();mutate(data);assert.throws(()=>planApprovedWelcomes(data));assert.equal(data.history.length,0)}
+});
+test("release receipt requires all eight unique stored identities, including closed ones",()=>{
+ const ids=Array.from({length:8},(_,i)=>i.toString(16).padStart(64,"0"));
+ const r=[{created:ids.slice(0,6),skipped:ids.slice(6)}],rows=ids.map((id,i)=>({id,status:i>5?"done":"pending"}));
+ assert.ok(receiptIsVerified(r,rows));assert.ok(!receiptIsVerified([],rows));assert.ok(!receiptIsVerified(r,rows.slice(1)));assert.ok(!receiptIsVerified(r,[...rows,rows[0]]));
 });
