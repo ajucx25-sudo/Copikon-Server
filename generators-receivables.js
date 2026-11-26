@@ -16,7 +16,7 @@ export async function invoices(odoo,id){
  return rows.map(r=>{
  const c=currencies.find(c=>c.id===r.currency_id?.[0]);
  if(r.company_id?.[0]!==12||r.branch_id?.[0]!==41||r.move_type!=="out_invoice"||r.state!=="posted"||!states.includes(r.payment_state)||!Number.isFinite(r.amount_residual)||r.amount_residual<=0||!c||!Number.isInteger(c.decimal_places)||c.decimal_places<0||c.decimal_places>6||id&&r.id!==id)fail("No se pudo verificar la cartera de la rama en Odoo.",502);
- return {id:r.id,number:r.name,client:r.partner_id?.[1]||"Por verificar",seller:r.invoice_user_id?.[1]||"Sin asignar",date:r.invoice_date,due:r.invoice_date_due||null,total:r.amount_total,balance:r.amount_residual,currency:c.name,digits:c.decimal_places};
+ return {id:r.id,number:r.name,clientId:Number.isSafeInteger(r.partner_id?.[0])?r.partner_id[0]:null,client:r.partner_id?.[1]||"Por verificar",seller:r.invoice_user_id?.[1]||"Sin asignar",date:r.invoice_date,due:r.invoice_date_due||null,total:r.amount_total,balance:r.amount_residual,currency:c.name,digits:c.decimal_places};
  });
 }
 export function installments(rows,invoice){
@@ -36,7 +36,7 @@ export function view(invoice,plan,legacy,day){
  const rows=legacy?(legacyOk?oldRows:[]):changed?[]:plan?plan.rows:invoice.due?[{date:invoice.due,amount:invoice.balance}]:[];
  const alerts=rows.flatMap((r,i)=>{if(!validDay(r.date))return [];const days=(Date.parse(r.date)-Date.parse(day))/86400000;
  return days<=7?[{...r,days,label:plan||legacy?`Cuota ${i+1}`:"Factura sin plan"}]:[];});
- return {...invoice,status,review:changed||(!!legacy&&!legacyOk),alerts,revision:plan?.revision||0,rows:plan?.rows||[],legacy:!!legacy};
+ return {...invoice,status,review:changed||(!!legacy&&!legacyOk),alerts,revision:plan?.revision||0,rows:legacy?(legacyOk?oldRows:[]):plan?.rows||[],legacy:!!legacy};
 }
 const legacyFor=(rows,id)=>rows.find(p=>Number(p.move_id)===id&&p.kind==="ar"&&!["cancelled","paid"].includes(p.status));
 export async function assertNoGeneratorsPlan(readCol,p){
