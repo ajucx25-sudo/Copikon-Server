@@ -29,6 +29,7 @@ import { isEquipmentMutation, isPosventaEquipmentPath, validateEquipmentEdit } f
 import {isLocationContactPath,planLocationContact} from "./posventa-location-contact.js";
 import {registerWelcomes} from "./posventa-welcome.js";
 import {registerReceivables,base as receivablesPath,assertNoGeneratorsPlan} from "./generators-receivables.js";
+import {registerPayables} from "./generators-payables.js";
 import { registerBaifaClientSync, isBaifaSyncPath } from "./baifa-client-sync.js";
 import { registerMonthlyClose } from "./baifa-monthly-close.js";
 import { registerInventory, isInventoryPath } from "./generators-inventory.js";
@@ -237,6 +238,7 @@ const wrap = (fn) => (req, res) =>
 
 const sessions = createSessions(pool, readCol, buildPartnerUser);
 registerReceivables(app,{sessions,odoo,readCol,writeCol,wrap});
+registerPayables(app,{sessions,odoo,wrap});
 app.use(productAccess(sessions));
 registerCorrectiveCalendar(app,{sessions,readCol});
 registerDossiers(app,{pool,sessions,readCol});
