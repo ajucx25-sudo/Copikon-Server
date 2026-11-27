@@ -27,8 +27,9 @@ export function welcomeSpecs(unit,entry,clientId){
  if(!unit||unit.clientId!==clientId||unit.id!==entry.id||unit.odooUnitKey!==entry.unit||!entry.unit)return {};
  const description=String(unit.productDescription||"");
  const models=[...new Set((description.match(/\bBF-[A-Z0-9]+(?:-[A-Z0-9]+)+\b/gi)||[]).map(s=>s.toUpperCase()))];
+ const ambiguousGrouping=/\d[.,\s]\d{3}(?:[.,]\d+)?\s*kVA\b/i.test(description);
  const powers=[...new Set([...description.matchAll(/(?<![\d.,/-])(\d{1,4}(?:[.,]\d+)?)\s*kVA\b/gi)].map(m=>Number(m[1].replace(",","."))).filter(n=>n>0))];
- return {...(models.length===1?{model:models[0]}:{}),...(powers.length===1&&!/\d\s*[-/]\s*\d+(?:[.,]\d+)?\s*kVA/i.test(description)?{powerKva:powers[0]}:{})};
+ return {...(models.length===1?{model:models[0]}:{}),...(powers.length===1&&!ambiguousGrouping&&!/\d\s*[-/]\s*\d+(?:[.,]\d+)?\s*kVA/i.test(description)?{powerKva:powers[0]}:{})};
 }
 export function registerWelcomes(app,{readCol,writeCol,wrap}){
  app.get(welcomePath,wrap(async(req,res)=>{
