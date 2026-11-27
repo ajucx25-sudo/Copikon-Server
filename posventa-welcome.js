@@ -23,12 +23,20 @@ export async function recordWelcomes(additions,readCol,writeCol,now){
  if(next.length){const changed=new Set(next.map(r=>r.id));await writeCol(key,[...rows.filter(r=>!changed.has(r.id)),...next]);}
 }
 export const welcomePath="/api/generators/posventa/equipment/welcomes";
+export function welcomeSpecs(unit,entry,clientId){
+ if(!unit||unit.clientId!==clientId||unit.id!==entry.id||unit.odooUnitKey!==entry.unit||!entry.unit)return {};
+ const description=String(unit.productDescription||"");
+ const models=[...new Set((description.match(/\bBF-[A-Z0-9]+(?:-[A-Z0-9]+)+\b/gi)||[]).map(s=>s.toUpperCase()))];
+ const powers=[...new Set([...description.matchAll(/(?<![\d.,/-])(\d{1,4}(?:[.,]\d+)?)\s*kVA\b/gi)].map(m=>Number(m[1].replace(",","."))).filter(n=>n>0))];
+ return {...(models.length===1?{model:models[0]}:{}),...(powers.length===1&&!/\d\s*[-/]\s*\d+(?:[.,]\d+)?\s*kVA/i.test(description)?{powerKva:powers[0]}:{})};
+}
 export function registerWelcomes(app,{readCol,writeCol,wrap}){
  app.get(welcomePath,wrap(async(req,res)=>{
-  const rows=await readCol(key),clients=await readCol("erpClients");
+  const [rows,clients,units]=await Promise.all([readCol(key),readCol("erpClients"),readCol("erpClientEquipment")]);
+  const unitsById=new Map(units.map(u=>[u.id,u]));
   res.json({items:rows.filter(r=>r.status!=="done").map(r=>{const c=clients.find(c=>c.id===r.clientId);
    const own=r.status==="claimed"&&r.owner!=null&&r.owner===req.verifiedUser?.id;
-   return {id:r.id,invoice:r.invoice,invoiceDate:r.invoiceDate,createdAt:r.createdAt,status:r.status,owner:r.owner||null,client:c?.name||"Cliente por verificar",...(own?{contact:c?.contact||"",phone:c?.phone||""}:{}),equipment:r.equipment.map(({id,code})=>({id,code}))};
+   return {id:r.id,invoice:r.invoice,invoiceDate:r.invoiceDate,createdAt:r.createdAt,status:r.status,owner:r.owner||null,client:c?.name||"Cliente por verificar",...(own?{contact:c?.contact||"",phone:c?.phone||""}:{}),equipment:r.equipment.map(e=>({id:e.id,code:e.code,...welcomeSpecs(unitsById.get(e.id),e,r.clientId)}))};
   })});
  }));
  app.post(welcomePath+"/:id/:action",wrap(async(req,res)=>{
